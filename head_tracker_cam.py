@@ -477,7 +477,7 @@ while True:
     # 主检测(640): 标准推理
     # conf 0.15→0.25: 提高置信度, 挡掉门锁/音箱/书本/手指等低分误检
     # ★ 副检测已移除(用户要求加帧率): 每帧仅1次烟推理, 动态模糊/小烟兜底靠"历史5帧融合"
-    sr = SMOKE(frame_enh, conf=0.25, iou=0.5, verbose=False)
+    sr = SMOKE(frame_enh, conf=0.27, iou=0.5, verbose=False)
     for r in sr:
         for box in r.boxes:
             conf = float(box.conf[0])
@@ -590,9 +590,14 @@ while True:
                     continue
                 # ③ 肤色主导(手) 放宽(近距手指入框的真烟肤色高, 材质+形状已把关):
                 if skin > 0.85 and brown < 0.02: continue
-                # ④ 远近肤色分档(大幅放宽, 只挡极端):
+                # ④ 远近肤色分档(远距手指专项修复):
+                #    远距真烟肤色<10%(烟纸白); 远距手指框内肤色>15% → 拒
+                #    ★ 原0.35太松(远距手指框内背景多稀释肤色占比, 漏过误识别)
                 if area_ratio < 0.01:
-                    if skin > 0.35: continue    # 远距手指(原0.20 → 放宽)
+                    if skin > 0.15: continue    # 远距肤色>15% = 手指/手(原0.35→0.15)
+                    # 远距细长+肤色+无滤嘴 = 伸直的手指(手指细长条, 烟是白纸带滤嘴)
+                    if skin > 0.08 and aspect > 1.5 and brown < 0.03:
+                        continue
                 else:
                     if skin > 0.88: continue    # 近距纯手(原0.80 → 放宽)
                 # ⑤ 手机/书本: 非细长+极亮屏/极暗屏(放宽阈值, 材质漏网兜底)
