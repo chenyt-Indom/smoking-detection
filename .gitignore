@@ -1,0 +1,18 @@
+# 运行时数据与日志(不上传)
+logs/
+alerts/
+*.log
+*.bak*
+__pycache__/
+*.pyc
+
+# 大模型文件: 只上传 V24 权重, 其他 onnx/pt 忽略
+models/*.onnx
+models/*_v*.pt
+models/*.pt
+!models/smoke_cig_v24.pt
+models/yolov8n*.pt
+
+# 训练原图数据(大)
+D:/training_data/
+training_data/
