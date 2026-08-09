@@ -2,11 +2,11 @@
 V7-Head + V14-Smoke — 全屏香烟检测
 V7: 头部检测 (绿色框) | V14: 全屏香烟 (红色框)
 """
-import cv2, numpy as np, time
+import cv2, numpy as np, time, torch
 from ultralytics import YOLO
 
 HEAD = YOLO(r"D:\视觉安防系统\models\yolov8n_head_v7.pt", task='detect')
-SMOKE = YOLO(r"D:\视觉安防系统\models\smoke_cig_v28.pt", task='detect')
+SMOKE = YOLO(r"D:\视觉安防系统\models\smoke_cig_v30.pt", task='detect')
 HEAD.to('cuda'); SMOKE.to('cuda')
 # ★★ 手部检测模型(新架构: 手掌蓝色框 + 香烟聚焦头/手区域)
 #   hand.pt 由 COCO 手部数据集训练, 训练完成后放入 models/ 自动启用
@@ -25,7 +25,19 @@ try:
     SMOKE.model.half()
 except Exception:
     print("⚠️ SMOKE fp16转换失败, 继续用fp32")
-print("✅ V7-Head + V28-Smoke | 头绿框 | 手蓝框 | 烟红框(头/手区域聚焦) | Q退出")
+print("✅ V7-Head + V30-Smoke | 头绿框 | 手蓝框 | 烟红框(头/手区域聚焦) | Q退出")
+
+# ★ ROI放大检测的结果模拟对象(兼容 ultralytics box 接口)
+#   手/头区域裁图放大后独立跑SMOKE, 检出框需换算回全图坐标再进入过滤链
+class _RoiBox:
+    __slots__ = ('xyxy', 'conf')
+    def __init__(self, x1, y1, x2, y2, c):
+        self.xyxy = [torch.tensor([float(x1), float(y1), float(x2), float(y2)])]
+        self.conf = [torch.tensor(float(c))]
+class _RoiRes:
+    __slots__ = ('boxes',)
+    def __init__(self, boxes):
+        self.boxes = boxes
 
 cap = cv2.VideoCapture(0)
 # 单实例锁: 防止多实例抢同一个摄像头导致"显示混乱/头框丢失"
@@ -181,7 +193,7 @@ def light_adapt(frame):
 # 烟丢失后, 在预测位置附近找"位置近+尺寸像+颜色像"的候选, 恢复原ID继续追踪
 SIG_HIST_SIZE = 64       # 签名直方图bin数
 SIG_RECOVER_RANGE = 2.5  # 找回搜索范围 = 丢失时框宽 × 此系数
-SIG_RECOVER_FRAMES = 30  # 最长找回帧数(~1秒), 超时清轨防幽灵
+SIG_RECOVER_FRAMES = 10  # 最长找回帧数(~0.5秒), 超时清轨防幽灵(原30帧=1.5s太久)
 
 def extract_sig(frame, bbox):
     """提取目标外观签名: HSV直方图 + 尺寸指纹
@@ -430,17 +442,12 @@ def iou(a, b):
     return iw*ih/(aa+bb-iw*ih+1e-6)
 
 tracks = []; smoke_tracks = []; hand_tracks = []; next_id = 0   # ★ hand_tracks: 手部追踪(蓝色框)
-low_suspects = []   # 低分稳定框记忆: [(bbox, 连续帧数)] — 耳后/口边烟连续2帧确认建轨
 import os
 AUTO_SAVE = r'D:\training_data\smoke\fp_auto'   # 误检帧自动采集(检出烟时保存)
 os.makedirs(AUTO_SAVE, exist_ok=True)
 last_auto_save = 0
 
-# ===== 多帧检测融合: 保留最近 K 帧的烟检测结果 =====
-# 等效"检测频率提升K倍": 漏检1帧也能从历史框找回, 快速移动不掉链
-SMOKE_HISTORY_MAX = 8   # 保留最近5帧检测框
-smoke_history = []       # [(bbox, conf, frame_idx), ...] 新→旧
-
+# ★ 长记忆已取消(用户17:19): 删除 smoke_history/low_suspects — 检测框只来自本帧
 while True:
     ret, frame = cap.read()
     if not ret or frame is None:
@@ -522,7 +529,7 @@ while True:
     det_hands = []
     if HAND_READY:
         try:
-            res_h = HAND(frame, conf=0.38, iou=0.5, verbose=False)
+            res_h = HAND(frame, conf=0.30, iou=0.5, verbose=False)
             for r in res_h:
                 for box in r.boxes:
                     b = box.xyxy[0].cpu().numpy()
@@ -610,14 +617,36 @@ while True:
         focus_regions.append((max(0, hx1-hw_*1.2), max(0, hy1-hh_*0.6),
                               min(W, hx2+hw_*1.2), min(H, hy2+hh_*1.6)))
     # 无头无手: focus_regions为空 → 本帧不做烟检测(严格限定区域, 不识别区域外)
-    # 主检测(1024): 全屏检测 + 下方"区域聚焦过滤"(候选中心必须在头/手区域内)
-    # ★ 严格区域: 无头无手(focus_regions空) → 跳过烟检测(区域外不识别)
+    # ★★ 新架构(用户需求): ROI 裁剪放大独立检测 — "放大方框看附近小区域有没有香烟"
+    #   头框/手框出现 → 裁剪扩张区域ROI → 放大到640 → 独立跑SMOKE → 框坐标换算回全图
+    #   相比"全图1024+中心过滤": 区域小图被放大, 有效分辨率翻倍, 小烟/被挡一半的烟更好检出
+    #   区域上限4个(多人场景防性能下降); 无头无手 → sr空 → 烟识别关闭
+    sr = []
     if focus_regions:
-        sr = SMOKE(frame_enh, conf=0.06, iou=0.5, imgsz=1024, verbose=False)
-        if (fc % 4) == 0:   # 960 多尺度副检测(每4帧): 极小/边缘烟兜底
+        _roi_budget = 4
+        for (frx1, fry1, frx2, fry2) in focus_regions:
+            if _roi_budget <= 0: break
+            # ★ 坐标转int再切片(模型输出float, numpy切片必须整数)
+            _frx1, _fry1 = max(0, int(frx1)), max(0, int(fry1))
+            _frx2, _fry2 = min(W, int(frx2)), min(H, int(fry2))
+            _frw, _frh = _frx2-_frx1, _fry2-_fry1
+            if _frw < 24 or _frh < 24: continue
+            _roi = frame_enh[_fry1:_fry2, _frx1:_frx2]
+            _scale = 640.0 / max(_frw, _frh)      # 放大系数(区域小→放大倍数大)
+            _tw, _th = int(_frw*_scale+0.5), int(_frh*_scale+0.5)
+            if _tw < 16 or _th < 16: continue
             try:
-                sr2 = SMOKE(frame_enh, conf=0.06, iou=0.5, imgsz=960, verbose=False)
-                sr = list(sr) + list(sr2)
+                _roi_big = cv2.resize(_roi, (_tw, _th), interpolation=cv2.INTER_LINEAR)
+                _rr = SMOKE(_roi_big, conf=0.06, iou=0.5, imgsz=640, verbose=False)
+                for _rrc in _rr:
+                    for _b2 in _rrc.boxes:
+                        _bc = float(_b2.conf[0])
+                        _bx1, _by1, _bx2, _by2 = _b2.xyxy[0].cpu().numpy()
+                        # 放大图坐标 → 换算回全图坐标(以_int裁剪原点为基准)
+                        _ox1 = _frx1 + _bx1/_scale; _oy1 = _fry1 + _by1/_scale
+                        _ox2 = _frx1 + _bx2/_scale; _oy2 = _fry1 + _by2/_scale
+                        sr.append(_RoiRes([_RoiBox(_ox1, _oy1, _ox2, _oy2, _bc)]))
+                _roi_budget -= 1
             except Exception:
                 pass
     else:
@@ -641,6 +670,21 @@ while True:
                     _in_focus = True; break
             if not _in_focus:
                 continue   # ★ 严格: 不在头/手区域 → 一律拒(无任何豁免)
+
+            # ===== ★★★ 必须与蓝框(手)/绿框(头)有交集(用户17:07要求): 否则不算烟 =====
+            #   替代原"接触手"约束(v3): 红框必须与蓝框或绿框有交集(IoU>0)
+            #   ① 嘴前/嘴边烟: 在头框(绿)内 → 有交集 → 放行(修复"头框内烟检测不到")
+            #   ② 手持烟: 在手框(蓝)内/重叠 → 放行
+            #   ③ 窗格栅/门框/桌面/远处烟: 与任何头/手框无交集 → 拒
+            _touch_hand = False; _touch_head = False
+            for (_tbx1, _tby1, _tbx2, _tby2) in det_hands:
+                if iou((x1, y1, x2, y2), (_tbx1, _tby1, _tbx2, _tby2)) > 0.0:
+                    _touch_hand = True; break
+            for (_tbx1, _tby1, _tbx2, _tby2) in det_heads:
+                if iou((x1, y1, x2, y2), (_tbx1, _tby1, _tbx2, _tby2)) > 0.0:
+                    _touch_head = True; break
+            if not (_touch_hand or _touch_head):
+                continue   # ★ 严格: 红框未与蓝/绿框有交集 → 一律拒(不管多像烟)
 
             # ===== 强光源直接过滤: 整框几乎全过曝 → 直接拒 =====
             # 治"强光源/灯具/过曝区被误判为烟"
@@ -772,15 +816,17 @@ while True:
                 _pix = _crop.shape[0] * _crop.shape[1]
                 _skin = np.sum(cv2.inRange(_hsv, (0,25,50), (45,180,255)) > 0) / _pix
                 if _skin > 0.55:
-                    continue   # 肤色主导(>55%) = 手/胳膊/脸 → 拒(不管形状, 不豁免!)
+                    # ★ 口边烟豁免(用户17:07): 与头框交集+细长(aspect≥2.0) = 嘴上烟(含唇色) → 放行
+                    if not (_touch_head and aspect >= 2.0):
+                        continue   # 肤色主导(>55%) = 手/胳膊/脸 → 拒(不管形状, 不豁免!)
 
             if not near_confirmed:
                 # ===== 手指组合拒(仅新目标): 肤色较高+粗短 =====
                 # 实测均值: 手指 aspect≈1.9粗短 肤色≈0.35 | 香烟 aspect≈2.4细长
                 # 只对"新目标"检查(D规则豁免已确认烟轨)
                 if xi2 - xi1 >= 6 and yi2 - yi1 >= 6:
-                    if _skin > 0.30 and aspect < 2.2:
-                        continue   # 手指(肤色较高 + 粗短 aspect<2.2) → 拒
+                    if _skin > 0.30 and aspect < 2.2 and not (_touch_head and aspect >= 2.0):
+                        continue   # 手指(肤色较高 + 粗短 aspect<2.2) → 拒(头框内细长=口边烟豁免)
 
             # (材质关/颜色关已停用 — 纯形状识别模式, D规则豁免仅预留)
 
@@ -801,15 +847,33 @@ while True:
                     if inter / h_area > 0.5:
                         in_face = True; break
                     # 情况B: 中心在头框内的极小框(<5%)
-                    #   细长(aspect≥2.5) = 耳后/口边烟 → 放行(夹耳后需求)
+                    #   细长(aspect≥2.0) = 耳后/口边烟 → 放行(口边烟框含唇 aspect常2.0-2.5)
                     #   非细长 = 脸上特征(鼻/嘴/眼) → 丢
                     if hx1 <= cx <= hx2 and hy1 <= cy <= hy2:
-                        if (w * h) / h_area < 0.05 and aspect < 2.5:
+                        if (w * h) / h_area < 0.05 and aspect < 2.0:
                             in_face = True; break
                 if in_face: continue
             # 兜底: 无头框时, 大而圆的检测框(占画面3%+ 且 近圆形) = 头/大圆物 → 丢
             if area_ratio > 0.03 and aspect < 1.5:
                 continue
+
+            # ===== 电子设备拒(用户17:17): 手机/耳机被误判为烟 =====
+            #   拿在手里/戴在耳边会通过"交集"判定, 用屏幕/机身特征区分:
+            #   ① 手机亮屏: 白亮像素多 + 非细长 + 面积>0.4% → 拒 (烟白但细长, 不触发)
+            #   ② 彩色屏幕(壁纸/内容): 高饱和彩像素>50% → 拒 (烟滤嘴棕色占比小)
+            #   ③ 黑屏手机/黑耳机: 黑色像素>55% → 拒 (烟纸白, 黑占比极低)
+            if xi2 - xi1 >= 6 and yi2 - yi1 >= 6:
+                _ehsv = cv2.cvtColor(frame[yi1:yi2, xi1:xi2], cv2.COLOR_BGR2HSV)
+                _epix = max(1, (yi2-yi1) * (xi2-xi1))
+                _ew = float(np.sum(cv2.inRange(_ehsv, (0,0,180), (180,60,255)) > 0)) / _epix
+                _eb = float(np.sum(cv2.inRange(_ehsv, (0,0,0), (180,255,70)) > 0)) / _epix
+                _ec = float(np.sum(cv2.inRange(_ehsv, (0,80,80), (180,255,255)) > 0)) / _epix
+                if area_ratio > 0.004 and _ew > 0.45 and aspect < 3.0:
+                    continue   # 大片亮白 + 非细长 = 手机亮屏 → 拒
+                if _ec > 0.50:
+                    continue   # 高饱和彩主导 = 彩色屏幕/彩色耳机 → 拒
+                if _eb > 0.55:
+                    continue   # 黑色主导 = 黑屏手机/黑耳机 → 拒
 
             raw_smoke.append((float(x1), float(y1), float(x2), float(y2)))
 
@@ -843,40 +907,8 @@ while True:
             merged.append(sb)
     raw_smoke = merged
 
-    # ===== 长期追踪: 全部检测框快照(当前帧 + 低分池 + 历史, 去重) =====
-    # 多帧历史融合: 等效检测频率×N倍, 漏检1帧也能从历史框找回
-    # ★ 方向感知去重(治移动时旧帧框叠加): 烟细长, 移动时旧框与新框位置不同,
-    #   旧阈值(iou>0.5/中心距30)在移动时不去重 → 双框叠加显示 = 重叠
-    #   现按"烟形状方向"判断: 竖直烟横向对齐(dx<宽×3)+纵向距离<高×1.2; 水平烟对称
-    def _hist_dup(_b, _e):
-        if iou(_b, _e) > 0.3:
-            return True
-        _bw = max(_b[2]-_b[0], _e[2]-_e[0]); _bh = max(_b[3]-_b[1], _e[3]-_e[1])
-        _dx = abs((_b[0]+_b[2])/2 - (_e[0]+_e[2])/2)
-        _dy = abs((_b[1]+_b[3])/2 - (_e[1]+_e[3])/2)
-        _dist = (_dx**2 + _dy**2) ** 0.5
-        if _bh >= _bw:
-            return _dx < max(20.0, _bw * 3.0) and _dist < max(60.0, _bh * 1.2)
-        else:
-            return _dy < max(20.0, _bh * 3.0) and _dist < max(60.0, _bw * 1.2)
-    all_det_boxes = list(raw_smoke)
-    for _b, _conf, _age in smoke_history:    # _age=0最新, 越大越旧
-        if not any(_hist_dup(_b, _e) for _e in all_det_boxes):
-            all_det_boxes.append(_b)
-    for _b in low_pool:
-        if not any(_hist_dup(_b, _e) for _e in all_det_boxes):
-            all_det_boxes.append(_b)
-    # 当前帧检测框入历史队列(给后续5帧用)
-    for _b in raw_smoke:
-        smoke_history.insert(0, (_b, 1.0, 0))
-    # 限制队列长度, 并对老框做"老化"(age增加,后续可按age衰减匹配权重)
-    new_hist = []
-    for i, (b, c, a) in enumerate(smoke_history):
-        if i < SMOKE_HISTORY_MAX:
-            new_hist.append((b, c, a + (1 if i > 0 else 0)))   # 第一个保持age=0
-        else:
-            break
-    smoke_history = new_hist
+    # ★★ 长记忆已取消(用户17:19): 删除历史框快照(smoke_history)/低分池融合
+    #   检测框只来自本帧 raw_smoke, 无跨帧历史 → 丢失立即删框
 
     # === ByteTrack 两级关联 (Kalman预测 + 高分/低分双层) ===
     sm_matched = set(); sm_det = set()
@@ -911,89 +943,13 @@ while True:
             sig = extract_sig(frame, sb)
             if sig is not None:
                 smoke_tracks[best_i][0].update_sig(sig)
-    # Level 2 (ByteTrack核心): 低分池 → 未匹配轨迹 (遮挡/远距恢复, 更严格IoU)
-    for sb in low_pool:
-        if len(smoke_tracks) == 0: break
-        best_i, best_score = -1, 0.30
-        scx, scy = (sb[0]+sb[2])/2, (sb[1]+sb[3])/2
-        for i, st in enumerate(smoke_tracks):
-            if st[1] in sm_matched: continue
-            tb = st[0].bbox
-            tcx, tcy = (tb[0]+tb[2])/2, (tb[1]+tb[3])/2
-            iou_val = iou(tb, sb)
-            dist = ((scx-tcx)**2 + (scy-tcy)**2) ** 0.5
-            score = iou_val
-            if iou_val < 0.25 and dist < 55:   # 低分恢复: 位置强约束, 避免误关联
-                score = 0.25 + 0.10 * (1 - dist / 55)
-            if score > best_score:
-                best_score = score; best_i = i
-        if best_i >= 0 and best_score >= 0.30:
-            smoke_tracks[best_i][0].update(sb); sm_matched.add(smoke_tracks[best_i][1])
-    # 未匹配轨迹: lost+1 (Kalman预测维持)
+    # ★★ 长记忆已取消(用户17:19): 删除Level2低分匹配/长期找回/低分建轨
+    #   检测到就显示, 丢失(lost>=1)立即删框, 无任何历史/预测残留
+    # 未匹配轨迹: lost+1 (下帧清理时 lost>=1 立即删除)
     for st in smoke_tracks:
         if st[1] not in sm_matched: st[0].lost += 1
-    # ===== 长期追踪找回: 丢失轨迹在附近找"位置近+签名像"的框, 恢复原ID =====
-    recovered_boxes = []   # 已被某轨迹恢复的框(防多个轨迹抢同一框)
-    for st in smoke_tracks:
-        if st[1] in sm_matched or st[0].confirmed < 2:
-            continue   # 已关联或未确认(可能噪声)不找回
-        if st[0].lost < 1 or st[0].lost > SIG_RECOVER_FRAMES:
-            continue
-        rb = try_recover_smoke(frame, st, all_det_boxes, W, H)
-        if rb is not None:
-            # 该框是否已被其他轨迹占用(位置去重)
-            taken = False
-            for _rbb in recovered_boxes:
-                if iou(rb, _rbb) > 0.4:
-                    taken = True; break
-            if taken:
-                continue
-            st[0].update(rb); sm_matched.add(st[1])
-            recovered_boxes.append(rb)
-            sig = extract_sig(frame, rb)
-            if sig is not None:
-                st[0].update_sig(sig)
-    # 低分稳定框建轨 (耳后/口边烟等新目标, conf低但连续2帧同位置 = 真目标)
-    if len(smoke_tracks) < 6:
-        for sb in low_pool:
-            # 只处理未匹配过轨迹的低分框
-            already = False
-            scx, scy = (sb[0]+sb[2])/2, (sb[1]+sb[3])/2
-            for st in smoke_tracks:
-                tb = st[0].bbox
-                tcx, tcy = (tb[0]+tb[2])/2, (tb[1]+tb[3])/2
-                if ((scx-tcx)**2 + (scy-tcy)**2) ** 0.5 < 40:
-                    already = True; break
-            if already: continue
-            # 与历史低分框匹配: 连续2帧同一位置 → 建轨
-            hit = False
-            for k, (lb, cnt) in enumerate(low_suspects):
-                lcx, lcy = (lb[0]+lb[2])/2, (lb[1]+lb[3])/2
-                if ((scx-lcx)**2 + (scy-lcy)**2) ** 0.5 < 30:
-                    low_suspects[k] = (sb, cnt + 1)
-                    if cnt + 1 >= 2:   # 连续2帧稳定 → 建轨前手机/手持物校验
-                        # 手机特征: 亮屏/暗屏/肤色占比高 → 拒绝建轨
-                        xi1, yi1 = max(0, int(sb[0])), max(0, int(sb[1]))
-                        xi2, yi2 = min(W, int(sb[2])), min(H, int(sb[3]))
-                        reject = False
-                        if xi2 - xi1 >= 6 and yi2 - yi1 >= 6:
-                            crop = frame[yi1:yi2, xi1:xi2]
-                            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-                            pix = crop.shape[0] * crop.shape[1]
-                            bright = np.sum(cv2.inRange(hsv, (0,0,200), (180,255,255)) > 0) / pix
-                            dark = np.sum(cv2.inRange(hsv, (0,0,0), (180,50,120)) > 0) / pix
-                            skin = np.sum(cv2.inRange(hsv, (0,25,50), (45,180,255)) > 0) / pix
-                            if bright > 0.45 or dark > 0.55 or skin > 0.50:
-                                reject = True
-                        if not reject:
-                            _sig0 = extract_sig(frame, sb)
-                            smoke_tracks.append([KalmanBox(sb, pn=0.80, mn=0.05, sig=_sig0), next_id + 5000])
-                            next_id += 1
-                        low_suspects.pop(k)
-                    hit = True; break
-            if not hit:
-                low_suspects.append((sb, 1))
-    low_suspects = [(lb, cnt) for lb, cnt in low_suspects if cnt < 8]  # 8帧未确认则遗忘
+    # ===== (已删除: 长期追踪找回 try_recover_smoke — 长记忆取消) =====
+    # ===== (已删除: 低分稳定框建轨 low_suspects — 长记忆取消) =====
     # 新轨迹: 仅高分框创建 (低分池不建新轨, 防误检污染); 烟用快跟随Kalman(减少漂移)
     for j, sb in enumerate(raw_smoke):
         if j not in sm_det and len(smoke_tracks) < 6:
@@ -1004,10 +960,8 @@ while True:
         bx1, by1, bx2, by2 = st[0].bbox
         if bx2 < 0 or by2 < 0 or bx1 > W or by1 > H:
             st[0].lost = 99
-    # 未确认轨道(噪声)快速清除: confirmed<2 的10帧即清(熬过波动防闪);
-    # 已确认轨迹(confirmed>=2)允许长期找回: lost<30 (SIG_RECOVER_FRAMES) 保留, 超时清防幽灵
-    smoke_tracks = [st for st in smoke_tracks
-                    if st[0].lost < (SIG_RECOVER_FRAMES if st[0].confirmed >= 2 else 10)]
+    # ★ 防闪缓冲(用户17:30): 连续丢3帧才删轨(滤单帧检测波动), 真消失0.15s内清除
+    smoke_tracks = [st for st in smoke_tracks if st[0].lost < 3]
 
     # 误检帧自动采集: 有确认烟轨时保存整帧(限频), 供筛选负样本
     if smoke_tracks and time.time() - last_auto_save >= 0.5:
@@ -1044,9 +998,21 @@ while True:
                 _s_in = True; break
         if not _s_in:
             continue   # 不在头/手区域 → 不显示(装没看见)
+        # ★★ 红框必须与蓝框/绿框有交集(用户17:07要求): 一脱离立即不显示, 无缓冲
+        _touch_now = False
+        _dbb = st[0].disp_bbox
+        for (_tbx1, _tby1, _tbx2, _tby2) in list(det_hands) + list(det_heads):
+            if iou(_dbb, (_tbx1, _tby1, _tbx2, _tby2)) > 0.0:
+                _touch_now = True; break
+        if not _touch_now:
+            continue   # ★ 红框已脱离蓝/绿框 → 立即消失(不显示预测框)
         # 显示: 稳定轨全显; 新轨(lost<3)也显(减少"刚出现就消失"的闪烁)
         sw, sh = st[0].disp_bbox[2]-st[0].disp_bbox[0], st[0].disp_bbox[3]-st[0].disp_bbox[1]
-        if (sw*sh)/(W*H) < 0.01 and st[0].confirmed < 1 and st[0].lost >= 3:
+        # ★★ 防闪缓冲(用户17:30): 丢失<3帧(单帧检测波动)保持显示, 连续丢3帧(~0.15s)才消失
+        #   解决"一闪一闪": 每帧检测conf波动导致偶发漏检, 零缓冲会直接闪; 3帧缓冲滤掉波动
+        if st[0].lost >= 3:
+            continue
+        if (sw*sh)/(W*H) < 0.01 and st[0].confirmed < 1 and st[0].lost >= 1:
             continue
         sx1, sy1, sx2, sy2 = map(int, st[0].disp_bbox)
         if st[0].lost > 0:
