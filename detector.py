@@ -220,6 +220,8 @@ class MultiStageDetector:
                 all_heads.append({"bbox": [hx1, hy1, hx2, hy2], "track_id": tid, "source": source_tag})
                 if do_smoke and hy2 > hy1 and hx2 > hx1:
                     roi = self._augment_roi(frame[hy1:hy2, hx1:hx2])
+                    # ★ 浅色背景局部对比度增强: 亮度>180才触发, 强化烟-背景边缘
+                    roi = self.enhance_cigarette_contrast(roi)
                     smoke_dets = self._detect_smoking_fast(roi)
                     for sd in smoke_dets:
                         all_alerts.append({
@@ -249,6 +251,8 @@ class MultiStageDetector:
                 roi_type = f"hand_{side.lower()}"
                 if do_smoke and hy2 > hy1 and hx2 > hx1:
                     roi = self._augment_roi(frame[hy1:hy2, hx1:hx2])
+                    # ★ 浅色背景局部对比度增强: 亮度>180才触发, 强化烟-背景边缘
+                    roi = self.enhance_cigarette_contrast(roi)
                     smoke_dets = self._detect_smoking_fast(roi)
                     for sd in smoke_dets:
                         all_alerts.append({
@@ -540,6 +544,30 @@ class MultiStageDetector:
         roi = roi * contrast
         roi = np.clip(roi, 0, 255).astype(np.uint8)
         return roi
+
+    def enhance_cigarette_contrast(self, roi: np.ndarray) -> np.ndarray:
+        """浅色背景局部对比度增强: 强化香烟与背景的边缘, 浅色背景下识别更准
+        自适应策略: ROI平均亮度 > 180(浅色背景场景)才触发, 暗光场景不多跑一步
+        1. CLAHE(clipLimit=3.0, tileGridSize=4x4) 在 LAB 色彩空间 L 通道局部直方图均衡
+        2. 3×3 锐化核(kernel=[-1,-1,-1; -1,9,-1; -1,-1,-1]) 边缘增强
+        调用位置: ROI裁剪+基础增强之后, 送抽烟检测模型之前
+        """
+        if roi is None or roi.size == 0:
+            return roi
+        # 自适应开关: 平均亮度>180(浅色背景)才增强, 暗光/正常光直接返回
+        gray = cv2.cvtColor(roi, cv2.COLOR_BGR2GRAY)
+        if float(gray.mean()) <= 180.0:
+            return roi
+        # 1) CLAHE 在 LAB L 通道局部直方图均衡化
+        lab = cv2.cvtColor(roi, cv2.COLOR_BGR2LAB)
+        l, a, b = cv2.split(lab)
+        clahe = cv2.createCLAHE(clipLimit=3.0, tileGridSize=(4, 4))
+        l = clahe.apply(l)
+        roi_enh = cv2.cvtColor(cv2.merge([l, a, b]), cv2.COLOR_LAB2BGR)
+        # 2) 3×3 锐化核边缘增强
+        kernel = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]], dtype=np.float32)
+        roi_enh = cv2.filter2D(roi_enh, -1, kernel)
+        return np.clip(roi_enh, 0, 255).astype(np.uint8)
 
     @staticmethod
     def _filter_parts_by_person(parts: list, person_boxes: list, max_offset: float = 1.5) -> list:

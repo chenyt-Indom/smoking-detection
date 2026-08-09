@@ -52,12 +52,11 @@ _last_gamma = None       # 上次 gamma 值(仅变化时重建 LUT)
 _lut_cache = None        # gamma LUT 缓存
 
 def light_adapt(frame):
-    """光线自适应 v2:
+    """光线自适应 v3: 减少灰蒙蒙(避免 4 重压暗叠加)
     ① 过曝感知: 过曝占比>8% 禁用CLAHE + 强压gamma(防过曝误检)
-    ② 局部亮度平衡: 明暗不统一时(暗背景+亮前景), 用背景估计做除法均衡
-       (治"镜头里光线不统一"→ 均衡后全画面亮度一致)
-    ③ 亮度压低: 整体目标亮度偏暗(用户实验: 暗背景追踪比亮背景准)
-    ④ 暗光 CLAHE 提纹(烟纸纤维凸显)
+    ② 局部亮度平衡(明暗不统一时启用, 目标130偏亮→ 减少灰蒙蒙)
+    ③ 暗光 CLAHE 提纹(烟纸纤维凸显) — tileGridSize 8x8(更柔和, 避免刷平细节)
+    ④ gamma: 正常情况 1.0(不压暗, 由显示层 0.70 统一压, 避免双重叠加)
     ⑤ 动态光变快速响应(luma_ema 0.7)
     """
     global _luma_ema
@@ -91,45 +90,55 @@ def light_adapt(frame):
         out = frame.copy()
     else:
         # ③ 局部亮度平衡(明暗不统一 → 均衡): L -= 背景估计 + 目标灰度
-        #    bg(大核均值) 代表局部背景亮度; L-bg 消除明暗差, 再整体压低
-        if bright_range > 70.0:   # 光线明显不统一(明暗共存)才启用
-            bg = cv2.GaussianBlur(lf, (0, 0), 21)   # 45→21: 帧率优化(轻量化)
-            target = 105.0     # 均衡后目标亮度: 偏暗(暗背景追踪更准)
+        #    bg(大核均值) 代表局部背景亮度; L-bg 消除明暗差
+        #    目标130(原105→130: 偏亮, 减少灰蒙蒙)
+        if bright_range > 70.0:
+            bg = cv2.GaussianBlur(lf, (0, 0), 21)
+            target = 130.0     # ★ 105→130: 平衡后偏亮, 保留更多明暗细节
             lf = lf - bg + target
             lf = np.clip(lf, 0, 255)
-        # ④ CLAHE 局部对比度(提纹) — tileGridSize 4x4: 帧率优化(快4倍)
-        #    对象全局缓存(避免每帧重建)
+        # ④ CLAHE 局部对比度(提纹) — tileGridSize 8x8(原4x4→8x8: 更柔和, 避免刷平)
         global _clahe_obj
         if luma < 120:
             clip = 3.0    # 暗光强提纹
         else:
             clip = 1.5
         if _clahe_obj is None or abs(_clahe_obj.getClipLimit() - clip) > 0.01:
-            _clahe_obj = cv2.createCLAHE(clipLimit=clip, tileGridSize=(4, 4))
+            _clahe_obj = cv2.createCLAHE(clipLimit=clip, tileGridSize=(8, 8))  # ★ 4x4→8x8 更柔和
         lf = _clahe_obj.apply(lf.astype(np.uint8)).astype(np.float32)
+        # ⑤ ★ 边缘对比度增强(Unsharp Mask) — 治"白背景烟边缘梯度不足"
+        #    用户实测: 白烟在浅色背景(白门/白墙)上识别不出 — 边缘梯度仅5-15灰阶, 模型看不见
+        #    Unsharp: lf + amount*(lf - blur) → 边缘过冲, 梯度放大, 烟轮廓凸显
+        #    ★ 用户要求加强: amount 1.5→2.8(更强边缘), std阈值 60→80(更多浅色场景触发)
+        #    触发条件: 高亮(luma>140) + 低梯度(std<80) = 均匀浅色背景场景
+        #    正常/暗光场景 amount≈0 不触发, 避免噪声放大
+        if luma > 140:
+            _gstd = float(np.std(gray))
+            if _gstd < 80.0:
+                _blur = cv2.GaussianBlur(lf, (0, 0), 3)
+                lf = lf + 2.8 * (lf - _blur)   # ★ amount=2.8(原1.5): 更强边缘强化
+                lf = np.clip(lf, 0, 255)
         out = cv2.cvtColor(cv2.merge([lf.astype(np.uint8), a, b]), cv2.COLOR_LAB2BGR)
-    # 5) gamma 校正(亮度整体压低 → 偏暗, 用户实验: 暗背景追踪更准)
+    # 5) gamma 校正: 正常情况 1.0(原1.10→1.0: 不在 light_adapt 压暗, 统一交给显示层 0.70)
     if isinstance(LIGHT_MODE, (int, float)):
         gamma = float(LIGHT_MODE)
-    elif pct_overexposed > 0.20:    # 极过曝 → 极强压(亮度压低)
+    elif pct_overexposed > 0.20:    # 极过曝 → 极强压
         gamma = 2.2
     elif pct_overexposed > 0.08:    # 过曝 → 强压
         gamma = 1.8
-    elif luma < 75:        # 很暗 → 温和提亮(不暴亮, 保持暗调)
+    elif luma < 75:        # 很暗 → 温和提亮
         gamma = 0.75
     elif luma < 110:       # 偏暗 → 微提
         gamma = 0.88
     elif luma > 150:
         # ★ 白背景特化(治"白烟在白背景识别不出"): 高亮+均匀(白墙/白桌面)
-        #   灰度方差低 = 背景是纯白/浅色均匀面 → 强压gamma让背景暗下来,
-        #   白烟(有纤维纹理+滤嘴棕)对比凸显, 模型conf提升
         gstd = float(np.std(gray))
         if gstd < 50:
-            gamma = 1.6    # 白背景场景: 强压(白烟凸显)
+            gamma = 1.6    # 白背景场景: 强压
         else:
-            gamma = 1.30   # 偏亮但有内容 → 普通压
+            gamma = 1.30
     else:
-        gamma = 1.10       # 正常亮度也微压(保持暗调, 追踪更稳)
+        gamma = 1.0        # ★ 原1.10→1.0: 正常情况不压暗(避免双重叠加灰蒙蒙)
     if abs(gamma - 1.0) > 0.02:
         global _last_gamma, _lut_cache
         if _last_gamma is None or abs(_last_gamma - gamma) > 0.01:
@@ -238,11 +247,11 @@ def is_paper_material(crop, area_ratio, last_glint=None):
         return True, td, glint, last_glint
     # 核心判据(AND): 纸 = 有纹理(≥0.10) 且 低反光(<0.25)
     # ★ 门槛已放宽(用户反馈光线影响材质判定): 原0.15/0.15 过严, 光线变化时误杀真烟
-    is_paper = (td >= 0.10) and (glint < 0.25)
+    is_paper = (td >= 0.06) and (glint < 0.30)   # ★ td 0.10→0.06 / glint 0.25→0.30 (应对光线过滤纹理变化, 减小材质判定严格度)
     if not is_paper:
         # 双保险: 有纹理且帧间反光稳定(波动<0.05) → 漫反射=纸(塑料反光会闪烁)
         if last_glint is not None and last_glint > 0:
-            if td >= 0.10 and abs(glint - last_glint) < 0.05:
+            if td >= 0.06 and abs(glint - last_glint) < 0.05:
                 is_paper = True
     return is_paper, td, glint, glint
 
@@ -432,13 +441,10 @@ while True:
     for t in tracks: t[0].predict()
     for st in smoke_tracks: st[0].predict()
 
-    # ★ 光线自适应隔帧启用(治"暗光真烟漏检+过曝误检", 帧率代价~3.5ms均摊):
-    #   偶数帧用增强帧(暗光提纹/过曝压制), 奇数帧用原帧
+    # ★ 光线自适应每帧执行(治"暗光真烟漏检+过曝误检", 帧率代价~7ms):
     #   完全停用会导致: 暗光真烟材质误杀(纹理不足) + 过曝区误检 — 用户实测已证实
-    if (fc % 2) == 0:
-        frame_enh = light_adapt(frame)
-    else:
-        frame_enh = frame
+    #   显示层同步呈现增强帧(用户要求: 对比度/光线自适应效果在视频中可见)
+    frame_enh = light_adapt(frame)
 
     # --- V7 头检测 (原始帧, conf=0.30 用户要求提高精度) ---
     # 320近距大头副检已移除(用户反馈: 背景内容被误识别为头)
@@ -489,8 +495,12 @@ while True:
     _over_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     _over_mask = _over_gray > 235
     # 主检测(640): 标准推理
-    # conf 0.15→0.25: 提高置信度, 挡掉门锁/音箱/书本/手指等低分误检
-    # ★ 副检测已移除(用户要求加帧率): 每帧仅1次烟推理, 动态模糊/小烟兜底靠"历史5帧融合"
+    # ★ 纯形状识别模式(用户要求): conf 0.12 — 停用材质/颜色后, 靠模型+形状把关
+    #   原0.06是为颜色加权放行的弱信号; 现无加权, 提到0.12挡纯噪声(过曝/背景低分)
+    # 主检测(640): 标准推理
+    # ★ 纯形状识别模式(用户要求): conf 0.06 — 放行低对比小目标(白背景+远距)
+    #   现实根因: 白烟在白门/浅色背景对比度低+像素少 → V28 conf 0.03-0.06
+    #   原0.10会把这些漏掉; 0.06让弱信号进入, 靠"尺寸一致性+形状关"几何兜底
     sr = SMOKE(frame_enh, conf=0.06, iou=0.5, verbose=False)
     for r in sr:
         for box in r.boxes:
@@ -516,77 +526,66 @@ while True:
                         if float((_rg < 150).mean()) < 0.15:
                             continue   # 整框几乎全过曝(纯光晕/强光源) → 拒
 
-            # ===== ★ 提前复合评分(通用化, 收紧版) =====
-            # V28对低对比场景conf仅0.03-0.06, 用多特征加权让真烟通过
-            # 收紧(用户反馈误检多): 加分需"特征组合"触发, 单特征(仅棕/仅白)不给大分
-            #   真烟 = 棕滤嘴 + 白烟身 + 细长, 缺一不可(组合才有大加分)
-            qx1, qy1 = max(0, int(x1)), max(0, int(y1))
-            qx2, qy2 = min(W, int(x2)), min(H, int(y2))
-            if qx2 - qx1 >= 4 and qy2 - qy1 >= 4:
-                _qcrop = frame[qy1:qy2, qx1:qx2]
-                _qhsv = cv2.cvtColor(_qcrop, cv2.COLOR_BGR2HSV)
-                _qpix = max(1, _qcrop.shape[0] * _qcrop.shape[1])
-                _brown_q = float(np.sum(cv2.inRange(_qhsv, (8,40,60), (40,200,200)) > 0)) / _qpix
-                _paper_q = float(np.sum(cv2.inRange(_qhsv, (0,0,140), (180,45,255)) > 0)) / _qpix
-                _sat_q = float(np.sum(cv2.inRange(_qhsv, (0,60,60), (180,255,255)) > 0)) / _qpix
-                _bonus = 0.0
-                # 真烟特征组合(棕滤嘴+白烟身+细长): 任一组合触发加分
-                if _brown_q > 0.03 and _paper_q > 0.12:
-                    _bonus += 0.15       # 棕+有白 = 滤嘴特征(最强)
-                elif _brown_q > 0.015 and 3.0 < aspect < 6.0:
-                    _bonus += 0.06       # 弱棕+细长
-                if _paper_q > 0.35 and 3.0 < aspect < 6.0:
-                    _bonus += 0.08       # 白+细长 = 烟身特征
-                if _brown_q > 0.03 and _paper_q > 0.25:
-                    _bonus += 0.06       # 棕+白组合加成
-                # 负向特征(误检控制):
-                if _paper_q > 0.35 and _brown_q < 0.01:
-                    _bonus -= 0.20       # 纯白无棕 = 塑料/白纸 → 强扣
-                if _sat_q > 0.25:
-                    _bonus -= 0.10       # 高饱和鲜艳 = 非烟色 → 扣
-                if _brown_q > 0.25 and _paper_q < 0.08:
-                    _bonus -= 0.10       # 棕多白极少 = 棕色物体(木条/纸箱) → 扣
-                conf = min(0.40, conf + _bonus)
+            # ===== ★ 纯形状识别模式(用户要求): 停用材质关+颜色关 =====
+            # 光线照射/远距会使材质(纹理/反光)与颜色(滤嘴棕/烟纸白)判断不可靠
+            # → 回归最稳妥: 只用图形特征(细长条 aspect + 距离尺寸一致性)识别
+            # conf 保持模型原始值(不靠颜色加权), 弱信号由形状关+尺寸校验兜底
 
             # ===== 距离机制: 头框宽 → 距离分级 → 阈值 + 尺寸一致性校验 =====
             nearest_hw = None
             best_d2 = 1e18
+            nearest_hw_dist = 1e18   # ★ 烟到最近人头中心的距离(px)
             for hb, hw0 in head_list:
                 hcx, hcy = (hb[0]+hb[2])/2, (hb[1]+hb[3])/2
                 d2 = (cx-hcx)**2 + (cy-hcy)**2
                 if d2 < best_d2:
                     best_d2 = d2; nearest_hw = hw0
+                    nearest_hw_dist = d2 ** 0.5
             if nearest_hw is not None:
                 hw = nearest_hw
-                # ★ 距离阈值大幅降低(用户实测: 0.27/0.32太严, 弱conf真烟被拒, 颜色加权没机会生效)
-                #   原 0.32/0.32/0.27 → 现 0.18/0.18/0.15(让conf 0.15+加权后过)
-                if hw >= 150: dt = 0.18   # 近距: conf 0.15+颜色加权(棕+0.18)=0.33过
-                elif hw >= 60: dt = 0.18
-                else: dt = 0.15            # 远距: conf 0.15刚好过dt
+                # ★ 纯形状识别模式: 无颜色加权, dt 统一 = 模型conf(0.12)
+                #   原 0.18/0.18/0.15 是为"颜色加权后conf提升"设计, 现不需要分级
+                if hw >= 150: dt = 0.06   # 近距
+                elif hw >= 60: dt = 0.06
+                else: dt = 0.06            # 远距(统一0.06, 弱信号由形状关+尺寸校验兜底)
                 if conf < dt:
-                    # ByteTrack 低分池: 被距离阈值拒但≥0.15的合法框 → 供第二级关联(遮挡恢复)
+                    # ByteTrack 低分池: 被距离阈值拒但≥0.10的合法框 → 供第二级关联(遮挡恢复)
                     # 门槛: 细长(aspect≥1.8挡手机1.78) + 面积/形状约束
                     if conf >= 0.10 and area_ratio < 0.08 and aspect >= 1.8 and aspect <= 6.0:
                         low_pool.append((float(x1), float(y1), float(x2), float(y2)))
                     continue
-                # 尺寸一致性: 烟像素宽≈头宽×0.05(±余量); 胳膊/烟盒/手机≈0.25-0.40被拒
-                if hw < 60:                       # 远距严格校验
-                    if w > hw * 0.12: continue     # 框宽>烟应有宽度2.4倍 → 胳膊/烟盒/手机
-                    if w < hw * 0.01: continue     # 远距太窄 → 噪点
-                elif hw < 150:                    # 中距: 放宽(手持烟框含手指)
-                    if w > hw * 0.22: continue     # 超0.22 → 胳膊/烟盒
+                # ★ 尺寸一致性校验 — 只对"烟靠近人头"生效(烟-头距离 < 头宽×3)
+                #   白墙区烟离人头远(>头宽×3): 跳过尺寸校验, 靠形状关+面积兜底
+                #   (修复: 画面中央人头近+白墙区烟远 → 头宽比例失衡误杀白墙烟)
+                if nearest_hw_dist < hw * 3.0:
+                    if hw < 60:                       # 远距严格校验
+                        if w > hw * 0.12: continue     # 框宽>烟应有宽度2.4倍 → 胳膊/烟盒/手机
+                        if w < hw * 0.01: continue     # 远距太窄 → 噪点
+                    elif hw < 150:                    # 中距: 放宽(手持烟框含手指)
+                        if w > hw * 0.22: continue     # 超0.22 → 胳膊/烟盒
+                # else: 烟远离人头 → 不做尺寸约束(形状关+面积上限兜底)
             else:
-                if conf < 0.40:
-                    if conf >= 0.15 and area_ratio < 0.08 and aspect >= 1.8 and aspect <= 6.0:
+                # ★ 无头部参考时, 仍让弱信号进入过滤链(治白墙+远距小烟漏检)
+                #   原 conf<0.40 直接continue → 白背景烟 conf 0.14-0.17 直接被拒
+                #   现与 dt 一致: conf<0.06 才拒, 靠"形状关+面积"几何兜底防误检
+                if conf < 0.06:
+                    if conf >= 0.04 and area_ratio < 0.08 and aspect >= 1.8 and aspect <= 6.0:
                         low_pool.append((float(x1), float(y1), float(x2), float(y2)))
-                    continue           # 无头部检出 → 极保守
+                    continue           # conf 太低才拒绝
 
-            # ===== 形状关(所有框通用): 真烟细长条, 防大面积/极细长异常 =====
-            if conf < 0.30 and aspect < 1.3: continue  # 低置信须细长, 圆头/竖直需≥0.30
+            # ===== 形状关(距离感知): 真烟细长条, 防大面积/极细长异常 =====
+            # ★ 近距(hw≥150)放宽: 手持烟框内含手, 框更大/宽高比更低 → 不能按远距标准误杀
+            #   远距(纯烟条): 细长小框, 严格; 近距(手+烟): 允许更大/更宽
+            is_near = nearest_hw is not None and nearest_hw >= 150
+            if conf < 0.25 and aspect < (1.0 if is_near else 1.3): continue  # 近距允许近方形(手含烟)
             if aspect > 6.0: continue                   # 极细长(窗帘褶/线)
-            if area_ratio > 0.08: continue              # 大面积(整只手/物体)
+            if area_ratio > (0.18 if is_near else 0.08): continue  # 近距框含手, 面积上限放宽到18%
+            # ★ 无头参考时绝对宽度兜底: 远处胳膊/手宽(>40px)而烟窄(<30px)
+            #   之前尺寸校验被"远离人头跳过"后, 胳膊全放行 → 加绝对宽度上限
+            if nearest_hw is None and w > 40:
+                continue   # 无头参考 + 框宽>40px = 胳膊/手/物体 → 拒
 
-            # ===== D规则豁免: 已确认烟轨附近 → 跳过材质+颜色过滤 =====
+            # ===== D规则豁免: 已确认烟轨附近 → 跳过剩余过滤 =====
             # 真烟已连续确认, 位置吻合的框大概率还是它(即使近距手指入框肤色高)
             # "追踪一旦确认, 规则让位给追踪" → 根治近距误杀
             near_confirmed = False
@@ -596,74 +595,30 @@ while True:
                 tcx2, tcy2 = (tbb[0]+tbb[2])/2, (tbb[1]+tbb[3])/2
                 if ((cx-tcx2)**2 + (cy-tcy2)**2) ** 0.5 < max(60.0, (tbb[2]-tbb[0])*3.0):
                     near_confirmed = True; break
-            if not near_confirmed:
-                # ===== ★ 识别逻辑 v2: 先材质(纸质?) → 再形状(已在上方) =====
-                # 材质关(第一关, 新目标必过): 过滤出纸质材质(烟纸=哑光+纤维纹理+漫反射)
-                #   非纸质(塑料吸管/笔/玻璃/金属/光滑面)直接拒绝, 最强误检防线
-                #   材质crop用光线自适应增强帧(frame_enh): 暗光/逆光CLAHE提纹, 纸更易辨
-                #   ★ 去掉外层area_ratio>=0.002限制(细长烟area_ratio常<0.002被跳过,漏检)
-                #     只保留像素尺寸判断(>=4px才查), 内部is_paper_material有更精细判断
-                mxi1, myi1 = max(0, int(x1)), max(0, int(y1))
-                mxi2, myi2 = min(W, int(x2)), min(H, int(y2))
-                if mxi2 - mxi1 >= 4 and myi2 - myi1 >= 4:
-                    _mat_ok, _td, _glint, _ = is_paper_material(frame_enh[myi1:myi2, mxi1:mxi2], area_ratio, None)
-                    if not _mat_ok:
-                        continue   # 非纸质材质(光滑+高反光=塑料/玻璃/金属) → 拒
 
-                # ===== 颜色关 v3: 颜色从"硬杀"降为"弱权重"(用户要求) =====
-                # ★ 材质(纸质) + 形状(细长) 已是主要判定依据(上方两关硬门槛)
-                #   颜色只保留: ①极端双保险(材质漏网) ②无滤嘴纸条防线 ③肤色/亮屏放宽拒
-                #   其余颜色规则移除 → 真烟不再被颜色误杀(暗光/色偏/逆光都放行)
-                xi1, yi1 = max(0, int(x1)), max(0, int(y1))
-                xi2, yi2 = min(W, int(x2)), min(H, int(y2))
-                if xi2 - xi1 < 4 or yi2 - yi1 < 4: continue
-                crop = frame[yi1:yi2, xi1:xi2]
-                hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
-                pix = max(1, crop.shape[0] * crop.shape[1])
-                skin = np.sum(cv2.inRange(hsv, (0,25,50), (45,180,255)) > 0) / pix
-                pure_white = np.sum(cv2.inRange(hsv, (0,0,200), (180,25,255)) > 0) / pix
-                saturated = np.sum(cv2.inRange(hsv, (0,60,60), (180,255,255)) > 0) / pix
-                paper = np.sum(cv2.inRange(hsv, (0,0,150), (180,40,255)) > 0) / pix
-                bright_high = np.sum(cv2.inRange(hsv, (0,0,220), (180,255,255)) > 0) / pix
-                glint = np.sum(cv2.inRange(hsv, (0,0,235), (180,60,255)) > 0) / pix
-                brown = np.sum(cv2.inRange(hsv, (8,40,60), (40,200,200)) > 0) / pix  # 滤嘴棕
-                paper_mid = np.sum(cv2.inRange(hsv, (0,0,140), (180,45,255)) > 0) / pix  # 烟纸白亮
-                # ① 极端双保险(材质关漏网的塑料/玻璃/亮面):
-                if pure_white > 0.88 and glint > 0.12: continue   # 整框纯白+镜面反光(吸管/玻璃漏网)
-                if saturated > 0.60: continue                     # 大半鲜艳色(绿窗帘/彩物)
-                if bright_high > 0.55 and area_ratio > 0.02: continue  # 大片高亮均匀面(手机屏/反光面)
-                # ② 无滤嘴纸条防线(纸条/白纸片/书页边缘 — 材质是纸+形状细长但无滤嘴):
-                #    真烟必有滤嘴棕≥1.5%; 纸片/纸条全白无滤嘴 → 拒
-                #    ★ 放宽brown<0.015(原0.02过严, 远距/边缘真烟滤嘴占比稀释被误杀)
-                if aspect > 2.5 and brown < 0.015 and paper_mid < 0.20:
-                    continue
-                # ②b 纯白细长兜底(塑料吸管/白笔/白塑料管): 全白(paper_mid>0.45)+ 无棕 → 拒
-                #    ★ 放宽brown<0.015(原0.03, 真烟滤嘴brown≈0.05-0.08绝不触发)
-                if aspect > 2.5 and brown < 0.015 and paper_mid > 0.45:
-                    continue
-                # ②c 颜色加权已提前到距离机制前(避免双重加成), 此处只做二次过滤
-                # conf 二次过滤(复合评分后): 0.10→0.12 挡弱噪声(误检控制)
-                if conf < 0.12:
-                    continue
-                # ③ 肤色主导(手) 放宽(近距手指入框的真烟肤色高, 材质+形状已把关):
-                if skin > 0.85 and brown < 0.02: continue
-                # ④ 远近肤色分档(远距手指专项修复):
-                #    远距真烟肤色<10%(烟纸白); 远距手指框内肤色>15% → 拒
-                #    ★ 原0.35太松(远距手指框内背景多稀释肤色占比, 漏过误识别)
-                if area_ratio < 0.01:
-                    if skin > 0.15: continue    # 远距肤色>15% = 手指/手(原0.35→0.15)
-                    # 远距细长+肤色+无滤嘴 = 伸直的手指(手指细长条, 烟是白纸带滤嘴)
-                    if skin > 0.08 and aspect > 1.5 and brown < 0.03:
-                        continue
-                else:
-                    if skin > 0.88: continue    # 近距纯手(原0.80 → 放宽)
-                # ⑤ 手机/书本: 非细长+极亮屏/极暗屏(放宽阈值, 材质漏网兜底)
-                if aspect < 1.3 and area_ratio > 0.005:
-                    bright_mid = np.sum(cv2.inRange(hsv, (0,0,140), (180,60,255)) > 0) / pix
-                    dark = np.sum(cv2.inRange(hsv, (0,0,0), (180,50,120)) > 0) / pix
-                    if bright_mid > 0.40: continue    # 大片亮屏(原0.30 → 放宽)
-                    if dark > 0.60: continue          # 大片暗区(原0.55 → 放宽)
-                # ===== 颜色弱权重结束: 其余颜色差异不再硬杀, 放行 =====
+            # ===== 肤色主导拒(所有框生效, 不豁免已确认轨!) =====
+            # ★ 根治"手指误建轨后永远豁免": 远距手指肤色0.74-0.89(实测)
+            #   真烟肤色<0.40(白纸+滤嘴稀释) → 肤色主导拒对真烟无害
+            #   放在D规则豁免之前, 即使已确认烟轨也检查(手指不该被追踪豁免)
+            xi1, yi1 = max(0, int(x1)), max(0, int(y1))
+            xi2, yi2 = min(W, int(x2)), min(H, int(y2))
+            if xi2 - xi1 >= 6 and yi2 - yi1 >= 6:
+                _crop = frame[yi1:yi2, xi1:xi2]
+                _hsv = cv2.cvtColor(_crop, cv2.COLOR_BGR2HSV)
+                _pix = _crop.shape[0] * _crop.shape[1]
+                _skin = np.sum(cv2.inRange(_hsv, (0,25,50), (45,180,255)) > 0) / _pix
+                if _skin > 0.55:
+                    continue   # 肤色主导(>55%) = 手/胳膊/脸 → 拒(不管形状, 不豁免!)
+
+            if not near_confirmed:
+                # ===== 手指组合拒(仅新目标): 肤色较高+粗短 =====
+                # 实测均值: 手指 aspect≈1.9粗短 肤色≈0.35 | 香烟 aspect≈2.4细长
+                # 只对"新目标"检查(D规则豁免已确认烟轨)
+                if xi2 - xi1 >= 6 and yi2 - yi1 >= 6:
+                    if _skin > 0.30 and aspect < 2.2:
+                        continue   # 手指(肤色较高 + 粗短 aspect<2.2) → 拒
+
+            # (材质关/颜色关已停用 — 纯形状识别模式, D规则豁免仅预留)
 
             # ===== 头框重叠 + 头附近区域: 中心在头框内/下方的极小框 = 脸上特征(鼻/嘴/下巴/喉结) =====
             # ★ 已确认烟轨豁免: 烟移到嘴前/耳后(头框内)是正常吸烟姿态, 不能被脸上特征过滤误杀
@@ -876,10 +831,11 @@ while True:
         last_auto_save = time.time()
         cv2.imwrite(os.path.join(AUTO_SAVE, f'auto_{int(last_auto_save)}.jpg'), frame)
 
-    # --- 显示帧准备: ★ 全局亮度压低(用户要求"光亮压低", 非区域过滤) ---
-    #   整体亮度×0.62: 画面变暗不刺眼, 无"涂块"痕迹, 人脸/衣服/烟保持原色
-    #   (检测层的强光源过滤仍生效, 防误检; 显示层只做全局压暗)
-    _disp = cv2.convertScaleAbs(frame, alpha=0.70, beta=0)
+    # --- 显示帧准备: ★ 显示"增强后"的画面(用户要求: 对比度/光线自适应效果可见) ---
+    #   frame_enh = 光线自适应增强帧(CLAHE提纹+亮度平衡+gamma压暗/提亮)
+    #   显示增强帧 = 看到的画面与模型输入一致, 直接呈现转化后的效果
+    #   再叠加全局亮度×0.70(用户要求"光亮压低", 不刺眼)
+    _disp = cv2.convertScaleAbs(frame_enh, alpha=0.70, beta=0)
 
     # --- 绘制(在 _disp 上, 覆盖涂暗层, 标注框颜色保持鲜艳) ---
     for t in tracks:
