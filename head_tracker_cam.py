@@ -363,6 +363,9 @@ class KalmanBox:
         self.kf.statePost = np.array([[cx], [cy], [w], [h], [0], [0]], np.float32)
         self.bbox = bbox; self.lost = 0; self.confirmed = 0
         self.disp_bbox = bbox   # 显示用平滑框(EMA, 防瞬移/跳变)
+        # ★ 18:48 上下文激活: 该头/手框内确认过香烟 → True
+        #   激活后框内"非手自带物体"直接归类为烟(烟转向外形剧变不再丢失)
+        self.smoke_activated = False
         # ===== 长期追踪签名 (Re-ID): 丢失后找回用 =====
         self.sig = sig          # 外观签名 (None=尚未采集)
         self.sig_pool = []      # 历史签名池(最近N个代表外观, 容忍外观演变)
@@ -390,7 +393,8 @@ class KalmanBox:
         p = self.kf.predict().flatten()
         self.bbox = (float(p[0]-p[2]/2), float(p[1]-p[3]/2), float(p[0]+p[2]/2), float(p[1]+p[3]/2))
         # 显示平滑: 丢失期间显示框缓慢跟随预测(不跳变)
-        alpha = 0.50 if self.lost > 0 else 0.85  # ★预测期显示紧跟
+        # ★ 18:08 防抖: alpha 0.85→0.72, 烟框更稳定不"一抖一抖"(代价:轻微滞后)
+        alpha = 0.50 if self.lost > 0 else 0.72  # ★预测期显示紧跟
         d = self.disp_bbox
         self.disp_bbox = (
             d[0]*(1-alpha) + self.bbox[0]*alpha, d[1]*(1-alpha) + self.bbox[1]*alpha,
@@ -413,7 +417,8 @@ class KalmanBox:
         self.bbox = (float(p[0]-p[2]/2), float(p[1]-p[3]/2), float(p[0]+p[2]/2), float(p[1]+p[3]/2))
         # 显示平滑: EMA 混合检测框与旧显示框, 消除快速移动后的瞬移
         # 丢失重获时瞬移最大 → 检测置信度低(lost>0刚恢复)时用更重平滑
-        alpha = 0.50 if self.lost > 0 else 0.85  # ★显示紧跟检测(不滞后)
+        # ★ 18:08 防抖: alpha 0.85→0.72, 烟框更稳定不"一抖一抖"(代价:轻微滞后)
+        alpha = 0.50 if self.lost > 0 else 0.72  # ★显示紧跟检测(不滞后)
         d = self.disp_bbox
         self.disp_bbox = (
             d[0]*(1-alpha) + self.bbox[0]*alpha, d[1]*(1-alpha) + self.bbox[1]*alpha,
@@ -488,7 +493,7 @@ while True:
     # --- V7 头检测 (原始帧, conf=0.40 提升: 防手掌/圆形物被误认为头部) ---
     # 用户反馈(14:05): 手掌有时被识别成头部 → conf 0.30→0.40(更严格)
     # 手部有独立 hand.pt 检测(蓝色框), 头模型不再需要低conf容忍手掌
-    res = HEAD(frame, conf=0.55, iou=0.5, verbose=False)
+    res = HEAD(frame, conf=0.50, iou=0.5, verbose=False)
     det_heads = []
     for r in res:
         for box in r.boxes:
@@ -529,7 +534,7 @@ while True:
     det_hands = []
     if HAND_READY:
         try:
-            res_h = HAND(frame, conf=0.30, iou=0.5, verbose=False)
+            res_h = HAND(frame, conf=0.25, iou=0.5, verbose=False)
             for r in res_h:
                 for box in r.boxes:
                     b = box.xyxy[0].cpu().numpy()
@@ -604,26 +609,33 @@ while True:
     # ★★ 新架构(用户要求): 香烟检测注意力只放在"头部+手部"
     #   在头框/手框的扩张区域内找烟(烟常在嘴边/手持/耳后), 大幅减少全屏误检(椅子/门框/桌腿)
     #   头框扩张: 上下左右各扩(脸前/嘴前/耳后) | 手框扩张: 更大(手持烟/挥烟)
-    #   ★ 用户要求(14:14): 严格 — focus_regions 改用【本帧原始检测det_heads/det_hands】
-    #   不用 tracks/hand_tracks(它们含lost<5的历史轨迹, 检测不到时仍"虚假存在" → 误判烟)
-    #   本帧没检测到 → focus_regions空 → 烟识别关闭(符合"无头无手绝不识别")
+    #   ★ 稳定性(18:08): focus_regions 改用【平滑追踪框 tracks/hand_tracks】
+    #     本帧检测框每帧跳几px → ROI区域跟着抖 → 烟框"一抖一抖"
+    #     追踪框经Kalman平滑, 区域稳定 → 烟框稳定
+    #   ★ 严格性兜底: "交集判定"(候选烟必须与本帧det_heads/det_hands有交集)不变,
+    #     无头无手(本帧) → 候选全拒 → 依然"无头无手绝不识别"
     focus_regions = []
-    for (hx1, hy1, hx2, hy2) in det_heads:           # 本帧头检测(不含历史)
+    for t in tracks:                                  # 平滑头追踪框
+        hx1, hy1, hx2, hy2 = t[0].bbox
         hw_, hh_ = hx2-hx1, hy2-hy1
         focus_regions.append((max(0, hx1-hw_*0.6), max(0, hy1-hh_*0.9),
                               min(W, hx2+hw_*0.6), min(H, hy2+hh_*0.6)))
-    for (hx1, hy1, hx2, hy2) in det_hands:            # 本帧手检测(不含历史)
+    for ht in hand_tracks:                            # 平滑手追踪框
+        hx1, hy1, hx2, hy2 = ht[0].bbox
         hw_, hh_ = hx2-hx1, hy2-hy1
         focus_regions.append((max(0, hx1-hw_*1.2), max(0, hy1-hh_*0.6),
                               min(W, hx2+hw_*1.2), min(H, hy2+hh_*1.6)))
     # 无头无手: focus_regions为空 → 本帧不做烟检测(严格限定区域, 不识别区域外)
     # ★★ 新架构(用户需求): ROI 裁剪放大独立检测 — "放大方框看附近小区域有没有香烟"
-    #   头框/手框出现 → 裁剪扩张区域ROI → 放大到640 → 独立跑SMOKE → 框坐标换算回全图
+    #   头框/手框出现 → 裁剪扩张区域ROI → 放大到768 → SMOKE批量推理 → 框坐标换算回全图
     #   相比"全图1024+中心过滤": 区域小图被放大, 有效分辨率翻倍, 小烟/被挡一半的烟更好检出
-    #   区域上限4个(多人场景防性能下降); 无头无手 → sr空 → 烟识别关闭
+    #   ★性能拉满(18:05): 所有ROI收集后一次batch前向(替代逐区域串行), 频率翻倍
+    #   ★质量提升: 放大目标640→768(细节+20%), 区域上限4→6(多人)
+    #   无头无手 → sr空 → 烟识别关闭
     sr = []
     if focus_regions:
-        _roi_budget = 4
+        _roi_budget = 6
+        _batch_imgs = []   # (放大图, 全图x原点, 全图y原点, 放大系数)
         for (frx1, fry1, frx2, fry2) in focus_regions:
             if _roi_budget <= 0: break
             # ★ 坐标转int再切片(模型输出float, numpy切片必须整数)
@@ -632,13 +644,17 @@ while True:
             _frw, _frh = _frx2-_frx1, _fry2-_fry1
             if _frw < 24 or _frh < 24: continue
             _roi = frame_enh[_fry1:_fry2, _frx1:_frx2]
-            _scale = 640.0 / max(_frw, _frh)      # 放大系数(区域小→放大倍数大)
+            _scale = 768.0 / max(_frw, _frh)      # ★ 放大目标768(质量)
             _tw, _th = int(_frw*_scale+0.5), int(_frh*_scale+0.5)
             if _tw < 16 or _th < 16: continue
+            _roi_big = cv2.resize(_roi, (_tw, _th), interpolation=cv2.INTER_LINEAR)
+            _batch_imgs.append((_roi_big, _frx1, _fry1, _scale))
+            _roi_budget -= 1
+        if _batch_imgs:
             try:
-                _roi_big = cv2.resize(_roi, (_tw, _th), interpolation=cv2.INTER_LINEAR)
-                _rr = SMOKE(_roi_big, conf=0.06, iou=0.5, imgsz=640, verbose=False)
-                for _rrc in _rr:
+                _rr_all = SMOKE([b[0] for b in _batch_imgs], conf=0.03, iou=0.5,
+                                imgsz=768, verbose=False)   # ★ batch一次前向
+                for _rrc, (_img, _frx1, _fry1, _scale) in zip(_rr_all, _batch_imgs):
                     for _b2 in _rrc.boxes:
                         _bc = float(_b2.conf[0])
                         _bx1, _by1, _bx2, _by2 = _b2.xyxy[0].cpu().numpy()
@@ -646,7 +662,6 @@ while True:
                         _ox1 = _frx1 + _bx1/_scale; _oy1 = _fry1 + _by1/_scale
                         _ox2 = _frx1 + _bx2/_scale; _oy2 = _fry1 + _by2/_scale
                         sr.append(_RoiRes([_RoiBox(_ox1, _oy1, _ox2, _oy2, _bc)]))
-                _roi_budget -= 1
             except Exception:
                 pass
     else:
@@ -677,14 +692,43 @@ while True:
             #   ② 手持烟: 在手框(蓝)内/重叠 → 放行
             #   ③ 窗格栅/门框/桌面/远处烟: 与任何头/手框无交集 → 拒
             _touch_hand = False; _touch_head = False
-            for (_tbx1, _tby1, _tbx2, _tby2) in det_hands:
+            # ★ 18:10 防断续: 交集判定用【本帧检测 + 平滑追踪框】
+            #   本帧头/手检测帧间波动(漏1-2帧) → 追踪框(lost<5)兜底, 烟不闪断
+            #   真消失(连续丢帧, 追踪框也清) → 交集失败 → 烟框消失(不残留)
+            for (_tbx1, _tby1, _tbx2, _tby2) in list(det_hands) + [ht[0].bbox for ht in hand_tracks]:
                 if iou((x1, y1, x2, y2), (_tbx1, _tby1, _tbx2, _tby2)) > 0.0:
                     _touch_hand = True; break
-            for (_tbx1, _tby1, _tbx2, _tby2) in det_heads:
+            for (_tbx1, _tby1, _tbx2, _tby2) in list(det_heads) + [t[0].bbox for t in tracks]:
                 if iou((x1, y1, x2, y2), (_tbx1, _tby1, _tbx2, _tby2)) > 0.0:
                     _touch_head = True; break
             if not (_touch_hand or _touch_head):
                 continue   # ★ 严格: 红框未与蓝/绿框有交集 → 一律拒(不管多像烟)
+
+            # ===== ★★ 上下文激活(用户18:48): 已激活的手/头框内 → 直接归类为烟 =====
+            #   某手/头框ID内确认过一次烟 → 激活 → 框内"非手自带物体"直接算烟
+            #   应对: 烟转向时外形剧变(像素重排)导致检测框消失/漏判
+            _in_activated = False
+            for _ht in hand_tracks:
+                if _ht[0].smoke_activated and iou((x1, y1, x2, y2), _ht[0].bbox) > 0.05:
+                    _in_activated = True; break
+            for _t in tracks:
+                if _t[0].smoke_activated and iou((x1, y1, x2, y2), _t[0].bbox) > 0.05:
+                    _in_activated = True; break
+            if _in_activated:
+                raw_smoke.append((float(x1), float(y1), float(x2), float(y2)))
+                continue   # ★ 已激活框内 → 直接归类, 不再推导/过滤
+
+            # ===== ★ 快速放行(用户18:48): 在框内 + 满足任一充分条件 → 直接归类 =====
+            #   充分条件: 细长(aspect 1.8-6) + 有纹理(非纯色) → 就是烟, 跳过复杂过滤
+            #   (门框/椅背=纯色细长 → 低纹理排除; 手机近方形 → 不触发, 走原过滤链)
+            if 1.8 <= aspect <= 6.0 and area_ratio < 0.18:
+                _qcrop = frame[max(0,int(y1)):min(H,int(y2)), max(0,int(x1)):min(W,int(x2))]
+                if _qcrop.size >= 16:
+                    _qg = cv2.cvtColor(_qcrop, cv2.COLOR_BGR2GRAY)
+                    _lap_var = cv2.Laplacian(_qg, cv2.CV_64F).var()
+                    if _lap_var >= 8.0:
+                        raw_smoke.append((float(x1), float(y1), float(x2), float(y2)))
+                        continue   # ★ 细长+有纹理+在框内 → 直接归类为烟
 
             # ===== 强光源直接过滤: 整框几乎全过曝 → 直接拒 =====
             # 治"强光源/灯具/过曝区被误判为烟"
@@ -907,6 +951,16 @@ while True:
             merged.append(sb)
     raw_smoke = merged
 
+    # ★★ 18:48 上下文激活: 本帧确认的烟 → 激活其所属手/头框(ID)
+    #   该框内后续出现"非手自带物体" → 直接归类为烟(快速放行分支)
+    for _sb in raw_smoke:
+        for _ht in hand_tracks:
+            if iou(_sb, _ht[0].bbox) > 0.05:
+                _ht[0].smoke_activated = True
+        for _t in tracks:
+            if iou(_sb, _t[0].bbox) > 0.05:
+                _t[0].smoke_activated = True
+
     # ★★ 长记忆已取消(用户17:19): 删除历史框快照(smoke_history)/低分池融合
     #   检测框只来自本帧 raw_smoke, 无跨帧历史 → 丢失立即删框
 
@@ -998,10 +1052,12 @@ while True:
                 _s_in = True; break
         if not _s_in:
             continue   # 不在头/手区域 → 不显示(装没看见)
-        # ★★ 红框必须与蓝框/绿框有交集(用户17:07要求): 一脱离立即不显示, 无缓冲
+        # ★★ 红框必须与蓝框/绿框有交集(用户17:07要求): 脱离立即不显示
+        #   18:10 防断续: 交集判定含平滑追踪框(本帧漏检1-2帧不闪断, 真消失才消失)
         _touch_now = False
         _dbb = st[0].disp_bbox
-        for (_tbx1, _tby1, _tbx2, _tby2) in list(det_hands) + list(det_heads):
+        for (_tbx1, _tby1, _tbx2, _tby2) in list(det_hands) + list(det_heads) + \
+                [ht[0].bbox for ht in hand_tracks] + [t[0].bbox for t in tracks]:
             if iou(_dbb, (_tbx1, _tby1, _tbx2, _tby2)) > 0.0:
                 _touch_now = True; break
         if not _touch_now:
@@ -1015,12 +1071,10 @@ while True:
         if (sw*sh)/(W*H) < 0.01 and st[0].confirmed < 1 and st[0].lost >= 1:
             continue
         sx1, sy1, sx2, sy2 = map(int, st[0].disp_bbox)
-        if st[0].lost > 0:
-            cv2.rectangle(_disp, (sx1,sy1), (sx2,sy2), (0,165,255), 2)
-            cv2.putText(_disp, "CIG?", (sx1, sy2+18), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,165,255), 1)
-        else:
-            cv2.rectangle(_disp, (sx1,sy1), (sx2,sy2), RED, 3)
-            cv2.putText(_disp, "CIG", (sx1, sy2+18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, RED, 2)
+        # ★ 统一红色(用户17:34): 防闪缓冲内(lost 0-2)不区分颜色, 消除红/黄交替闪烁
+        #   原: lost>0画黄框CIG?, lost=0画红框 → 检测抖动导致红黄交替闪
+        cv2.rectangle(_disp, (sx1,sy1), (sx2,sy2), RED, 3)
+        cv2.putText(_disp, "CIG", (sx1, sy2+18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, RED, 2)
 
     # 状态行(画在 _disp 上, 覆盖涂暗)
     cv2.putText(_disp, f"H:{len(tracks)} C:{len(smoke_tracks)} {fc/max(1,time.time()-t0):.0f}fps",
