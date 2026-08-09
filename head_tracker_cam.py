@@ -614,17 +614,17 @@ while True:
     #     追踪框经Kalman平滑, 区域稳定 → 烟框稳定
     #   ★ 严格性兜底: "交集判定"(候选烟必须与本帧det_heads/det_hands有交集)不变,
     #     无头无手(本帧) → 候选全拒 → 依然"无头无手绝不识别"
-    focus_regions = []
+    focus_regions = []   # (rx1, ry1, rx2, ry2, kind)  kind='head'/'hand'
     for t in tracks:                                  # 平滑头追踪框
         hx1, hy1, hx2, hy2 = t[0].bbox
         hw_, hh_ = hx2-hx1, hy2-hy1
         focus_regions.append((max(0, hx1-hw_*0.6), max(0, hy1-hh_*0.9),
-                              min(W, hx2+hw_*0.6), min(H, hy2+hh_*0.6)))
+                              min(W, hx2+hw_*0.6), min(H, hy2+hh_*0.6), 'head'))
     for ht in hand_tracks:                            # 平滑手追踪框
         hx1, hy1, hx2, hy2 = ht[0].bbox
         hw_, hh_ = hx2-hx1, hy2-hy1
         focus_regions.append((max(0, hx1-hw_*1.2), max(0, hy1-hh_*0.6),
-                              min(W, hx2+hw_*1.2), min(H, hy2+hh_*1.6)))
+                              min(W, hx2+hw_*1.2), min(H, hy2+hh_*1.6), 'hand'))
     # 无头无手: focus_regions为空 → 本帧不做烟检测(严格限定区域, 不识别区域外)
     # ★★ 新架构(用户需求): ROI 裁剪放大独立检测 — "放大方框看附近小区域有没有香烟"
     #   头框/手框出现 → 裁剪扩张区域ROI → 放大到768 → SMOKE批量推理 → 框坐标换算回全图
@@ -635,8 +635,9 @@ while True:
     sr = []
     if focus_regions:
         _roi_budget = 6
-        _batch_imgs = []   # (放大图, 全图x原点, 全图y原点, 放大系数)
-        for (frx1, fry1, frx2, fry2) in focus_regions:
+        # ★ 19:47 头/手区域分开批次, 手框区域 conf 更严(0.20)滤手指误检
+        _batches = [('head', [], 0.10), ('hand', [], 0.20)]
+        for (frx1, fry1, frx2, fry2, _kind) in focus_regions:
             if _roi_budget <= 0: break
             # ★ 坐标转int再切片(模型输出float, numpy切片必须整数)
             _frx1, _fry1 = max(0, int(frx1)), max(0, int(fry1))
@@ -648,20 +649,24 @@ while True:
             _tw, _th = int(_frw*_scale+0.5), int(_frh*_scale+0.5)
             if _tw < 16 or _th < 16: continue
             _roi_big = cv2.resize(_roi, (_tw, _th), interpolation=cv2.INTER_LINEAR)
-            _batch_imgs.append((_roi_big, _frx1, _fry1, _scale))
+            # 放入对应批次
+            for (_bk, _blist, _bc) in _batches:
+                if _bk == _kind:
+                    _blist.append((_roi_big, _frx1, _fry1, _scale))
             _roi_budget -= 1
-        if _batch_imgs:
+        # 逐批次推理
+        for (_bk, _blist, _bc) in _batches:
+            if not _blist: continue
             try:
-                _rr_all = SMOKE([b[0] for b in _batch_imgs], conf=0.03, iou=0.5,
-                                imgsz=768, verbose=False)   # ★ batch一次前向
-                for _rrc, (_img, _frx1, _fry1, _scale) in zip(_rr_all, _batch_imgs):
+                _rr_all = SMOKE([b[0] for b in _blist], conf=_bc, iou=0.5,
+                                imgsz=768, verbose=False)
+                for _rrc, (_img, _frx1, _fry1, _scale) in zip(_rr_all, _blist):
                     for _b2 in _rrc.boxes:
-                        _bc = float(_b2.conf[0])
+                        _bcx = float(_b2.conf[0])
                         _bx1, _by1, _bx2, _by2 = _b2.xyxy[0].cpu().numpy()
-                        # 放大图坐标 → 换算回全图坐标(以_int裁剪原点为基准)
                         _ox1 = _frx1 + _bx1/_scale; _oy1 = _fry1 + _by1/_scale
                         _ox2 = _frx1 + _bx2/_scale; _oy2 = _fry1 + _by2/_scale
-                        sr.append(_RoiRes([_RoiBox(_ox1, _oy1, _ox2, _oy2, _bc)]))
+                        sr.append(_RoiRes([_RoiBox(_ox1, _oy1, _ox2, _oy2, _bcx)]))
             except Exception:
                 pass
     else:
@@ -680,7 +685,7 @@ while True:
             # 香烟识别功能只存在于"头框/手框出现后"的框内及其附近
             # 区域外一律拒(即使候选是烟/即使靠近已确认烟轨) — "装没看见"
             _in_focus = False
-            for (frx1, fry1, frx2, fry2) in focus_regions:
+            for (frx1, fry1, frx2, fry2, _) in focus_regions:
                 if frx1 <= cx <= frx2 and fry1 <= cy <= fry2:
                     _in_focus = True; break
             if not _in_focus:
@@ -864,6 +869,19 @@ while True:
                     if not (_touch_head and aspect >= 2.0):
                         continue   # 肤色主导(>55%) = 手/胳膊/脸 → 拒(不管形状, 不豁免!)
 
+            # ===== ★★ 手持区域肤色互斥(用户19:44: 持物是烟检测的开关) =====
+            #   候选与手框"部分重叠"(IoU 0.03-0.4) = 潜在手持烟 → 必须"非肤色"
+            #   空手: 手指/手掌被当烟 → 框内肤色高(≥0.45) → 拒(未持物绝不框烟)
+            #   持物: 真烟白色纸+棕滤嘴 → 框内肤色低(<0.45) → 放行(等于"拍到真烟才持物")
+            _hand_partial = False
+            for (_hbx1, _hby1, _hbx2, _hby2) in list(det_hands) + [ht[0].bbox for ht in hand_tracks]:
+                _hiou = iou((x1, y1, x2, y2), (_hbx1, _hby1, _hbx2, _hby2))
+                # ★ 19:47 扩大: IoU>0.01(任何交集) 即触发检查, 防红框伸出框外绕过互斥
+                if 0.01 < _hiou <= 0.4:
+                    _hand_partial = True; break
+            if _hand_partial and _skin >= 0.45:
+                continue   # ★ 手框内疑似烟但肤色主导 = 手指/手掌被当烟 → 拒(未持物不框烟)
+
             if not near_confirmed:
                 # ===== 手指组合拒(仅新目标): 肤色较高+粗短 =====
                 # 实测均值: 手指 aspect≈1.9粗短 肤色≈0.35 | 香烟 aspect≈2.4细长
@@ -1032,6 +1050,23 @@ while True:
         hx1, hy1, hx2, hy2 = map(int, ht[0].disp_bbox if hasattr(ht[0], 'disp_bbox') else ht[0].bbox)
         cv2.rectangle(_disp, (hx1,hy1), (hx2,hy2), (255,0,0), 2)   # 蓝色
         cv2.putText(_disp, "HAND", (hx1, hy1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,0), 1)
+# ★★ 19:35 手持物判断v5: 只认"拍到真烟", 排除"手本身被当烟"
+        #   ✅ 持物 = 已确认烟轨(confirmed≥3, 当前帧在手框内) 且 与手框"部分重叠"
+        #   ★ 互斥判定(关键): 烟框与手框 IoU 必须 ∈ (0.03, 0.4]
+        #     - 手持真烟: 烟框小(细长), 部分嵌入手里 → IoU≈0.05-0.3 → 持物 ✅
+        #     - 手/手指被当烟(空手误检): 烟框≈手框 → IoU>0.4 → 排除 ❌
+        #     - 烟离手(嘴前/桌面): 无交集 IoU=0 → 不算手持 ✅
+        _holding = False
+        for _st in smoke_tracks:
+            if _st[0].confirmed < 3: continue        # 连续≥3帧稳定(滤短时误检)
+            if _st[0].lost > 0: continue             # 当前帧还在(防历史轨残影)
+            _sbb = _st[0].bbox
+            _iou_h = iou(_sbb, (hx1, hy1, hx2, hy2))
+            if 0.03 < _iou_h <= 0.4:                 # 部分重叠 = 手持真烟
+                _holding = True; break
+        _htxt = "持物" if _holding else "空手"
+        _hcol = (0, 255, 255) if _holding else (255, 0, 0)
+        cv2.putText(_disp, _htxt, (hx1, hy2+16), cv2.FONT_HERSHEY_SIMPLEX, 0.45, _hcol, 1)
 
     for t in tracks:
         x1, y1, x2, y2 = map(int, t[0].bbox)
@@ -1047,7 +1082,7 @@ while True:
         _scx = (st[0].disp_bbox[0]+st[0].disp_bbox[2])/2
         _scy = (st[0].disp_bbox[1]+st[0].disp_bbox[3])/2
         _s_in = False
-        for (frx1, fry1, frx2, fry2) in focus_regions:
+        for (frx1, fry1, frx2, fry2, _) in focus_regions:
             if frx1 <= _scx <= frx2 and fry1 <= _scy <= fry2:
                 _s_in = True; break
         if not _s_in:
