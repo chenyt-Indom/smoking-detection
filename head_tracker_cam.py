@@ -8,13 +8,24 @@ from ultralytics import YOLO
 HEAD = YOLO(r"D:\视觉安防系统\models\yolov8n_head_v7.pt", task='detect')
 SMOKE = YOLO(r"D:\视觉安防系统\models\smoke_cig_v28.pt", task='detect')
 HEAD.to('cuda'); SMOKE.to('cuda')
+# ★★ 手部检测模型(新架构: 手掌蓝色框 + 香烟聚焦头/手区域)
+#   hand.pt 由 COCO 手部数据集训练, 训练完成后放入 models/ 自动启用
+#   hand.pt 不存在时 HAND_READY=False → 禁用手部功能, 烟检回退全屏
+try:
+    HAND = YOLO(r"D:\视觉安防系统\models\hand.pt", task='detect')
+    HAND.to('cuda')
+    HAND_READY = True
+    print("✅ 手部模型已加载(hand.pt)")
+except Exception:
+    HAND_READY = False
+    print("⚠️ hand.pt 未就绪, 手部功能禁用, 烟检回退全屏")
 # ★ 半精度(fp16)推理加速: 仅 SMOKE 用(烟模型大, 提速明显)
 #   HEAD 保持 fp32: 头部小目标(遮挡/半脑袋)在fp16下精度损失→丢失, 头推理仅6ms不拖帧率
 try:
     SMOKE.model.half()
 except Exception:
     print("⚠️ SMOKE fp16转换失败, 继续用fp32")
-print("✅ V7-Head + V28-Smoke | 头绿框 | 烟红框(全屏) | Q退出")
+print("✅ V7-Head + V28-Smoke | 头绿框 | 手蓝框 | 烟红框(头/手区域聚焦) | Q退出")
 
 cap = cv2.VideoCapture(0)
 # 单实例锁: 防止多实例抢同一个摄像头导致"显示混乱/头框丢失"
@@ -418,7 +429,7 @@ def iou(a, b):
     aa = (a[2]-a[0])*(a[3]-a[1]); bb = (b[2]-b[0])*(b[3]-b[1])
     return iw*ih/(aa+bb-iw*ih+1e-6)
 
-tracks = []; smoke_tracks = []; next_id = 0
+tracks = []; smoke_tracks = []; hand_tracks = []; next_id = 0   # ★ hand_tracks: 手部追踪(蓝色框)
 low_suspects = []   # 低分稳定框记忆: [(bbox, 连续帧数)] — 耳后/口边烟连续2帧确认建轨
 import os
 AUTO_SAVE = r'D:\training_data\smoke\fp_auto'   # 误检帧自动采集(检出烟时保存)
@@ -459,6 +470,7 @@ while True:
 
     for t in tracks: t[0].predict()
     for st in smoke_tracks: st[0].predict()
+    for ht in hand_tracks: ht[0].predict()   # ★ 手部追踪预测(新架构)
 
     # ★★ 光线自适应暂停使用(用户要求 11:35): 全部关闭但代码保留, 可随时恢复
     #   恢复方法: 取消下行注释, 改为 frame_enh = light_adapt(frame)
@@ -466,10 +478,10 @@ while True:
     #   影响: 检测用原帧(无CLAHE/Unsharp/分块补偿), 暗光/白背景增强全部失效
     frame_enh = frame
 
-    # --- V7 头检测 (原始帧, conf=0.30 用户要求提高精度) ---
-    # 320近距大头副检已移除(用户反馈: 背景内容被误识别为头)
-    # 过滤已放宽: 小头≥10px, 大头不限宽高比, 无底部过滤(治半米内识别不出)
-    res = HEAD(frame, conf=0.30, iou=0.5, verbose=False)
+    # --- V7 头检测 (原始帧, conf=0.40 提升: 防手掌/圆形物被误认为头部) ---
+    # 用户反馈(14:05): 手掌有时被识别成头部 → conf 0.30→0.40(更严格)
+    # 手部有独立 hand.pt 检测(蓝色框), 头模型不再需要低conf容忍手掌
+    res = HEAD(frame, conf=0.55, iou=0.5, verbose=False)
     det_heads = []
     for r in res:
         for box in r.boxes:
@@ -505,6 +517,74 @@ while True:
             tracks.append([KalmanBox(dh), next_id]); next_id += 1
     tracks = [t for t in tracks if t[0].lost < 5]   # 头轨迹容忍(昨天配置, 恢复)
 
+    # --- ★★ 手部检测+追踪(新架构): 手掌蓝色框, 框随手掌变化动态更新 ---
+    #   hand.pt 由 COCO 手部数据训练; 与头部同样用 KalmanBox 追踪, 流畅稳定
+    det_hands = []
+    if HAND_READY:
+        try:
+            res_h = HAND(frame, conf=0.38, iou=0.5, verbose=False)
+            for r in res_h:
+                for box in r.boxes:
+                    b = box.xyxy[0].cpu().numpy()
+                    x1, y1, x2, y2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+                    bw, bh = x2-x1, y2-y1
+                    if bw < 20 or bh < 20: continue   # 最小手框(过滤噪声)
+                    if bw > W*0.7 or bh > H*0.7: continue  # 超大框(误检)
+                    # ★★ 肤色验证(治椅子/木纹/红色物体被误判为手) v2:
+                    #   人手: 肤色占比高(≥25%) + 高饱和红木占比低(皮肤S 90-140, 红木S>150)
+                    #   椅背红木: 纯红木S>150占比高(暖光下V也高会命中肤色) → 用高饱和红排除
+                    _hsx1, _hsy1 = max(0,int(x1)), max(0,int(y1))
+                    _hsx2, _hsy2 = min(W,int(x2)), min(H,int(y2))
+                    if _hsx2 - _hsx1 >= 8 and _hsy2 - _hsy1 >= 8:
+                        _hcrop = frame[_hsy1:_hsy2, _hsx1:_hsx2]
+                        _hhsv = cv2.cvtColor(_hcrop, cv2.COLOR_BGR2HSV)
+                        _hpix = _hcrop.shape[0] * _hcrop.shape[1]
+                        _hskin = float(np.sum(cv2.inRange(_hhsv, (0,25,50), (45,180,255)) > 0)) / _hpix
+                        if _hskin < 0.25:
+                            continue   # 框内肤色<25% → 非人手(椅子/木纹) → 拒
+                        # 高饱和红木排除: 红/棕(H 0-30) + S>150(极饱和纯红木, 肤色S一般<150)
+                        _hsat_red = float(np.sum(cv2.inRange(_hhsv, (0,150,40), (30,255,255)) > 0)) / _hpix
+                        if _hsat_red > 0.45:   # 阈值0.45: 红木2(0.56)拒, 深肤色手(0.45)过
+                            continue   # 极饱和红棕占比>35% → 红木椅背/木制品 → 拒
+                    det_hands.append((x1, y1, x2, y2))
+        except Exception:
+            pass
+    # ★★ 手部检测去重(治"方框分裂/重叠"): 同一只手被模型输出多个框(微小偏移/双检)
+    #   按面积降序, IoU>0.3 或中心距<手宽×0.8 → 保留大框去重小框
+    det_hands_dedup = []
+    for _dh in sorted(det_hands, key=lambda b: -(b[2]-b[0])*(b[3]-b[1])):
+        _dup = False
+        for _dh2 in det_hands_dedup:
+            if iou(_dh, _dh2) > 0.3:
+                _dup = True; break
+            _d = ((_dh[0]+_dh[2])/2 - (_dh2[0]+_dh2[2])/2)**2 + ((_dh[1]+_dh[3])/2 - (_dh2[1]+_dh2[3])/2)**2
+            if _d < ((_dh2[2]-_dh2[0]) * 0.8) ** 2:
+                _dup = True; break
+        if not _dup:
+            det_hands_dedup.append(_dh)
+    det_hands = det_hands_dedup
+    # 手部关联追踪(与头部同逻辑: IoU匹配 + Kalman预测)
+    h_matched_ids = set(); h_matched_det = set()
+    for j, dh in enumerate(det_hands):
+        best_i, best_iou = -1, 0.15
+        for i, ht in enumerate(hand_tracks):
+            if ht[1] in h_matched_ids: continue
+            iou_val = iou(ht[0].bbox, dh)
+            if iou_val < 0.15:
+                kf = ht[0].kf; ps = kf.statePre.flatten()
+                pb = (ps[0]-ps[2]/2, ps[1]-ps[3]/2, ps[0]+ps[2]/2, ps[1]+ps[3]/2)
+                iou_val = iou(pb, dh)
+            if iou_val > best_iou: best_iou = iou_val; best_i = i
+        if best_i >= 0:
+            hand_tracks[best_i][0].update(dh)
+            h_matched_ids.add(hand_tracks[best_i][1]); h_matched_det.add(j)
+    for ht in hand_tracks:
+        if ht[1] not in h_matched_ids: ht[0].lost += 1
+    for j, dh in enumerate(det_hands):
+        if j not in h_matched_det and len(hand_tracks) < 10:
+            hand_tracks.append([KalmanBox(dh, pn=0.50, mn=0.05), next_id + 1000]); next_id += 1
+    hand_tracks = [ht for ht in hand_tracks if ht[0].lost < 5]
+
     # --- V22 全屏烟检 + 智能过滤(距离机制) + ByteTrack低分池 ---
     raw_smoke = []
     low_pool = []   # ByteTrack 低分候选池 (被conf过滤但≥0.15, 仅用于维持已有轨迹)
@@ -514,20 +594,34 @@ while True:
     #   真烟不会出现在纯过曝白光区, 检测框内过曝占比高 → 直接拒(治强光源误检)
     _over_gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
     _over_mask = _over_gray > 235
-    # 主检测(640): 标准推理
-    # ★ 纯形状识别模式(用户要求): conf 0.12 — 停用材质/颜色后, 靠模型+形状把关
-    #   原0.06是为颜色加权放行的弱信号; 现无加权, 提到0.12挡纯噪声(过曝/背景低分)
-    # 主检测(1024): ★ 提高分辨率 — 模型看得更清晰(720p源缩到1024=0.8x, 细节保留率60%→80%)
-    # 副检测(960放大, 每4帧): 极小/远距/边缘烟兜底(多尺度, 检测能力全屏覆盖)
-    #   conf 0.06(弱信号进) + 几何防线(形状/尺寸/肤色)兜误检 = 不识别错也不漏识别
-    #   帧率: light~13 + HEAD 6 + 1024~16 + 960均摊3.5 + 复核5 + 过滤8 ≈ 51ms → 20FPS处理 > 源19 ✅
-    sr = SMOKE(frame_enh, conf=0.06, iou=0.5, imgsz=1024, verbose=False)
-    if (fc % 4) == 0:   # 960 多尺度副检测(每4帧): 极小/边缘烟兜底
-        try:
-            sr2 = SMOKE(frame_enh, conf=0.06, iou=0.5, imgsz=960, verbose=False)
-            sr = list(sr) + list(sr2)
-        except Exception:
-            pass
+    # ★★ 新架构(用户要求): 香烟检测注意力只放在"头部+手部"
+    #   在头框/手框的扩张区域内找烟(烟常在嘴边/手持/耳后), 大幅减少全屏误检(椅子/门框/桌腿)
+    #   头框扩张: 上下左右各扩(脸前/嘴前/耳后) | 手框扩张: 更大(手持烟/挥烟)
+    #   ★ 用户要求(14:14): 严格 — focus_regions 改用【本帧原始检测det_heads/det_hands】
+    #   不用 tracks/hand_tracks(它们含lost<5的历史轨迹, 检测不到时仍"虚假存在" → 误判烟)
+    #   本帧没检测到 → focus_regions空 → 烟识别关闭(符合"无头无手绝不识别")
+    focus_regions = []
+    for (hx1, hy1, hx2, hy2) in det_heads:           # 本帧头检测(不含历史)
+        hw_, hh_ = hx2-hx1, hy2-hy1
+        focus_regions.append((max(0, hx1-hw_*0.6), max(0, hy1-hh_*0.9),
+                              min(W, hx2+hw_*0.6), min(H, hy2+hh_*0.6)))
+    for (hx1, hy1, hx2, hy2) in det_hands:            # 本帧手检测(不含历史)
+        hw_, hh_ = hx2-hx1, hy2-hy1
+        focus_regions.append((max(0, hx1-hw_*1.2), max(0, hy1-hh_*0.6),
+                              min(W, hx2+hw_*1.2), min(H, hy2+hh_*1.6)))
+    # 无头无手: focus_regions为空 → 本帧不做烟检测(严格限定区域, 不识别区域外)
+    # 主检测(1024): 全屏检测 + 下方"区域聚焦过滤"(候选中心必须在头/手区域内)
+    # ★ 严格区域: 无头无手(focus_regions空) → 跳过烟检测(区域外不识别)
+    if focus_regions:
+        sr = SMOKE(frame_enh, conf=0.06, iou=0.5, imgsz=1024, verbose=False)
+        if (fc % 4) == 0:   # 960 多尺度副检测(每4帧): 极小/边缘烟兜底
+            try:
+                sr2 = SMOKE(frame_enh, conf=0.06, iou=0.5, imgsz=960, verbose=False)
+                sr = list(sr) + list(sr2)
+            except Exception:
+                pass
+    else:
+        sr = []   # 无头无手 → 本帧不检测烟
     for r in sr:
         for box in r.boxes:
             conf = float(box.conf[0])
@@ -537,6 +631,16 @@ while True:
             area_ratio = (w * h) / (W * H)
             aspect = max(w, h) / min(w, h)
             cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+            # ===== ★★ 区域聚焦(严格版, 用户强调): 候选中心必须在头/手聚焦区域内 =====
+            # 香烟识别功能只存在于"头框/手框出现后"的框内及其附近
+            # 区域外一律拒(即使候选是烟/即使靠近已确认烟轨) — "装没看见"
+            _in_focus = False
+            for (frx1, fry1, frx2, fry2) in focus_regions:
+                if frx1 <= cx <= frx2 and fry1 <= cy <= fry2:
+                    _in_focus = True; break
+            if not _in_focus:
+                continue   # ★ 严格: 不在头/手区域 → 一律拒(无任何豁免)
 
             # ===== 强光源直接过滤: 整框几乎全过曝 → 直接拒 =====
             # 治"强光源/灯具/过曝区被误判为烟"
@@ -551,6 +655,21 @@ while True:
                         _rg = _over_gray[oy1:oy2, ox1:ox2]
                         if float((_rg < 150).mean()) < 0.15:
                             continue   # 整框几乎全过曝(纯光晕/强光源) → 拒
+
+            # ===== ★ 低纹理细长拒(用户实测: 椅子边/门框/桌腿误检) =====
+            # 用户截图(11:59): 室内椅子上误出红框2个 — V28把"细长棕色纯色物体"当烟
+            # 区分: 椅子边/门框/桌腿 = "纯色均匀, Laplacian 方差极低(<10)"
+            #       烟纸纤维纹理丰富, Laplacian 方差 > 20
+            # 光线暂停后无CLAHE, 几何防线挡不住纯色细长, 必须用纹理密度判定
+            # 注: 白背景烟(像素少)lap可能低, 用 aspect 联合 + 面积下限避免误伤
+            if area_ratio < 0.05 and aspect >= 2.0:
+                _qcrop = frame[max(0,int(y1)):min(H,int(y2)), max(0,int(x1)):min(W,int(x2))]
+                if _qcrop.size >= 16:
+                    _qg = cv2.cvtColor(_qcrop, cv2.COLOR_BGR2GRAY)
+                    _lap_var = cv2.Laplacian(_qg, cv2.CV_64F).var()
+                    # 纯色均匀细长物体(椅子边/门框) → 拒
+                    if _lap_var < 8.0:
+                        continue   # 低纹理纯色细长 = 椅子边/门框/桌腿 → 拒
 
             # ===== ★ 纯形状识别模式(用户要求): 停用材质关+颜色关 =====
             # 光线照射/远距会使材质(纹理/反光)与颜色(滤嘴棕/烟纸白)判断不可靠
@@ -900,6 +1019,12 @@ while True:
     _disp = frame_enh.copy()
 
     # --- 绘制(在 _disp 上, 覆盖涂暗层, 标注框颜色保持鲜艳) ---
+    # ★★ 手部蓝色框(新架构): 追踪框随手掌大小动态变化(Kalman更新)
+    for ht in hand_tracks:
+        hx1, hy1, hx2, hy2 = map(int, ht[0].disp_bbox if hasattr(ht[0], 'disp_bbox') else ht[0].bbox)
+        cv2.rectangle(_disp, (hx1,hy1), (hx2,hy2), (255,0,0), 2)   # 蓝色
+        cv2.putText(_disp, "HAND", (hx1, hy1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,0), 1)
+
     for t in tracks:
         x1, y1, x2, y2 = map(int, t[0].bbox)
         cv2.rectangle(_disp, (x1,y1), (x2,y2), GREEN, 2)
@@ -909,6 +1034,16 @@ while True:
         cv2.putText(_disp, lb, (x1+2,y1-3), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,0,0), 1)
 
     for st in smoke_tracks:
+        # ★★ 严格区域(用户强调): 烟轨中心必须在头/手聚焦区域内才显示, 否则"装没看见"
+        #   即使香烟就在镜头中, 不在头/手框内 → 不显示(区域外禁止识别功能)
+        _scx = (st[0].disp_bbox[0]+st[0].disp_bbox[2])/2
+        _scy = (st[0].disp_bbox[1]+st[0].disp_bbox[3])/2
+        _s_in = False
+        for (frx1, fry1, frx2, fry2) in focus_regions:
+            if frx1 <= _scx <= frx2 and fry1 <= _scy <= fry2:
+                _s_in = True; break
+        if not _s_in:
+            continue   # 不在头/手区域 → 不显示(装没看见)
         # 显示: 稳定轨全显; 新轨(lost<3)也显(减少"刚出现就消失"的闪烁)
         sw, sh = st[0].disp_bbox[2]-st[0].disp_bbox[0], st[0].disp_bbox[3]-st[0].disp_bbox[1]
         if (sw*sh)/(W*H) < 0.01 and st[0].confirmed < 1 and st[0].lost >= 3:
