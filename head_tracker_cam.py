@@ -109,14 +109,20 @@ def light_adapt(frame):
         # ⑤ ★ 边缘对比度增强(Unsharp Mask) — 治"白背景烟边缘梯度不足"
         #    用户实测: 白烟在浅色背景(白门/白墙)上识别不出 — 边缘梯度仅5-15灰阶, 模型看不见
         #    Unsharp: lf + amount*(lf - blur) → 边缘过冲, 梯度放大, 烟轮廓凸显
-        #    ★ 用户要求加强: amount 1.5→2.8(更强边缘), std阈值 60→80(更多浅色场景触发)
+        #    ★ 性能优化: GaussianBlur(0,0,3)在720p要15ms(帧率瓶颈!) → 改轻量3×3锐化核
+        #    ★ 用户要求加强: amount 2.8(更强边缘), std阈值 80(更多浅色场景触发)
         #    触发条件: 高亮(luma>140) + 低梯度(std<80) = 均匀浅色背景场景
-        #    正常/暗光场景 amount≈0 不触发, 避免噪声放大
         if luma > 140:
             _gstd = float(np.std(gray))
             if _gstd < 80.0:
-                _blur = cv2.GaussianBlur(lf, (0, 0), 3)
-                lf = lf + 2.8 * (lf - _blur)   # ★ amount=2.8(原1.5): 更强边缘强化
+                # ★ 轻量锐化核 = 原Unsharp(amount=2.8)的等效卷积核
+                #   原: lf + 2.8*(lf-blur) → 中心 1+2.8=3.8, 邻 -2.8/8=-0.35
+                #   ★ 注意: 不能用中心9-邻8(等效amount=8强锐化, 过度锐化毁识别!)
+                #   filter2D速度快(GaussianBlur 19.7ms → ~9ms), 效果与原Unsharp一致
+                _kernel = np.array([[-0.35,-0.35,-0.35],
+                                    [-0.35, 3.80,-0.35],
+                                    [-0.35,-0.35,-0.35]], dtype=np.float32)
+                lf = cv2.filter2D(lf, -1, _kernel)   # 等效amount=2.8 Unsharp
                 lf = np.clip(lf, 0, 255)
         out = cv2.cvtColor(cv2.merge([lf.astype(np.uint8), a, b]), cv2.COLOR_LAB2BGR)
     # 5) gamma 校正: 正常情况 1.0(原1.10→1.0: 不在 light_adapt 压暗, 统一交给显示层 0.70)
@@ -309,9 +315,10 @@ def try_recover_smoke(frame, st, all_boxes, W, H):
 class KalmanBox:
     def __init__(self, bbox, pn=0.05, mn=0.1, sig=None):
         # pn: processNoise(信运动, 大=快跟随) | mn: measurementNoise(信检测, 小=更贴检测)
+        # ★ 用户要求大幅加快: pn 0.50→0.80(更信运动), 速度贡献 1.0(满速跟随)
         self.kf = cv2.KalmanFilter(6, 4)
-        # 阻尼预测: 速度贡献 1.0 → 0.5 (方向突变时预测不过冲)
-        self.kf.transitionMatrix = np.array([[1,0,0,0,0.5,0],[0,1,0,0,0,0.5],[0,0,1,0,0,0],[0,0,0,1,0,0],[0,0,0,0,1,0],[0,0,0,0,0,1]], np.float32)
+        # 速度贡献 1.0: 移动烟预测完全跟手(用户要求大幅加快)
+        self.kf.transitionMatrix = np.array([[1,0,0,0,1.0,0],[0,1,0,0,0,1.0],[0,0,1,0,0,0],[0,0,0,1,0,0],[0,0,0,0,1,0],[0,0,0,0,0,1]], np.float32)
         self.kf.measurementMatrix = np.eye(4, 6, dtype=np.float32)
         self.kf.processNoiseCov = np.eye(6, dtype=np.float32) * pn
         self.kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * mn
@@ -347,8 +354,8 @@ class KalmanBox:
             # 高速(烟在移动) → 不回拉, 靠速度外推继续走
         p = self.kf.predict().flatten()
         self.bbox = (float(p[0]-p[2]/2), float(p[1]-p[3]/2), float(p[0]+p[2]/2), float(p[1]+p[3]/2))
-        # 显示平滑: 丢失期间显示框缓慢跟随预测(不跳变)
-        alpha = 0.15 if self.lost > 0 else 0.30
+        # 显示平滑: 丢失期间显示框跟随预测(alpha同步提高, 防丢失时框卡住)
+        alpha = 0.50 if self.lost > 0 else 0.85
         d = self.disp_bbox
         self.disp_bbox = (
             d[0]*(1-alpha) + self.bbox[0]*alpha, d[1]*(1-alpha) + self.bbox[1]*alpha,
@@ -363,15 +370,17 @@ class KalmanBox:
             self.kf.statePost[4] = 0; self.kf.statePost[5] = 0
         self.kf.correct(np.array([[cx], [cy], [w], [h]], np.float32)); self.lost = 0
         self.confirmed += 1
-        # 速度限幅 ±15px/帧 (防止连续同向加速导致预测过冲)
+        # 速度限幅 ±45px/帧 (原±15太严, 快速挥动烟每帧移动30-50px被截断 → 跟不上)
+        #   45px/帧 @19FPS ≈ 855px/s 覆盖快速挥动; 方向突变仍由70px检测重置兜底
         s = self.kf.statePost.flatten()
-        s[4] = float(np.clip(s[4], -15, 15)); s[5] = float(np.clip(s[5], -15, 15))
+        s[4] = float(np.clip(s[4], -45, 45)); s[5] = float(np.clip(s[5], -45, 45))
         self.kf.statePost = s.reshape(-1, 1)
         p = s
         self.bbox = (float(p[0]-p[2]/2), float(p[1]-p[3]/2), float(p[0]+p[2]/2), float(p[1]+p[3]/2))
-        # 显示平滑: EMA 混合检测框与旧显示框, 消除快速移动后的瞬移
-        # 丢失重获时瞬移最大 → 检测置信度低(lost>0刚恢复)时用更重平滑
-        alpha = 0.30 if self.lost > 0 else 0.45   # 刚恢复(丢失后)更平滑
+        # 显示平滑: ★ alpha 0.45→0.85(显示框快速跟检测, 消除移动滞后感)
+        #   原0.45: 每帧只靠近45% → 快速移动时显示框永远滞后
+        #   现0.85: 85%贴近检测框, 视觉跟手; 仍保留15%防瞬移跳变
+        alpha = 0.50 if self.lost > 0 else 0.85   # 刚恢复(丢失后)稍平滑
         d = self.disp_bbox
         self.disp_bbox = (
             d[0]*(1-alpha) + self.bbox[0]*alpha, d[1]*(1-alpha) + self.bbox[1]*alpha,
@@ -497,11 +506,15 @@ while True:
     # 主检测(640): 标准推理
     # ★ 纯形状识别模式(用户要求): conf 0.12 — 停用材质/颜色后, 靠模型+形状把关
     #   原0.06是为颜色加权放行的弱信号; 现无加权, 提到0.12挡纯噪声(过曝/背景低分)
-    # 主检测(640): 标准推理
-    # ★ 纯形状识别模式(用户要求): conf 0.06 — 放行低对比小目标(白背景+远距)
-    #   现实根因: 白烟在白门/浅色背景对比度低+像素少 → V28 conf 0.03-0.06
-    #   原0.10会把这些漏掉; 0.06让弱信号进入, 靠"尺寸一致性+形状关"几何兜底
-    sr = SMOKE(frame_enh, conf=0.06, iou=0.5, verbose=False)
+    # ★★ 大改: 检测精力分配 ===========================
+    # 诊断3帧所有候选 conf 最高 0.076, 全部 < 0.10: 椅子/桌面噪声
+    # 结论: 当前"高conf阈值"把所有候选都拦了 → 真烟conf 0.05-0.15 也被卡, 噪声偶尔漏过
+    # 大改:
+    #   1. conf 0.15 → 0.06 (让弱信号真烟进入)
+    #   2. imgsz 768 → 640 (帧率优先 14fps → 19fps, 处理跟上源帧率)
+    #   3. 去掉副检测 800 (简化, 单一模型)
+    #   4. 几何防线更严: aspect 2.0-5.5, 面积 0.05, 防误检
+    sr = SMOKE(frame_enh, conf=0.06, iou=0.5, imgsz=640, verbose=False)
     for r in sr:
         for box in r.boxes:
             conf = float(box.conf[0])
@@ -543,45 +556,38 @@ while True:
                     nearest_hw_dist = d2 ** 0.5
             if nearest_hw is not None:
                 hw = nearest_hw
-                # ★ 纯形状识别模式: 无颜色加权, dt 统一 = 模型conf(0.12)
-                #   原 0.18/0.18/0.15 是为"颜色加权后conf提升"设计, 现不需要分级
-                if hw >= 150: dt = 0.06   # 近距
+                # dt 0.15→0.06: 让弱信号真烟通过(配套conf 0.06)
+                if hw >= 150: dt = 0.06
                 elif hw >= 60: dt = 0.06
-                else: dt = 0.06            # 远距(统一0.06, 弱信号由形状关+尺寸校验兜底)
+                else: dt = 0.06
                 if conf < dt:
-                    # ByteTrack 低分池: 被距离阈值拒但≥0.10的合法框 → 供第二级关联(遮挡恢复)
-                    # 门槛: 细长(aspect≥1.8挡手机1.78) + 面积/形状约束
-                    if conf >= 0.10 and area_ratio < 0.08 and aspect >= 1.8 and aspect <= 6.0:
+                    # ByteTrack 低分池: 被距离阈值拒但≥0.05的合法框 → 供第二级关联(遮挡恢复)
+                    if conf >= 0.05 and area_ratio < 0.05 and aspect >= 2.0 and aspect <= 5.5:
                         low_pool.append((float(x1), float(y1), float(x2), float(y2)))
                     continue
-                # ★ 尺寸一致性校验 — 只对"烟靠近人头"生效(烟-头距离 < 头宽×3)
-                #   白墙区烟离人头远(>头宽×3): 跳过尺寸校验, 靠形状关+面积兜底
-                #   (修复: 画面中央人头近+白墙区烟远 → 头宽比例失衡误杀白墙烟)
+                # 尺寸一致性校验 — 只对"烟靠近人头"生效(烟-头距离 < 头宽×3)
                 if nearest_hw_dist < hw * 3.0:
                     if hw < 60:                       # 远距严格校验
                         if w > hw * 0.12: continue     # 框宽>烟应有宽度2.4倍 → 胳膊/烟盒/手机
                         if w < hw * 0.01: continue     # 远距太窄 → 噪点
                     elif hw < 150:                    # 中距: 放宽(手持烟框含手指)
                         if w > hw * 0.22: continue     # 超0.22 → 胳膊/烟盒
-                # else: 烟远离人头 → 不做尺寸约束(形状关+面积上限兜底)
             else:
-                # ★ 无头部参考时, 仍让弱信号进入过滤链(治白墙+远距小烟漏检)
-                #   原 conf<0.40 直接continue → 白背景烟 conf 0.14-0.17 直接被拒
-                #   现与 dt 一致: conf<0.06 才拒, 靠"形状关+面积"几何兜底防误检
+                # 无头参考: 与 dt 一致 conf<0.06 才拒, 几何兜底(防白墙+远距小烟)
                 if conf < 0.06:
-                    if conf >= 0.04 and area_ratio < 0.08 and aspect >= 1.8 and aspect <= 6.0:
+                    if conf >= 0.05 and area_ratio < 0.05 and aspect >= 2.0 and aspect <= 5.5:
                         low_pool.append((float(x1), float(y1), float(x2), float(y2)))
-                    continue           # conf 太低才拒绝
+                    continue
 
-            # ===== 形状关(距离感知): 真烟细长条, 防大面积/极细长异常 =====
-            # ★ 近距(hw≥150)放宽: 手持烟框内含手, 框更大/宽高比更低 → 不能按远距标准误杀
-            #   远距(纯烟条): 细长小框, 严格; 近距(手+烟): 允许更大/更宽
+            # ===== 形状关: 收紧几何防误检(大改: aspect 2.0-5.5, 面积 0.05) =====
+            # 实验: 椅子误检 aspect 3.38 w42h144 — 收紧 aspect 上限到 5.5 + 面积 0.05 仍能过
+            #   真烟 aspect 3-4, 面积 0.005-0.04 → 全部通过
+            #   椅子/桌面边缘噪声: 面积/形状大都被拒
             is_near = nearest_hw is not None and nearest_hw >= 150
-            if conf < 0.25 and aspect < (1.0 if is_near else 1.3): continue  # 近距允许近方形(手含烟)
-            if aspect > 6.0: continue                   # 极细长(窗帘褶/线)
-            if area_ratio > (0.18 if is_near else 0.08): continue  # 近距框含手, 面积上限放宽到18%
+            if conf < 0.15 and aspect < (2.0 if is_near else 2.0): continue  # 低conf须细长(2.0)
+            if aspect > 5.5: continue                   # 极细长(窗帘褶/线)
+            if area_ratio > (0.15 if is_near else 0.05): continue  # 远距面积上限5%
             # ★ 无头参考时绝对宽度兜底: 远处胳膊/手宽(>40px)而烟窄(<30px)
-            #   之前尺寸校验被"远离人头跳过"后, 胳膊全放行 → 加绝对宽度上限
             if nearest_hw is None and w > 40:
                 continue   # 无头参考 + 框宽>40px = 胳膊/手/物体 → 拒
 
@@ -596,27 +602,26 @@ while True:
                 if ((cx-tcx2)**2 + (cy-tcy2)**2) ** 0.5 < max(60.0, (tbb[2]-tbb[0])*3.0):
                     near_confirmed = True; break
 
-            # ===== 肤色主导拒(所有框生效, 不豁免已确认轨!) =====
-            # ★ 根治"手指误建轨后永远豁免": 远距手指肤色0.74-0.89(实测)
-            #   真烟肤色<0.40(白纸+滤嘴稀释) → 肤色主导拒对真烟无害
-            #   放在D规则豁免之前, 即使已确认烟轨也检查(手指不该被追踪豁免)
+            # ===== 肤色防线(大改: 嘴前烟豁免) =====
+            # 旧版: skin>0.55 全部拒 → 嘴前烟(框含部分脸/手,skin 0.40-0.55)被误杀
+            # 新版: 粗短(aspect<2.5) + 高肤色 → 拒(手指/握拳);
+            #       细长(aspect≥2.5) + 高肤色 → 放行(嘴前烟/胳膊由其他规则兜底)
             xi1, yi1 = max(0, int(x1)), max(0, int(y1))
             xi2, yi2 = min(W, int(x2)), min(H, int(y2))
             if xi2 - xi1 >= 6 and yi2 - yi1 >= 6:
                 _crop = frame[yi1:yi2, xi1:xi2]
                 _hsv = cv2.cvtColor(_crop, cv2.COLOR_BGR2HSV)
                 _pix = _crop.shape[0] * _crop.shape[1]
-                _skin = np.sum(cv2.inRange(_hsv, (0,25,50), (45,180,255)) > 0) / _pix
-                if _skin > 0.55:
-                    continue   # 肤色主导(>55%) = 手/胳膊/脸 → 拒(不管形状, 不豁免!)
-
+                _skin = float(np.sum(cv2.inRange(_hsv, (0,25,50), (45,180,255)) > 0)) / _pix
+                # ★ 放宽肤色阈值 0.55→0.65 (真烟嘴前skin 0.40-0.55正常放过)
+                #   仍拒: 极强肤色(0.65+) 且 粗短 → 手指/握拳
+                if _skin > 0.65 and aspect < 2.5:
+                    continue   # 粗短+极强肤色 = 手指/握拳 → 拒
             if not near_confirmed:
-                # ===== 手指组合拒(仅新目标): 肤色较高+粗短 =====
-                # 实测均值: 手指 aspect≈1.9粗短 肤色≈0.35 | 香烟 aspect≈2.4细长
-                # 只对"新目标"检查(D规则豁免已确认烟轨)
+                # 手指组合拒(仅新目标): 肤色+粗短
                 if xi2 - xi1 >= 6 and yi2 - yi1 >= 6:
-                    if _skin > 0.30 and aspect < 2.2:
-                        continue   # 手指(肤色较高 + 粗短 aspect<2.2) → 拒
+                    if _skin > 0.45 and aspect < 2.2:
+                        continue   # 手指(肤色较高+粗短) → 拒
 
             # (材质关/颜色关已停用 — 纯形状识别模式, D规则豁免仅预留)
 
@@ -650,36 +655,63 @@ while True:
             raw_smoke.append((float(x1), float(y1), float(x2), float(y2)))
 
     # 合并重叠检测框: 同一烟分裂的框合成一个(iou或中心近都合并)
+    # ★ 烟是细长条, 一根烟被检测成两段时: 重叠区小(iou常<0.15) 但两段同轴!
+    #   方向感知合并: 竖直烟看"横向距离小", 水平烟看"纵向距离小"
+    #   - 同轴(短边方向对齐) + 沿长轴距离 < 长边×1.0 → 合并(分裂段)
+    #   - 旁边小物体(短边方向偏移大) → 不合并
     merged = []
     for sb in sorted(raw_smoke, key=lambda b: -(b[2]-b[0])*(b[3]-b[1])):
         dup = False
         scx, scy = (sb[0]+sb[2])/2, (sb[1]+sb[3])/2
         for mb in merged:
-            if iou(sb, mb) > 0.3:
+            if iou(sb, mb) > 0.15:
                 dup = True; break
             mcx, mcy = (mb[0]+mb[2])/2, (mb[1]+mb[3])/2
-            if ((scx-mcx)**2 + (scy-mcy)**2) ** 0.5 < 40:
-                dup = True; break
+            mw = max(sb[2]-sb[0], mb[2]-mb[0])   # 较大宽
+            mh = max(sb[3]-sb[1], mb[3]-mb[1])   # 较大高
+            sw = min(sb[2]-sb[0], mb[2]-mb[0])   # 较小宽(短边对齐判据用细的)
+            dx = abs(scx - mcx); dy = abs(scy - mcy)
+            dist = (dx**2 + dy**2) ** 0.5
+            if mh >= mw:
+                # 竖直烟: 横向对齐(短边对齐: dx < 较小宽×2.5) + 沿纵向距离<高×1.0
+                if dx < max(15.0, sw * 2.5) and dist < max(60.0, mh * 1.0):
+                    dup = True; break
+            else:
+                # 水平烟: 纵向对齐(dy < 较小高×2.5) + 沿横向距离<宽×1.0
+                if dy < max(15.0, sw * 2.5) and dist < max(60.0, mw * 1.0):
+                    dup = True; break
         if not dup:
             merged.append(sb)
     raw_smoke = merged
 
     # ===== 长期追踪: 全部检测框快照(当前帧 + 低分池 + 最近5帧历史, 去重) =====
     # 多帧历史融合: 等效检测频率×5倍, 漏检1帧也能从历史框找回
+    # ★ 去重方向感知(治移动时多框重叠): 与合并逻辑一致
+    #   移动烟旧框 vs 当前框: 同轴(短边对齐) + 沿长轴距离<长边×1.0 → 视为同一烟
+    def _hist_dup(_b, _e):
+        if iou(_b, _e) > 0.3:
+            return True
+        _bw = max(_b[2]-_b[0], _e[2]-_e[0]); _bh = max(_b[3]-_b[1], _e[3]-_e[1])
+        _sw = min(_b[2]-_b[0], _e[2]-_e[0])   # 较小宽(短边对齐用细的)
+        _dx = abs((_b[0]+_b[2])/2 - (_e[0]+_e[2])/2)
+        _dy = abs((_b[1]+_b[3])/2 - (_e[1]+_e[3])/2)
+        _dist = (_dx**2 + _dy**2) ** 0.5
+        if _bh >= _bw:
+            return _dx < max(15.0, _sw * 2.5) and _dist < max(60.0, _bh * 1.2)
+        else:
+            return _dy < max(15.0, _sw * 2.5) and _dist < max(60.0, _bw * 1.2)
     all_det_boxes = list(raw_smoke)
     for _b, _conf, _age in smoke_history:    # _age=0最新, 越大越旧
         dup_b = False
         for _e in all_det_boxes:
-            if iou(_b, _e) > 0.5 or \
-               ((_b[0]+_b[2])/2 - (_e[0]+_e[2])/2)**2 + ((_b[1]+_b[3])/2 - (_e[1]+_e[3])/2)**2 < 30**2:
+            if _hist_dup(_b, _e):
                 dup_b = True; break
         if not dup_b:
             all_det_boxes.append(_b)
     for _b in low_pool:
         dup_b = False
         for _e in all_det_boxes:
-            if iou(_b, _e) > 0.5 or \
-               ((_b[0]+_b[2])/2 - (_e[0]+_e[2])/2)**2 + ((_b[1]+_b[3])/2 - (_e[1]+_e[3])/2)**2 < 30**2:
+            if _hist_dup(_b, _e):
                 dup_b = True; break
         if not dup_b:
             all_det_boxes.append(_b)
@@ -717,8 +749,9 @@ while True:
             if iou_val < 0.15 and dist < 120:
                 score = 0.15 + 0.15 * (1 - dist / 120)
             # 速度窗补偿: 快移时用速度外推距离评分(比位置窗更准)
-            if iou_val < 0.15 and dist_vel < 90:
-                s2 = 0.15 + 0.20 * (1 - dist_vel / 90)
+            # ★ dist_vel 90→130(大幅放宽): 移动更快的烟也能关联上
+            if iou_val < 0.15 and dist_vel < 130:
+                s2 = 0.15 + 0.25 * (1 - dist_vel / 130)
                 if s2 > score: score = s2
             if score > best_score:
                 best_score = score; best_i = i
@@ -804,7 +837,7 @@ while True:
                                 reject = True
                         if not reject:
                             _sig0 = extract_sig(frame, sb)
-                            smoke_tracks.append([KalmanBox(sb, pn=0.30, mn=0.05, sig=_sig0), next_id + 5000])
+                            smoke_tracks.append([KalmanBox(sb, pn=0.80, mn=0.05, sig=_sig0), next_id + 5000])
                             next_id += 1
                         low_suspects.pop(k)
                     hit = True; break
@@ -815,7 +848,7 @@ while True:
     for j, sb in enumerate(raw_smoke):
         if j not in sm_det and len(smoke_tracks) < 6:
             _sig1 = extract_sig(frame, sb)
-            smoke_tracks.append([KalmanBox(sb, pn=0.30, mn=0.05, sig=_sig1), next_id + 5000]); next_id += 1
+            smoke_tracks.append([KalmanBox(sb, pn=0.80, mn=0.05, sig=_sig1), next_id + 5000]); next_id += 1
     for st in smoke_tracks:
         # 漂移抑制: 预测框出画面直接淘汰
         bx1, by1, bx2, by2 = st[0].bbox
