@@ -969,6 +969,27 @@ def iou(a, b):
     aa = (a[2]-a[0])*(a[3]-a[1]); bb = (b[2]-b[0])*(b[3]-b[1])
     return iw*ih/(aa+bb-iw*ih+1e-6)
 
+def hand_skin_ok(frame, x1, y1, x2, y2, W, H):
+    """★ 08-12 肤色验证(抽取自检测链, 低分候选升级建轨复用):
+    人手: 肤色占比≥25% + 高饱和红木占比≤45% (治椅子/木纹误判)"""
+    _hsx1, _hsy1 = max(0,int(x1)), max(0,int(y1))
+    _hsx2, _hsy2 = min(W,int(x2)), min(H,int(y2))
+    if _hsx2 - _hsx1 < 8 or _hsy2 - _hsy1 < 8:
+        return False
+    try:
+        _hcrop = frame[_hsy1:_hsy2, _hsx1:_hsx2]
+        _hhsv = cv2.cvtColor(_hcrop, cv2.COLOR_BGR2HSV)
+        _hpix = _hcrop.shape[0] * _hcrop.shape[1]
+        _hskin = float(np.sum(cv2.inRange(_hhsv, (0,25,50), (45,180,255)) > 0)) / _hpix
+        if _hskin < 0.25:
+            return False   # 肤色<25% → 非人手
+        _hsat_red = float(np.sum(cv2.inRange(_hhsv, (0,150,40), (30,255,255)) > 0)) / _hpix
+        if _hsat_red > 0.45:
+            return False   # 高饱和红木 → 拒
+        return True
+    except Exception:
+        return False
+
 def light_source_mask(gray):
     """★08-10 15:23 大面积光源掩码: 分辨"白色内容(烟/白物)"与"大面积光源(窗/灯/过曝)"
     ① 亮度>200 亮区 → 15x15闭运算合并成区域
@@ -994,6 +1015,7 @@ def light_source_mask(gray):
     return mask
 
 tracks = []; smoke_tracks = []; hand_tracks = []; next_id = 0   # ★ hand_tracks: 手部追踪(蓝色框)
+_prev_low_pool = []   # ★★ 08-12 上一帧手低分候选池(低分候选连续2帧确认建轨, 提升识别灵敏度)
 import os
 AUTO_SAVE = r'D:\training_data\smoke\fp_auto'   # 误检帧自动采集(检出烟时保存)
 os.makedirs(AUTO_SAVE, exist_ok=True)
@@ -1363,25 +1385,27 @@ while True:
                     _ar = max(bw, bh) / max(15.0, min(bw, bh))
                     if _ar > 2.2:
                         continue   # 细长条(手臂/物体) → 非手掌
-                    # ★ 低分候选(0.12-0.25)只进池, 不参与正常检测/建轨
+                    # ★ 低分候选(0.12-0.25): 先查"连续2帧确认"可否升级建轨(灵敏度)
+                    #   ★★ 08-12 治"手出现识别慢": 手刚出现/运动模糊时 conf 常在
+                    #   0.12-0.25, 只进池不建轨 → 要等 conf 升到 0.25+ 才出框(延迟几百ms)
+                    #   [新] 上一帧同位置(<0.8手宽)也有低分候选(连续2帧) + 肤色验证
+                    #        通过 → 立即升级为正常检测(建轨) → 手出现即出框
                     if conf < 0.25:
                         hand_low_pool.append((x1, y1, x2, y2, conf))
+                        if _prev_low_pool:
+                            for _plp in _prev_low_pool:
+                                _plw = max(_plp[2]-_plp[0], bw, 20.0)
+                                _pc = ((_plp[0]+_plp[2])/2 - (x1+x2)/2)**2 + ((_plp[1]+_plp[3])/2 - (y1+y2)/2)**2
+                                if _pc < (_plw * 0.8) ** 2:
+                                    if hand_skin_ok(frame, x1, y1, x2, y2, W, H):
+                                        det_hands.append((x1, y1, x2, y2))
+                                    break
                         continue
                     # ★★ 肤色验证(V8机制, 治椅子/木纹/红色物体误判)
                     #   ★ 高置信(≥0.60)跳过(hand.pt 高置信误杀少)
                     if conf < 0.60:
-                        _hsx1, _hsy1 = max(0,int(x1)), max(0,int(y1))
-                        _hsx2, _hsy2 = min(W,int(x2)), min(H,int(y2))
-                        if _hsx2 - _hsx1 >= 8 and _hsy2 - _hsy1 >= 8:
-                            _hcrop = frame[_hsy1:_hsy2, _hsx1:_hsx2]
-                            _hhsv = cv2.cvtColor(_hcrop, cv2.COLOR_BGR2HSV)
-                            _hpix = _hcrop.shape[0] * _hcrop.shape[1]
-                            _hskin = float(np.sum(cv2.inRange(_hhsv, (0,25,50), (45,180,255)) > 0)) / _hpix
-                            if _hskin < 0.25:
-                                continue   # 肤色<25% → 非人手
-                            _hsat_red = float(np.sum(cv2.inRange(_hhsv, (0,150,40), (30,255,255)) > 0)) / _hpix
-                            if _hsat_red > 0.45:
-                                continue   # 高饱和红木 → 拒
+                        if not hand_skin_ok(frame, x1, y1, x2, y2, W, H):
+                            continue
                     det_hands.append((x1, y1, x2, y2))
         except Exception:
             pass
@@ -1534,7 +1558,7 @@ while True:
         if _ex2-_ex1 < 24 or _ey2-_ey1 < 24: continue
         try:
             _crop3 = frame[_ey1:_ey2, _ex1:_ex2]
-            _rr3 = HAND(_crop3, conf=0.30, iou=0.5, imgsz=480, verbose=False)
+            _rr3 = HAND(_crop3, conf=0.25, iou=0.5, imgsz=480, verbose=False)   # ★ 08-12 0.30→0.25(模糊帧弱检也能找回)
             _found3 = None
             for _r in _rr3:
                 for _b in _r.boxes:
@@ -1544,8 +1568,9 @@ while True:
                     _gx2 = _ex1 + _bx2/_sc3; _gy2 = _ey1 + _by2/_sc3
                     if _gx2-_gx1 < 15 or _gy2-_gy1 < 15: continue
                     # ★ 02:21 中心距验证: 找回框须离预测位置 ≤0.5手宽(否则是背景误检)
+                    #   ★ 08-12 0.5→0.8手宽: 快速移动帧手已离开预测位置, 0.5太严救不回(框消失)
                     _gc = ((_gx1+_gx2)/2 - (_pb[0]+_pb[2])/2)**2 + ((_gy1+_gy2)/2 - (_pb[1]+_pb[3])/2)**2
-                    if _gc > (_hw3 * 0.5) ** 2:
+                    if _gc > (_hw3 * 0.8) ** 2:
                         continue
                     _found3 = (_gx1, _gy1, _gx2, _gy2)
                     break
@@ -1605,6 +1630,8 @@ while True:
                                     next_id + 1000]); next_id += 1
     # ★ 01:47 完全沿用V8: 手轨丢失容忍 lost<5(15:35 V8原版)
     hand_tracks = [ht for ht in hand_tracks if ht[0].lost < 5]
+    # ★★ 08-12 记录本帧低分候选(供下一帧"连续2帧确认升级建轨")
+    _prev_low_pool = [lp[:4] for lp in hand_low_pool]
     # ★ 17:31 手/头互斥已移除(用户要求: 手挡头前时头仍需识别)
     #   手挡头时两框都保留(互斥会删真头, 不可取); 头稳定性靠下方"建轨抑制+尺寸钳制"解决
 
