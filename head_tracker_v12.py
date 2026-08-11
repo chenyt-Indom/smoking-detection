@@ -795,7 +795,7 @@ class KalmanBox:
             _disp_dist = ((_cx1-_cx2)**2 + (_cy1-_cy2)**2) ** 0.5
             _w_avg = max(15.0, (self.bbox[2]-self.bbox[0] + (d[2]-d[0])) / 2.0)
             _speed = _disp_dist / _w_avg
-            if _speed > 0.5: alpha = 0.92    # 快移: 紧跟
+            if _speed > 0.5: alpha = 0.97    # 快移: 极限紧跟(17:47 0.92→0.97)
             elif _speed > 0.2: alpha = 0.82  # 中速
             else: alpha = 0.60               # 静止: 稳定
         d = self.disp_bbox
@@ -812,9 +812,9 @@ class KalmanBox:
             self.kf.statePost[4] = 0; self.kf.statePost[5] = 0
         self.kf.correct(np.array([[cx], [cy], [w], [h]], np.float32)); self.lost = 0
         self.confirmed += 1
-        # 速度限幅 ±15px/帧 (防止连续同向加速导致预测过冲)
+        # 速度限幅 ±200px/帧 (17:47 用户: 还要更快 → 120→200, 极限跟速)
         s = self.kf.statePost.flatten()
-        s[4] = float(np.clip(s[4], -45, 45)); s[5] = float(np.clip(s[5], -45, 45))  # ★限幅±45(快速平移不截断)
+        s[4] = float(np.clip(s[4], -200, 200)); s[5] = float(np.clip(s[5], -200, 200))
         self.kf.statePost = s.reshape(-1, 1)
         p = s
         self.bbox = (float(p[0]-p[2]/2), float(p[1]-p[3]/2), float(p[0]+p[2]/2), float(p[1]+p[3]/2))
@@ -979,7 +979,9 @@ while True:
     # --- 头检测(15:31 完全用 V12 模型, 废掉 pose): head_v12 模型检测(完整头框) ---
     #   ★ 15:51 BoT-SORT 全面接入: HEAD.track(botsort) — 模型检测 + BOTSORT追踪(ReID/GMC/低分恢复)
     #   验证: 实拍图 15/15 检出(BOTSORT 工作正常)
-    res = HEAD.track(frame, persist=True, tracker='botsort.yaml', conf=0.45, iou=0.5, imgsz=640, verbose=False)
+    #   ★ 17:31 conf 0.55→0.50: 手误检靠"头框宽高比钳制"处理(见下方), 0.55会致遮挡时头检测
+    #   时有时无(忽闪), 0.50更连续稳定; 误检由BOTSORT低分恢复+追踪过滤兜底
+    res = HEAD.track(frame, persist=True, tracker='botsort.yaml', conf=0.50, iou=0.5, imgsz=640, verbose=False)
     det_heads = []
     for r in res:
         if r.boxes is None: continue
@@ -999,7 +1001,7 @@ while True:
 
     matched_ids = set(); matched_det = set()
     for j, dh in enumerate(det_heads):
-        best_i, best_iou = -1, 0.15
+        best_i, best_score = -1, 0.15
         for i, t in enumerate(tracks):
             if t[1] in matched_ids: continue
             iou_val = iou(t[0].bbox, dh)
@@ -1007,14 +1009,76 @@ while True:
                 kf = t[0].kf; ps = kf.statePre.flatten()
                 pb = (ps[0]-ps[2]/2, ps[1]-ps[3]/2, ps[0]+ps[2]/2, ps[1]+ps[3]/2)
                 iou_val = iou(pb, dh)
-            if iou_val > best_iou: best_iou = iou_val; best_i = i
+            # ★★ 17:41 中心距通道(治高速移动跟不上): 头高速移动时帧间位移大 → IoU≈0 匹配失败
+            #   → lost+1 速度衰减 → 框减速跟不上。IoU低但中心距近(≤1.2头宽) → 同一头, 直接匹配
+            #   (速度自适应显示平滑已有: 快移α0.92紧跟; 静止α0.60稳定)
+            _score = iou_val
+            if iou_val < 0.15:
+                _tc = ((t[0].bbox[0]+t[0].bbox[2])/2, (t[0].bbox[1]+t[0].bbox[3])/2)
+                _dc = ((dh[0]+dh[2])/2, (dh[1]+dh[3])/2)
+                _tw2 = max(15.0, t[0].bbox[2]-t[0].bbox[0])
+                _dist = ((_tc[0]-_dc[0])**2 + (_tc[1]-_dc[1])**2) ** 0.5
+                if _dist < _tw2 * 2.5:   # 17:47 中心距阈值 2.0→2.5头宽: 更快的移动也匹配得上
+                    _score = 0.20   # 中心距近 → 匹配成功(略高于IoU阈值, 优先IoU)
+            if _score > best_score: best_score = _score; best_i = i
         if best_i >= 0:
+            _tb = tracks[best_i][0].bbox
+            _tw, _th = _tb[2]-_tb[0], _tb[3]-_tb[1]
+            _nw, _nh = dh[2]-dh[0], dh[3]-dh[1]
+            # ★★ 17:35 手挡头锁定(治手挡头时头框抖动/变形): 头轨与手轨重叠 → 检测框被手污染
+            #   完全信任 Kalman 预测(已 predict, 位置延续真头/尺寸保持) → 框稳定不抖
+            #   手移开(不重叠) → 恢复检测框接管(跟头移动)
+            #   ★ 17:45 增强: 重叠判定加"中心距"通道(IoU对手挡头部分重叠可能偏小) +
+            #   锁定期间 disp_bbox 硬跟随预测框(不EMA, 彻底消除变形)
+            _hand_ovl2 = False
+            for _ht in hand_tracks:
+                _hb2 = _ht[0].bbox
+                if iou(_tb, _hb2) > 0.10:
+                    _hand_ovl2 = True; break
+                _hcc = ((_hb2[0]+_hb2[2])/2, (_hb2[1]+_hb2[3])/2)
+                _tcc = ((_tb[0]+_tb[2])/2, (_tb[1]+_tb[3])/2)
+                _hw_sum = (_tw + (_hb2[2]-_hb2[0])) / 2
+                if ((_hcc[0]-_tcc[0])**2 + (_hcc[1]-_tcc[1])**2) ** 0.5 < _hw_sum * 0.9:
+                    _hand_ovl2 = True; break
+            if _hand_ovl2:
+                _htrk = tracks[best_i][0]
+                _htrk.lost = 0   # 保持存活(不 update, 用预测框)
+                _htrk.disp_bbox = _htrk.bbox   # 硬跟随: 显示框=预测框(无EMA滞后, 无变形)
+                matched_ids.add(tracks[best_i][1]); matched_det.add(j)
+                continue
+            # ★★ 17:31 尺寸钳制(治头遮挡时框变形): 新框与旧轨尺寸偏差>35% → 保持旧尺寸
+            #   17:35 阈值 50%→35%(更稳): 遮挡时模型只检出半头/变形头框, 直接 update 会忽大忽小
+            if _tw > 15 and _th > 15 and (_nw > _tw*1.35 or _nh > _th*1.35 or _nw < _tw*0.65 or _nh < _th*0.65):
+                _ncx = (dh[0]+dh[2])/2; _ncy = (dh[1]+dh[3])/2
+                dh = (_ncx-_tw/2, _ncy-_th/2, _ncx+_tw/2, _ncy+_th/2)
             tracks[best_i][0].update(dh); matched_ids.add(tracks[best_i][1]); matched_det.add(j)
     for t in tracks:
         if t[1] not in matched_ids: t[0].lost += 1
     for j, dh in enumerate(det_heads):
-        if j not in matched_det and len(tracks) < 20:
-            tracks.append([KalmanBox(dh), next_id]); next_id += 1
+        if j in matched_det: continue
+        # ★★ 17:31 新建轨抑制(治头遮挡时框分裂): 与任何现有头轨中心距 < 1.5×最大头宽
+        #   → 视为同一头(遮挡导致IoU小未匹配) → 不新建, 顺手喂给最近轨
+        _dup_track = False
+        for _t in tracks:
+            _tb = _t[0].bbox
+            _d2 = ((dh[0]+dh[2])/2 - (_tb[0]+_tb[2])/2)**2 + ((dh[1]+dh[3])/2 - (_tb[1]+_tb[3])/2)**2
+            _tw_max = max(dh[2]-dh[0], _tb[2]-_tb[0])
+            if _d2 < (_tw_max * 1.5) ** 2:
+                _dup_track = True
+                if _t[1] not in matched_ids:
+                    tracks[tracks.index(_t)][0].update(dh)
+                    matched_ids.add(_t[1])
+                break
+        if not _dup_track and len(tracks) < 20:
+            # ★★ 17:32 新建轨互斥(治"手独立出现被误检成头"): 新头框与上帧手轨重叠>0.25
+            #   → 孤立手位置的头框=手误检 → 不新建轨(绿框不会出现在手上)
+            #   ⚠️ 不影响已有头轨: 手挡头前时头轨已存在, 保留(不删不压) → 挡头仍识别
+            _hand_ovl = False
+            for _ht in hand_tracks:
+                if iou(dh, _ht[0].bbox) > 0.25:
+                    _hand_ovl = True; break
+            if not _hand_ovl:
+                tracks.append([KalmanBox(dh), next_id]); next_id += 1
     tracks = [t for t in tracks if t[0].lost < 5]   # 头轨迹容忍(昨天配置, 恢复)
 
     # --- ★★ 手部检测(15:31 完全用 V12 模型, 废掉 pose): hand_v12 模型检测(完整手掌框) ---
@@ -1167,6 +1231,8 @@ while True:
                 hand_tracks.append([KalmanBox(dh, pn=0.50, mn=0.05, sig=_hand_sigs[j] if j < len(_hand_sigs) else None),
                                     next_id + 1000]); next_id += 1
     hand_tracks = [ht for ht in hand_tracks if ht[0].lost < 5]
+    # ★ 17:31 手/头互斥已移除(用户要求: 手挡头前时头仍需识别)
+    #   手挡头时两框都保留(互斥会删真头, 不可取); 头稳定性靠下方"建轨抑制+尺寸钳制"解决
 
     # --- V22 全屏烟检 + 智能过滤(距离机制) + ByteTrack低分池 ---
     raw_smoke = []
