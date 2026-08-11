@@ -32,8 +32,10 @@ try:
 except Exception:
     pass   # ★ TensorRT engine 已绑定GPU, 不支持.to (16:16)
 try:
-    HAND = YOLO(r"D:\视觉安防系统\models\hand_v12.pt", task='detect')
-    print("✅ 手模型 hand_v12 加载")
+    # ★ 20:31 手模型换回 hand.pt(V8 验证版): 用户实拍数据训练, 实拍能识别
+    #   hand_v12(11k白背景)实拍分布偏移失败(只出巨型假框) → 弃用, 回退V8模型
+    HAND = YOLO(r"D:\视觉安防系统\models\hand.pt", task='detect')
+    print("✅ 手模型 hand.pt 加载(V8验证版, 用户实拍数据训练)")
     HAND_READY = True
 except Exception:
     HAND_READY = False
@@ -44,6 +46,28 @@ if HAND_READY:
         HAND.model.half()
     except Exception:
         pass
+# ★★ 18:40 MediaPipe Hands 手部关键点(21点): 精准手掌定位/手势/大小自适应
+#   非YOLO检测模型(手部关键点库, hand_landmarker.task 7.8MB 本地)
+#   21点外接框 = 完美贴合手掌(不含手臂), 握拳框小/张开框大(手势自适应)
+MP_HANDS = None
+_mp_ref = None
+try:
+    # ★ 20:33 恢复启用(独立线程隔离卡死, 见 _mp_worker)
+    import mediapipe as _mp
+    from mediapipe.tasks import python as _mp_python
+    from mediapipe.tasks.python import vision as _mp_vision
+    _mp_ref = _mp
+    if _os.path.exists(r"D:\training_data\hand_landmarker.task"):
+        _mp_opts = _mp_vision.HandLandmarkerOptions(
+            base_options=_mp_python.BaseOptions(model_asset_path=r"D:\training_data\hand_landmarker.task"),
+            num_hands=2, min_hand_detection_confidence=0.4, min_tracking_confidence=0.4)
+        MP_HANDS = _mp_vision.HandLandmarker.create_from_options(_mp_opts)
+        print("✅ MediaPipe Hands 已加载(21点手部关键点, 精准手掌)")
+    else:
+        print("⚠️ hand_landmarker.task 缺失, MediaPipe 未启用")
+except Exception as _e:
+    MP_HANDS = None
+    print(f"⚠️ MediaPipe Hands 未加载: {type(_e).__name__} {str(_e)[:80]}")
 try:
     SMOKE.model.half()
 except Exception:
@@ -450,6 +474,7 @@ _head_w_ema = None   # ★ 15:20 头宽时间EMA(防多策略切换跳变)
 _head_cx_ema = None   # ★ 15:27 头中心x EMA
 _head_cy_ema = None   # ★ 15:27 头中心y EMA
 _prev_hand_boxes = []
+_mp_prev_boxes = []   # ★ 20:16 MediaPipe 手框时间EMA(治漂移)
 
 def smooth_boxes(new_boxes, prev_boxes, alpha=0.60):
     """新检测框与上一帧框 EMA 平滑(位置/大小, 防关键点抖动导致框跳变)
@@ -608,6 +633,59 @@ def kpts_to_hand_bbox(kpts, w, h):
         if x2 - x1 >= 15 and y2 - y1 >= 15:
             return (x1, y1, x2, y2)
     return None
+
+
+def detect_hand_mp(frame):
+    """★ 18:40 MediaPipe 21点手部关键点 → 手掌外接框(精准贴合, 不含手臂)
+    21点(指尖×5+指节×10+手腕+手掌)外接框: 握拳框小/张开框大(手势大小自适应)
+    ★ 20:16 框级时间EMA: 21点外接框对关键点抖动敏感(min/max点一跳→框边跳→漂移)
+    帧间匹配(中心距<0.6宽)后 EMA(0.55旧+0.45新) 位置+尺寸 → 消除漂移
+    返回 [(x1,y1,x2,y2), ...]; 未启用/无手时返回 []"""
+    global _mp_prev_boxes
+    if MP_HANDS is None or frame is None:
+        return []
+    try:
+        _h, _w = frame.shape[:2]
+        _rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        _mimg = _mp_ref.Image(image_format=_mp_ref.ImageFormat.SRGB, data=_rgb)
+        _res = MP_HANDS.detect(_mimg)
+        _boxes = []
+        if _res.hand_landmarks:
+            for _lm in _res.hand_landmarks:
+                _xs = [p.x for p in _lm]; _ys = [p.y for p in _lm]
+                _x1 = max(0, int(min(_xs) * _w)); _y1 = max(0, int(min(_ys) * _h))
+                _x2 = min(_w, int(max(_xs) * _w)); _y2 = min(_h, int(max(_ys) * _h))
+                # 4% padding: 贴合手掌不留白(完美不多余)
+                _pw, _ph = (_x2 - _x1) * 0.04, (_y2 - _y1) * 0.04
+                _x1 = max(0, int(_x1 - _pw)); _y1 = max(0, int(_y1 - _ph))
+                _x2 = min(_w, int(_x2 + _pw)); _y2 = min(_h, int(_y2 + _ph))
+                if _x2 - _x1 >= 15 and _y2 - _y1 >= 15:
+                    _boxes.append((_x1, _y1, _x2, _y2))
+        # ★ 20:16 框级时间EMA(治漂移): 与上帧框匹配后平滑, 不匹配(新出现/瞬移)直接用
+        if _mp_prev_boxes:
+            _out = []
+            _used = set()
+            for _b in _boxes:
+                _bc = ((_b[0]+_b[2])/2, (_b[1]+_b[3])/2)
+                _bw2 = _b[2] - _b[0]
+                _bi, _bd = -1, _bw2 * 0.6
+                for _i, _pb in enumerate(_mp_prev_boxes):
+                    if _i in _used: continue
+                    _pc = ((_pb[0]+_pb[2])/2, (_pb[1]+_pb[3])/2)
+                    _d = ((_bc[0]-_pc[0])**2 + (_bc[1]-_pc[1])**2) ** 0.5
+                    if _d < _bd:
+                        _bd = _d; _bi = _i
+                if _bi >= 0:
+                    _used.add(_bi)
+                    _pb = _mp_prev_boxes[_bi]
+                    _out.append(tuple(int(_pb[k]*0.55 + _b[k]*0.45) for k in range(4)))
+                else:
+                    _out.append(_b)
+            _boxes = _out
+        _mp_prev_boxes = _boxes
+        return _boxes
+    except Exception:
+        return []
 
 
 def sig_similarity(a, b):
@@ -885,6 +963,47 @@ import threading, queue as _queue
 _frame_q = _queue.Queue(maxsize=2)
 _stop_flag = threading.Event()
 
+# ★★ 20:33 MediaPipe 独立线程(21点精准手掌, 卡死自动降级):
+#   实测 mediapipe detect 与摄像头流并发会卡死 → 放独立线程隔离, 主循环只取最新结果
+#   - MediaPipe 正常 → 21点外接框(精准手掌/手势/大小)
+#   - 结果超时(>0.8s未更新=线程卡死) → 主循环自动回退 hand.pt/pose, 系统不崩
+_mp_latest_boxes = []          # [(x1,y1,x2,y2), ...] 最新手掌框
+_mp_latest_time = 0.0          # 结果时间戳
+_mp_frame_cur = None           # 最新帧(线程取)
+_mp_lock = threading.Lock()
+def _mp_worker():
+    global _mp_latest_boxes, _mp_latest_time, _mp_frame_cur
+    while True:
+        time.sleep(0.02)
+        try:
+            with _mp_lock:
+                _fr = _mp_frame_cur
+            if _fr is None or MP_HANDS is None:
+                continue
+            _h, _w = _fr.shape[:2]
+            _rgb = cv2.cvtColor(_fr, cv2.COLOR_BGR2RGB)
+            _mimg = _mp_ref.Image(image_format=_mp_ref.ImageFormat.SRGB, data=_rgb)
+            _res = MP_HANDS.detect(_mimg)
+            _boxes = []
+            if _res.hand_landmarks:
+                for _lm in _res.hand_landmarks:
+                    _xs = [p.x for p in _lm]; _ys = [p.y for p in _lm]
+                    _x1 = max(0, int(min(_xs)*_w)); _y1 = max(0, int(min(_ys)*_h))
+                    _x2 = min(_w, int(max(_xs)*_w)); _y2 = min(_h, int(max(_ys)*_h))
+                    _pw, _ph = (_x2-_x1)*0.04, (_y2-_y1)*0.04
+                    _x1 = max(0, int(_x1-_pw)); _y1 = max(0, int(_y1-_ph))
+                    _x2 = min(_w, int(_x2+_pw)); _y2 = min(_h, int(_y2+_ph))
+                    if _x2-_x1 >= 15 and _y2-_y1 >= 15:
+                        _boxes.append((_x1, _y1, _x2, _y2))
+            with _mp_lock:
+                _mp_latest_boxes = _boxes
+                _mp_latest_time = time.time()
+        except Exception:
+            pass
+if MP_HANDS is not None:
+    threading.Thread(target=_mp_worker, daemon=True).start()
+    print("✅ MediaPipe 独立线程已启动(卡死自动降级 hand.pt/pose)")
+
 def _capture_worker():
     """★ 17:13 帧率修复: 1080p 只出现在采集环节!
     采集 1080p(细节/清晰) → 立即降采样 720p 入队 → 主循环全程 720p 处理
@@ -970,6 +1089,17 @@ while True:
     #   暂停原因: 光线锐化/过滤后香烟细节纹理不够明显, 先回退原帧对比
     #   影响: 检测用原帧(无CLAHE/Unsharp/分块补偿), 暗光/白背景增强全部失效
     frame_enh = frame
+    # ★ 20:33 MediaPipe 线程取帧(21点手部检测)
+    with _mp_lock:
+        _mp_frame_cur = frame
+    # ★ 18:36 手检测补充通道: pose 手腕(隔帧, 预训练零训练) — hand_v12 实拍分布偏移失败(只出巨型假框)
+    #   14:26 原始机制: 预训练 pose 直接找手(手腕关键点9/10); 15:31 因头画框不准废弃, 手腕定位本身可靠
+    if _gframe % 2 == 0:
+        _pose_persons = detect_pose(frame)
+        _pose_cache2 = _pose_persons
+    else:
+        _pose_persons = _pose_cache2 if '_pose_cache2' in globals() else []
+    _gframe += 1
     # ★ 16:29 超分线程取帧(异步展示超分效果)
     _sr_latest_frame = frame
     # ★ 16:58 RIFE演示: 缓存最近两帧小图(后台插帧对比窗用)
@@ -1081,43 +1211,56 @@ while True:
                 tracks.append([KalmanBox(dh), next_id]); next_id += 1
     tracks = [t for t in tracks if t[0].lost < 5]   # 头轨迹容忍(昨天配置, 恢复)
 
-    # --- ★★ 手部检测(15:31 完全用 V12 模型, 废掉 pose): hand_v12 模型检测(完整手掌框) ---
-    #   V8 机制: 模型输出(conf 0.12起) → 尺寸过滤 → 肤色验证 → 低分池 → 去重 → 追踪
+    # --- ★★ 手部检测(20:33 三通道: MediaPipe 21点优先 → hand.pt → pose 兜底) ---
+    #   MediaPipe 独立线程(21点精准手掌/手势/大小, 卡死自动超时降级)
+    #   hand.pt(V8验证版, 用户实拍训练) → 尺寸过滤 → 低分池 → 肤色验证(V8机制)
     det_hands = []
     hand_low_pool = []
-    if HAND_READY:
+    # ★ 通道1: MediaPipe 21点(线程结果, 新鲜度<0.8s 才用)
+    _mp_ok = False
+    with _mp_lock:
+        if _mp_latest_time > 0 and time.time() - _mp_latest_time < 0.8 and _mp_latest_boxes:
+            det_hands = list(_mp_latest_boxes)
+            _mp_ok = True
+    # ★ 通道2: hand.pt(V8机制, MediaPipe 超时/未检出时)
+    if not _mp_ok and HAND_READY:
         try:
-            # ★ 15:51 BoT-SORT 全面接入: HAND.track(botsort) — 低分恢复/ReID外观匹配
-            res_h = HAND.track(frame, persist=True, tracker='botsort.yaml',
-                               conf=0.25, iou=0.5, imgsz=640, verbose=False)
+            res_h = HAND(frame, conf=0.12, iou=0.5, imgsz=640, verbose=False)
             for r in res_h:
-                if r.boxes is None: continue
                 for box in r.boxes:
                     b = box.xyxy[0].cpu().numpy()
                     conf = float(box.conf.cpu().numpy()[0]) if box.conf is not None else 1.0
                     x1, y1, x2, y2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
                     bw, bh = x2-x1, y2-y1
-                    if bw < 20 or bh < 20: continue   # 最小手框(V8机制)
-                    if bw > W*0.7 or bh > H*0.7: continue  # 超大框(V8机制)
+                    if bw < 20 or bh < 20: continue   # 最小手框(过滤噪声)
+                    if bw > W*0.7 or bh > H*0.7: continue  # 超大框(误检)
                     if conf < 0.25:
                         hand_low_pool.append((x1, y1, x2, y2, conf))
                         continue
-                    # ★★ 肤色验证(V8机制, 治椅子/木纹误判)
-                    _hsx1, _hsy1 = max(0,int(x1)), max(0,int(y1))
-                    _hsx2, _hsy2 = min(W,int(x2)), min(H,int(y2))
-                    if _hsx2 - _hsx1 >= 8 and _hsy2 - _hsy1 >= 8:
-                        _hcrop = frame[_hsy1:_hsy2, _hsx1:_hsx2]
-                        _hhsv = cv2.cvtColor(_hcrop, cv2.COLOR_BGR2HSV)
-                        _hpix = _hcrop.shape[0] * _hcrop.shape[1]
-                        _hskin = float(np.sum(cv2.inRange(_hhsv, (0,25,50), (45,180,255)) > 0)) / _hpix
-                        if _hskin < 0.25:
-                            continue   # 肤色<25% → 非人手
-                        _hsat_red = float(np.sum(cv2.inRange(_hhsv, (0,150,40), (30,255,255)) > 0)) / _hpix
-                        if _hsat_red > 0.45:
-                            continue   # 高饱和红木 → 拒
+                    # ★★ 肤色验证(V8机制, 治椅子/木纹/红色物体误判)
+                    #   ★ 高置信(≥0.60)跳过(hand.pt 高置信误杀少)
+                    if conf < 0.60:
+                        _hsx1, _hsy1 = max(0,int(x1)), max(0,int(y1))
+                        _hsx2, _hsy2 = min(W,int(x2)), min(H,int(y2))
+                        if _hsx2 - _hsx1 >= 8 and _hsy2 - _hsy1 >= 8:
+                            _hcrop = frame[_hsy1:_hsy2, _hsx1:_hsx2]
+                            _hhsv = cv2.cvtColor(_hcrop, cv2.COLOR_BGR2HSV)
+                            _hpix = _hcrop.shape[0] * _hcrop.shape[1]
+                            _hskin = float(np.sum(cv2.inRange(_hhsv, (0,25,50), (45,180,255)) > 0)) / _hpix
+                            if _hskin < 0.25:
+                                continue   # 肤色<25% → 非人手
+                            _hsat_red = float(np.sum(cv2.inRange(_hhsv, (0,150,40), (30,255,255)) > 0)) / _hpix
+                            if _hsat_red > 0.45:
+                                continue   # 高饱和红木 → 拒
                     det_hands.append((x1, y1, x2, y2))
         except Exception:
             pass
+    # ★ 通道3: pose 手腕兜底(前两通道未检出时, 隔帧缓存)
+    if not det_hands and _pose_persons:
+        for _pp in _pose_persons:
+            _hb2 = kpts_to_hand_bbox(_pp[1], W, H)
+            if _hb2 is not None:
+                det_hands.append(_hb2)
     # ★ 15:07 手框时间平滑(模型输出已稳, 平滑防偶发跳变), 之后进去重/追踪
     det_hands, _prev_hand_boxes = smooth_boxes(det_hands, _prev_hand_boxes)
     # ★★ 手部检测去重(治"方框分裂/重叠"): 同一只手被模型输出多个框(微小偏移/双检)
