@@ -72,10 +72,13 @@ cap = cv2.VideoCapture(0)
 try:
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)   # 16:53 清晰度: 360p→480p(细节+33%)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)   # 17:03 1080p采集(实测25.6fps)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)   # 17:03 1080p
 except Exception:
     pass
+# ★ 17:03 1080p可缩放窗口(高清显示, 窗口自适应屏幕)
+cv2.namedWindow("Head + Smoke Detection", cv2.WINDOW_NORMAL)
+cv2.resizeWindow("Head + Smoke Detection", 1280, 720)
 # 单实例锁: 防止多实例抢同一个摄像头导致"显示混乱/头框丢失"
 try:
     import ctypes
@@ -370,13 +373,15 @@ def _rife_worker():
         except Exception:
             pass
 
-# ★ 16:29 超分异步线程启动(在 _sr_worker 定义后) — 16:58 效果展示版(CPU/ROI, 不卡)
+# ★ 17:13 演示线程彻底禁用(卡顿元凶3): 16:58 加的对比窗已移除但线程没停
+#   RIFE 线程每10s启2s子进程插帧 / 超分线程每10s占CPU → 周期性卡顿
+#   用户只需流畅1080p: 超分/RIFE 均不实时, 全部停用(代码保留, 离线可用)
 _stop_flag = threading.Event()   # ★ 全局停止标志(线程用)
-if _sr_model is not None:
+if False and _sr_model is not None:
     _sr_thread = threading.Thread(target=_sr_worker, daemon=True)
     _sr_thread.start()
     print("✅ 超分演示线程已启动(CPU/10s, 效果对比窗)")
-if _rife_model is not None:
+if False and _rife_model is not None:
     _rife_thread = threading.Thread(target=_rife_worker, daemon=True)
     _rife_thread.start()
     print("✅ RIFE演示线程已启动(10s, 效果对比窗)")
@@ -881,11 +886,17 @@ _frame_q = _queue.Queue(maxsize=2)
 _stop_flag = threading.Event()
 
 def _capture_worker():
+    """★ 17:13 帧率修复: 1080p 只出现在采集环节!
+    采集 1080p(细节/清晰) → 立即降采样 720p 入队 → 主循环全程 720p 处理
+    (检测 letterbox 640/画框/ROI/显示与 480p 系统同级负载 → 帧率恢复)
+    720p 由 1080p 降采样得来, 清晰度仍远好于 480p 源放大"""
     while not _stop_flag.is_set():
         _ok, _fr = cap.read()
         if not _ok or _fr is None:
             time.sleep(0.01)
             continue
+        if _fr.shape[1] > 1280:
+            _fr = cv2.resize(_fr, (1280, 720), interpolation=cv2.INTER_AREA)
         if _frame_q.full():
             try:
                 _frame_q.get_nowait()   # 丢旧帧(保最新)
@@ -918,8 +929,8 @@ while True:
             try:
                 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)   # 16:53 清晰度: 360p→480p(细节+33%)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1920)   # 17:03 1080p采集(实测25.6fps)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)   # 17:03 1080p
             except Exception:
                 cap = cv2.VideoCapture(0)
             if cap.isOpened():
@@ -939,10 +950,10 @@ while True:
     for st in smoke_tracks: st[0].predict()
     for ht in hand_tracks: ht[0].predict()   # ★ 手部追踪预测(新架构)
 
-    # ★★ 20:50 超分前置(标准 Real-ESRGAN x4plus): 采集帧 → 720p 超分帧
-    #   超分帧同时喂检测(小目标细节恢复)与显示; 未启用时用原帧
-    #   ⚠️ 超分后 W/H 变化, 同步更新(检测框坐标与超分帧一致)
-    if _sr_model is not None:
+    # ★★ 17:13 超分前置彻底禁用(卡帧元凶): Real-ESRGAN CPU 每帧 1080p 超分需 1s+
+    #   之前只禁了线程/显示, 主循环这个调用一直没禁 → 每帧卡 1 秒
+    #   超分不实时(实测全帧 1.1s), 实时场景不可用; 保留代码, 离线可用
+    if False and _sr_model is not None:
         frame = dlss_super_resolve(frame)
         if frame is not None:
             W, H = frame.shape[1], frame.shape[0]
@@ -1681,10 +1692,10 @@ while True:
                        f"RIFE:{'ON' if _rife_model is not None else 'OFF'}",
                 (4, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 2)
 
-    # ★ 显示(重构版): 超分帧已高清(720p), 直接显示; RIFE 插帧 → 显示丝滑
-    #   16:53 清晰度增强(实时不卡): 高质量缩放LANCZOS + 轻量锐化Unsharp
-    _disp = cv2.resize(_disp, (1280, 720), interpolation=cv2.INTER_LANCZOS4) if _disp.shape[1] >= 1280 else cv2.resize(_disp, (960, 540), interpolation=cv2.INTER_LANCZOS4)
-    # ★ 轻量锐化(Unsharp, ~2ms): 边缘更清晰(感知锐度提升, 不引入伪影)
+    # ★ 显示(17:06 帧率修复): 采集1080p(检测细节好), 显示缩到720p(锐化+imshow轻, 帧率稳)
+    #   1080p全帧锐化/imshow 20-40ms/帧 → 帧率骤降; 720p显示视觉仍清晰
+    _disp = cv2.resize(_disp, (1280, 720), interpolation=cv2.INTER_LANCZOS4) if _disp.shape[1] > 1280 else _disp
+    # ★ 轻量锐化(Unsharp, ~2ms 720p): 边缘更清晰(感知锐度提升, 不引入伪影)
     _disp = cv2.addWeighted(_disp, 1.5, cv2.GaussianBlur(_disp, (0, 0), 2.0), -0.5, 0)
     _show = _disp
     # 16:59 单窗口: 主画面=模型实际看到的(检测输入帧+框+状态), 无额外窗口/对比窗
