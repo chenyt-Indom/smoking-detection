@@ -1331,10 +1331,10 @@ while True:
             #   快速移动→运动模糊→hand.pt 检不出/框不准。Unsharp 增强模糊边缘
             #   (1.5原图-0.5高斯模糊, ~2ms), 帮助模糊帧检出; 头/烟检测不受影响
             _hframe = cv2.addWeighted(frame, 1.5, cv2.GaussianBlur(frame, (0, 0), 2.0), -0.5, 0)
-            # ★ 01:13 弱角度检出: conf 0.12→0.10(收弱框) + 低分池 0.25→0.15(0.15-0.25弱框
-            #   直接建轨, 不再被池吞 — 侧手/远距/背面等角度首次出现也能识别)
-            #   + imgsz 640→512(手是大目标, 精度损失小, 检测提速~35% → 帧率↑ 快速移动改善)
-            res_h = HAND(_hframe, conf=0.10, iou=0.5, imgsz=512, verbose=False)
+            # ★ 01:19 conf 回调基线(用户: 误检多): 0.10/池0.15 → 0.12/池0.25(01:08确认版)
+            #   弱框(0.12-0.25)收回低分池只维持已有轨, 不建轨 → 误检消除
+            #   imgsz 512 保留(手是大目标, 提速~35%, 不影响误检)
+            res_h = HAND(_hframe, conf=0.12, iou=0.5, imgsz=512, verbose=False)
             for r in res_h:
                 for box in r.boxes:
                     b = box.xyxy[0].cpu().numpy()
@@ -1343,8 +1343,8 @@ while True:
                     bw, bh = x2-x1, y2-y1
                     if bw < 20 or bh < 20: continue   # 最小手框(过滤噪声)
                     if bw > W*0.7 or bh > H*0.7: continue  # 超大框(误检)
-                    # ★ 低分候选(0.10-0.15)只进池维持已有轨, 不建轨(防噪声建轨)
-                    if conf < 0.15:
+                    # ★ 低分候选(0.12-0.25)只进池维持已有轨, 不建轨(防误检)
+                    if conf < 0.25:
                         hand_low_pool.append((x1, y1, x2, y2, conf))
                         continue
                     # ★★ 肤色验证(V8机制, 治椅子/木纹/红色物体误判)
