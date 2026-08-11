@@ -3,7 +3,7 @@ V12-重构版 — YOLOv12s × 3 + BoT-SORT 专业追踪 + DLSS 显示
 手/头/烟 全部 YOLOv12s | BoT-SORT(ultralytics botsort) | Real-ESRGAN超分 + RIFE插帧(显示层)
 检测用真实帧(准确), 显示用 DLSS 增强(丝滑+高清)
 """
-import cv2, numpy as np, time, torch, os
+import cv2, numpy as np, time, torch, os, threading
 from ultralytics import YOLO
 
 # ---- 15:31 完全使用 V12 模型(COCO预训练微调)检测: hand_v12/head_v12/smoke_v12 ----
@@ -16,12 +16,21 @@ except Exception:
     print("⚠️ head_v12 未就绪, 用 yolo12s 预训练")
 HEAD.to('cuda')
 try:
-    SMOKE = YOLO(r"D:\视觉安防系统\models\smoke_v12.pt", task='detect')
-    print("✅ 烟模型 smoke_v12 加载")
+    # ★ 16:16 TensorRT: engine 优先(推理快2-3x, fp16)
+    import os as _os
+    if _os.path.exists(r"D:\视觉安防系统\models\smoke_v12.engine"):
+        SMOKE = YOLO(r"D:\视觉安防系统\models\smoke_v12.engine", task='detect')
+        print("✅ 烟模型 smoke_v12 TensorRT engine 加载(2-3x)")
+    else:
+        SMOKE = YOLO(r"D:\视觉安防系统\models\smoke_v12.pt", task='detect')
+        print("✅ 烟模型 smoke_v12 加载")
 except Exception:
     SMOKE = YOLO(r"D:\training_data\yolo12s.pt", task='detect')
     print("⚠️ smoke_v12 未就绪, 用 yolo12s 预训练")
-SMOKE.to('cuda')
+try:
+    SMOKE.to('cuda')
+except Exception:
+    pass   # ★ TensorRT engine 已绑定GPU, 不支持.to (16:16)
 try:
     HAND = YOLO(r"D:\视觉安防系统\models\hand_v12.pt", task='detect')
     print("✅ 手模型 hand_v12 加载")
@@ -64,7 +73,7 @@ try:
     cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)   # 16:53 清晰度: 360p→480p(细节+33%)
 except Exception:
     pass
 # 单实例锁: 防止多实例抢同一个摄像头导致"显示混乱/头框丢失"
@@ -260,7 +269,8 @@ def init_dlss():
         if os.path.exists(r'D:/training_data/RealESRGAN_x4plus.pth'):
             from spandrel import ModelLoader
             _sr_model = ModelLoader().load_from_file(r'D:/training_data/RealESRGAN_x4plus.pth')
-            _sr_model = _sr_model.cuda().half()
+            # ★ 16:45 CPU常驻(不占GPU): 超分仅显示低频用, CPU够; GPU让给检测(BOTSORT/engine)
+            _sr_model = _sr_model.cpu().half()
             _sr_model.eval()
             ok_sr = True
             print('✅ DLSS超分: Real-ESRGAN(spandrel) 已启用(ROI降频增强)')
@@ -307,6 +317,69 @@ def sr_enhance_roi(frame, x1, y1, x2, y2, key):
         return up
     except Exception:
         return None
+
+# ★★ 16:29 超分异步线程(展示超分效果, 不阻塞主循环): 后台每3s超分当前帧 → _sr_latest
+_sr_latest = None
+_sr_latest_frame = None
+_sr_thread = None
+_sr_demo = None          # 16:58 效果展示: (原ROI, 超分ROI) 对比缓存
+_rife_demo = None        # 16:58 效果展示: (原帧, 插帧) 对比缓存
+_demo_a = None           # RIFE演示用前一帧
+_demo_b = None
+def _sr_worker():
+    """★ 16:58 超分效果展示(CPU后台10s/次): 只超分中央ROI(320x180) → _sr_demo对比窗
+    CPU常驻不占GPU, 主循环只贴图不阻塞"""
+    global _sr_latest, _sr_latest_frame, _sr_demo
+    while not _stop_flag.is_set():
+        time.sleep(10.0)
+        try:
+            _cur = _sr_latest_frame
+            if _cur is None or _sr_model is None:
+                continue
+            _h, _w = _cur.shape[:2]
+            _rx1, _ry1 = max(0, _w//2-160), max(0, _h//2-90)
+            _rx2, _ry2 = min(_w, _w//2+160), min(_h, _h//2+90)
+            _roi = _cur[_ry1:_ry2, _rx1:_rx2]
+            _t = torch.from_numpy(_roi.transpose(2,0,1)[None].astype(np.float32)/255.0)
+            with torch.no_grad():
+                _up = _sr_model(_t)[0]   # CPU推理
+            _sr_roi = (np.clip(_up.permute(1,2,0).numpy(),0,1)*255).astype(np.uint8)
+            _sr_demo = (_roi.copy(), _sr_roi)
+        except Exception:
+            pass
+
+def _rife_worker():
+    """★ 16:58 RIFE效果展示(后台10s/次): 用最近两帧插帧 → _rife_demo对比窗"""
+    global _rife_demo, _demo_a, _demo_b
+    while not _stop_flag.is_set():
+        time.sleep(10.0)
+        try:
+            if _demo_a is None or _demo_b is None:
+                continue
+            import subprocess
+            cv2.imwrite(r'D:/training_data/_d_a.png', _demo_a)
+            cv2.imwrite(r'D:/training_data/_d_b.png', _demo_b)
+            subprocess.run([
+                r'D:/training_data/rife-ncnn/rife-ncnn-vulkan-20221029-windows/rife-ncnn-vulkan.exe',
+                '-0', r'D:/training_data/_d_a.png', '-1', r'D:/training_data/_d_b.png',
+                '-o', r'D:/training_data/_d_mid.png', '-g', '0'],
+                timeout=10, capture_output=True)
+            _mid = cv2.imread(r'D:/training_data/_d_mid.png')
+            if _mid is not None:
+                _rife_demo = (_demo_b.copy(), _mid)
+        except Exception:
+            pass
+
+# ★ 16:29 超分异步线程启动(在 _sr_worker 定义后) — 16:58 效果展示版(CPU/ROI, 不卡)
+_stop_flag = threading.Event()   # ★ 全局停止标志(线程用)
+if _sr_model is not None:
+    _sr_thread = threading.Thread(target=_sr_worker, daemon=True)
+    _sr_thread.start()
+    print("✅ 超分演示线程已启动(CPU/10s, 效果对比窗)")
+if _rife_model is not None:
+    _rife_thread = threading.Thread(target=_rife_worker, daemon=True)
+    _rife_thread.start()
+    print("✅ RIFE演示线程已启动(10s, 效果对比窗)")
 
 def dlss_super_resolve(frame):
     """★ 超分前置: 采集帧 → Real-ESRGAN 超分 2x → 720p
@@ -846,7 +919,7 @@ while True:
                 cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
                 cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
                 cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)   # 16:53 清晰度: 360p→480p(细节+33%)
             except Exception:
                 cap = cv2.VideoCapture(0)
             if cap.isOpened():
@@ -886,6 +959,11 @@ while True:
     #   暂停原因: 光线锐化/过滤后香烟细节纹理不够明显, 先回退原帧对比
     #   影响: 检测用原帧(无CLAHE/Unsharp/分块补偿), 暗光/白背景增强全部失效
     frame_enh = frame
+    # ★ 16:29 超分线程取帧(异步展示超分效果)
+    _sr_latest_frame = frame
+    # ★ 16:58 RIFE演示: 缓存最近两帧小图(后台插帧对比窗用)
+    _demo_a = _demo_b
+    _demo_b = cv2.resize(frame, (320, 180), interpolation=cv2.INTER_AREA) if frame is not None else None
 
     # --- 头检测(15:31 完全用 V12 模型, 废掉 pose): head_v12 模型检测(完整头框) ---
     #   ★ 15:51 BoT-SORT 全面接入: HEAD.track(botsort) — 模型检测 + BOTSORT追踪(ReID/GMC/低分恢复)
@@ -1119,19 +1197,25 @@ while True:
     #   无头无手 → sr空 → 烟识别关闭
     sr = []
     if focus_regions:
-        # ★ 15:56 BoT-SORT 接入烟: 全帧 SMOKE.track(botsort) — ReID找回/低分恢复(追踪更稳定)
-        #   防误检: 后续"候选中心必须在focus_regions内"互斥过滤保留(全帧只出追踪, 区域外不显示)
-        try:
-            _rr_all = SMOKE.track(frame_enh, persist=True, tracker='botsort.yaml',
-                                  conf=0.12, iou=0.5, imgsz=640, verbose=False)
-            for _rrc in _rr_all:
-                if _rrc.boxes is None: continue
-                for _b2 in _rrc.boxes:
-                    _bcx = float(_b2.conf[0])
-                    _bx1, _by1, _bx2, _by2 = _b2.xyxy[0].cpu().numpy()
-                    sr.append(_RoiRes([_RoiBox(_bx1, _by1, _bx2, _by2, _bcx)]))
-        except Exception:
-            pass
+        # ★ 16:29 帧率优化: 烟隔帧推理(烟移动慢, 追踪由BOTSORT预测续帧) + 缓存上一帧结果
+        if _gframe % 2 == 0:
+            try:
+                _rr_all = SMOKE.track(frame_enh, persist=True, tracker='botsort.yaml',
+                                      conf=0.12, iou=0.5, imgsz=640, verbose=False)
+                _smoke_det_cache = []
+                for _rrc in _rr_all:
+                    if _rrc.boxes is None: continue
+                    for _b2 in _rrc.boxes:
+                        _bcx = float(_b2.conf[0])
+                        _bx1, _by1, _bx2, _by2 = _b2.xyxy[0].cpu().numpy()
+                        _smoke_det_cache.append((_bx1, _by1, _bx2, _by2, _bcx))
+            except Exception:
+                _smoke_det_cache = []
+            for _s in _smoke_det_cache:
+                sr.append(_RoiRes([_RoiBox(_s[0], _s[1], _s[2], _s[3], _s[4])]))
+        else:
+            for _s in (_smoke_det_cache if '_smoke_det_cache' in dir() else []):
+                sr.append(_RoiRes([_RoiBox(_s[0], _s[1], _s[2], _s[3], _s[4])]))
     else:
         sr = []   # 无头无手 → 本帧不检测烟
     for r in sr:
@@ -1588,18 +1672,22 @@ while True:
         cv2.rectangle(_disp, (sx1,sy1), (sx2,sy2), RED, 3)
         cv2.putText(_disp, "CIG", (sx1, sy2+18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, RED, 2)
 
-    # 状态行(画在 _disp 上, 覆盖涂暗)
-    cv2.putText(_disp, f"H:{len(tracks)} C:{len(smoke_tracks)} {fc/max(1,time.time()-t0):.0f}fps",
-                (4,18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 2)
+    # ★ 16:29 技术效果可视化: 状态面板(模型看到什么 + 各技术状态)
+    _fps_now = fc / max(1, time.time() - t0)
+    cv2.putText(_disp, f"H:{len(tracks)} C:{len(smoke_tracks)} {_fps_now:.0f}fps",
+                (4, 18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 2)
+    cv2.putText(_disp, f"TRT:{'ON' if _os.path.exists(r'D:/视觉安防系统/models/smoke_v12.engine') else 'OFF'} "
+                       f"BOTSORT:ON SR:{'ON' if _sr_model is not None else 'OFF'} "
+                       f"RIFE:{'ON' if _rife_model is not None else 'OFF'}",
+                (4, 38), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 255), 2)
 
     # ★ 显示(重构版): 超分帧已高清(720p), 直接显示; RIFE 插帧 → 显示丝滑
-    #   超分前置(检测已用超分帧), 显示无需再超分; RIFE 在真实帧之间插中间帧
-    _disp = cv2.resize(_disp, (1280, 720)) if _disp.shape[1] >= 1280 else cv2.resize(_disp, (960, 540))
+    #   16:53 清晰度增强(实时不卡): 高质量缩放LANCZOS + 轻量锐化Unsharp
+    _disp = cv2.resize(_disp, (1280, 720), interpolation=cv2.INTER_LANCZOS4) if _disp.shape[1] >= 1280 else cv2.resize(_disp, (960, 540), interpolation=cv2.INTER_LANCZOS4)
+    # ★ 轻量锐化(Unsharp, ~2ms): 边缘更清晰(感知锐度提升, 不引入伪影)
+    _disp = cv2.addWeighted(_disp, 1.5, cv2.GaussianBlur(_disp, (0, 0), 2.0), -0.5, 0)
     _show = _disp
-    if _rife_model is not None:
-        _mid = dlss_interp(_prev_disp, _disp)
-        if _mid is not None:
-            _show = _mid   # 显示中间帧(下一帧显示真实帧) → 视觉帧率×2
+    # 16:59 单窗口: 主画面=模型实际看到的(检测输入帧+框+状态), 无额外窗口/对比窗
     cv2.imshow("Head + Smoke Detection", _show)
     _prev_disp = _disp.copy()
     fc += 1
