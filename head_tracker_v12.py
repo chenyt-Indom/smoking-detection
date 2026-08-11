@@ -972,7 +972,7 @@ _mp_latest_time = 0.0          # 结果时间戳
 _mp_frame_cur = None           # 最新帧(线程取)
 _mp_lock = threading.Lock()
 def _mp_worker():
-    global _mp_latest_boxes, _mp_latest_time, _mp_frame_cur
+    global _mp_latest_boxes, _mp_latest_time, _mp_frame_cur, _mp_prev_boxes
     while True:
         time.sleep(0.02)
         try:
@@ -995,6 +995,29 @@ def _mp_worker():
                     _x2 = min(_w, int(_x2+_pw)); _y2 = min(_h, int(_y2+_ph))
                     if _x2-_x1 >= 15 and _y2-_y1 >= 15:
                         _boxes.append((_x1, _y1, _x2, _y2))
+            # ★ 21:18 帧间EMA(治漂移, 20:33重写线程时丢失): 21点外接框对关键点抖动敏感,
+            #   min/max点一跳→框边跳→漂移; 与上帧框匹配(中心距<0.6宽)后 EMA(0.55旧+0.45新)
+            if _mp_prev_boxes:
+                _out = []
+                _used = set()
+                for _b in _boxes:
+                    _bc = ((_b[0]+_b[2])/2, (_b[1]+_b[3])/2)
+                    _bw2 = _b[2] - _b[0]
+                    _bi, _bd = -1, _bw2 * 0.6
+                    for _i, _pb in enumerate(_mp_prev_boxes):
+                        if _i in _used: continue
+                        _pc = ((_pb[0]+_pb[2])/2, (_pb[1]+_pb[3])/2)
+                        _d = ((_bc[0]-_pc[0])**2 + (_bc[1]-_pc[1])**2) ** 0.5
+                        if _d < _bd:
+                            _bd = _d; _bi = _i
+                    if _bi >= 0:
+                        _used.add(_bi)
+                        _pb = _mp_prev_boxes[_bi]
+                        _out.append(tuple(int(_pb[k]*0.55 + _b[k]*0.45) for k in range(4)))
+                    else:
+                        _out.append(_b)
+                _boxes = _out
+            _mp_prev_boxes = _boxes
             with _mp_lock:
                 _mp_latest_boxes = _boxes
                 _mp_latest_time = time.time()
@@ -1261,8 +1284,8 @@ while True:
             _hb2 = kpts_to_hand_bbox(_pp[1], W, H)
             if _hb2 is not None:
                 det_hands.append(_hb2)
-    # ★ 15:07 手框时间平滑(模型输出已稳, 平滑防偶发跳变), 之后进去重/追踪
-    det_hands, _prev_hand_boxes = smooth_boxes(det_hands, _prev_hand_boxes)
+    # ★ 15:07 手框时间平滑(21:18 治漂移: alpha 0.60→0.55 更重平滑) — MediaPipe帧间EMA已在上游
+    det_hands, _prev_hand_boxes = smooth_boxes(det_hands, _prev_hand_boxes, alpha=0.55)
     # ★★ 手部检测去重(治"方框分裂/重叠"): 同一只手被模型输出多个框(微小偏移/双检)
     #   ★ 15:35 中心距 0.8→1.2 手宽: 快速移动时运动模糊导致双检框中心距大, 放宽合并
     det_hands_dedup = []
@@ -1362,7 +1385,7 @@ while True:
                 _hb = _ht[0].bbox
                 _d2 = ((dh[0]+dh[2])/2 - (_hb[0]+_hb[2])/2)**2 + ((dh[1]+dh[3])/2 - (_hb[1]+_hb[3])/2)**2
                 _hw_max = max(dh[2]-dh[0], _hb[2]-_hb[0])
-                if _d2 < (_hw_max * 1.5) ** 2:
+                if _d2 < (_hw_max * 1.8) ** 2:   # ★ 21:18 治分裂: 1.5→1.8手宽(更不易新建第二轨)
                     _dup_track = True
                     # ★ 顺手把它匹配给最近的轨(加速收敛, 框立刻跟上手)
                     if _ht[1] not in h_matched_ids:
