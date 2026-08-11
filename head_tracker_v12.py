@@ -1578,27 +1578,27 @@ while True:
                 _hb = _ht[0].bbox
                 _d2 = ((dh[0]+dh[2])/2 - (_hb[0]+_hb[2])/2)**2 + ((dh[1]+dh[3])/2 - (_hb[1]+_hb[3])/2)**2
                 _hw_max = max(dh[2]-dh[0], _hb[2]-_hb[0])
-            if _d2 < (_hw_max * _suppress_r) ** 2:
-                _dup_track = True
-                # ★ 顺手把它匹配给最近的轨(加速收敛, 框立刻跟上手)
-                # ★★ 08-12 顺手更新防合并框: 检测框若覆盖其他活跃轨中心(±0.25手宽)
-                #   → 是合并框/另一只手 → 不顺手更新(否则绕过合并框保护把轨拉偏)
-                if _ht[1] not in h_matched_ids:
-                    _steal3 = False
-                    _hba = _ht[0].bbox
-                    _hw_ref = max(dh[2]-dh[0], _hba[2]-_hba[0], 20.0)
-                    for _ht3 in hand_tracks:
-                        if _ht3 is _ht or _ht3[1] in h_matched_ids: continue
-                        if _ht3[0].lost >= 2: continue
-                        _b3 = _ht3[0].bbox
-                        _c3x = (_b3[0]+_b3[2])/2; _c3y = (_b3[1]+_b3[3])/2
-                        _pad3 = _hw_ref * 0.25
-                        if (dh[0]-_pad3) <= _c3x <= (dh[2]+_pad3) and (dh[1]-_pad3) <= _c3y <= (dh[3]+_pad3):
-                            _steal3 = True; break
-                    if not _steal3:
-                        hand_tracks[hand_tracks.index(_ht)][0].update(dh)
-                        h_matched_ids.add(_ht[1])
-                break
+                if _d2 < (_hw_max * _suppress_r) ** 2:
+                    _dup_track = True
+                    # ★ 顺手把它匹配给最近的轨(加速收敛, 框立刻跟上手)
+                    # ★★ 08-12 顺手更新防合并框: 检测框若覆盖其他活跃轨中心(±0.25手宽)
+                    #   → 是合并框/另一只手 → 不顺手更新(否则绕过合并框保护把轨拉偏)
+                    if _ht[1] not in h_matched_ids:
+                        _steal3 = False
+                        _hba = _ht[0].bbox
+                        _hw_ref = max(dh[2]-dh[0], _hba[2]-_hba[0], 20.0)
+                        for _ht3 in hand_tracks:
+                            if _ht3 is _ht or _ht3[1] in h_matched_ids: continue
+                            if _ht3[0].lost >= 2: continue
+                            _b3 = _ht3[0].bbox
+                            _c3x = (_b3[0]+_b3[2])/2; _c3y = (_b3[1]+_b3[3])/2
+                            _pad3 = _hw_ref * 0.25
+                            if (dh[0]-_pad3) <= _c3x <= (dh[2]+_pad3) and (dh[1]-_pad3) <= _c3y <= (dh[3]+_pad3):
+                                _steal3 = True; break
+                        if not _steal3:
+                            hand_tracks[hand_tracks.index(_ht)][0].update(dh)
+                            h_matched_ids.add(_ht[1])
+                    break
             if not _dup_track and len(hand_tracks) < 10:
                 # ★ ReID: 新建轨携带外观签名(后续匹配用)
                 hand_tracks.append([KalmanBox(dh, pn=0.50, mn=0.05, sig=_hand_sigs[j] if j < len(_hand_sigs) else None),
