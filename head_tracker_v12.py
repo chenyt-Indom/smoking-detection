@@ -68,6 +68,16 @@ try:
 except Exception as _e:
     MP_HANDS = None
     print(f"⚠️ MediaPipe Hands 未加载: {type(_e).__name__} {str(_e)[:80]}")
+# ★★ 23:52 MiDaS 单目深度估计(空间立体感知): 深度图判断"谁在前"
+#   手/胳膊挡脸 → 手区域深度小(近), 脸区域深度大(远) → 头框保持, 告别2D猜测
+#   ★ 00:08 懒初始化: MiDaS 在系统环境初始化会卡死(与MediaPipe并发冲突, 单测正常)
+#   → 初始化移入深度线程内部(后台), 卡死只影响深度线程, 不阻塞主系统
+DEPTH = None   # (model, transform) 或 None(线程内懒初始化)
+_depth_map = None      # 128x72 深度图
+_depth_time = 0.0      # 深度图时间戳
+_depth_frame_cur = None
+_depth_lock = threading.Lock()
+_depth_inited = False
 try:
     SMOKE.model.half()
 except Exception:
@@ -990,20 +1000,23 @@ def _mp_worker():
                     _xs = [p.x for p in _lm]; _ys = [p.y for p in _lm]
                     _x1 = max(0, int(min(_xs)*_w)); _y1 = max(0, int(min(_ys)*_h))
                     _x2 = min(_w, int(max(_xs)*_w)); _y2 = min(_h, int(max(_ys)*_h))
-                    _pw, _ph = (_x2-_x1)*0.04, (_y2-_y1)*0.04
+                    # ★ 21:25 用户要求: 手框适当放大一圈(4%→12% padding, 每边外扩)
+                    _pw, _ph = (_x2-_x1)*0.12, (_y2-_y1)*0.12
                     _x1 = max(0, int(_x1-_pw)); _y1 = max(0, int(_y1-_ph))
                     _x2 = min(_w, int(_x2+_pw)); _y2 = min(_h, int(_y2+_ph))
                     if _x2-_x1 >= 15 and _y2-_y1 >= 15:
                         _boxes.append((_x1, _y1, _x2, _y2))
             # ★ 21:18 帧间EMA(治漂移, 20:33重写线程时丢失): 21点外接框对关键点抖动敏感,
-            #   min/max点一跳→框边跳→漂移; 与上帧框匹配(中心距<0.6宽)后 EMA(0.55旧+0.45新)
+            #   min/max点一跳→框边跳→漂移; 与上帧框匹配后 EMA
+            #   ★ 21:59 治偶发漂移: 匹配阈值 0.6→1.0宽(检测跳变也平滑过渡, 不直接换新框)
+            #   + 权重 0.55→0.65旧(更稳; 快速移动由Kalman预测兜底跟手)
             if _mp_prev_boxes:
                 _out = []
                 _used = set()
                 for _b in _boxes:
                     _bc = ((_b[0]+_b[2])/2, (_b[1]+_b[3])/2)
                     _bw2 = _b[2] - _b[0]
-                    _bi, _bd = -1, _bw2 * 0.6
+                    _bi, _bd = -1, _bw2 * 1.0
                     for _i, _pb in enumerate(_mp_prev_boxes):
                         if _i in _used: continue
                         _pc = ((_pb[0]+_pb[2])/2, (_pb[1]+_pb[3])/2)
@@ -1013,7 +1026,7 @@ def _mp_worker():
                     if _bi >= 0:
                         _used.add(_bi)
                         _pb = _mp_prev_boxes[_bi]
-                        _out.append(tuple(int(_pb[k]*0.55 + _b[k]*0.45) for k in range(4)))
+                        _out.append(tuple(int(_pb[k]*0.65 + _b[k]*0.35) for k in range(4)))
                     else:
                         _out.append(_b)
                 _boxes = _out
@@ -1026,6 +1039,64 @@ def _mp_worker():
 if MP_HANDS is not None:
     threading.Thread(target=_mp_worker, daemon=True).start()
     print("✅ MediaPipe 独立线程已启动(卡死自动降级 hand.pt/pose)")
+
+# ★★ 23:52 MiDaS 深度线程(空间立体感知): 每0.5s对最新帧算深度图(128x72)
+#   独立线程, 不阻塞主循环; 深度图用于"手/胳膊挡头"判定(谁在前)
+#   ★ 00:08 懒初始化: 线程内首次运行才加载模型(系统环境加载会卡死 → 后台线程隔离,
+#   卡死只停深度线程, 主系统照常; 加载成功才启用深度判定)
+def _depth_worker():
+    global _depth_map, _depth_time, _depth_frame_cur, DEPTH, _depth_inited
+    while True:
+        time.sleep(0.5)
+        try:
+            if DEPTH is None and not _depth_inited:
+                _depth_inited = True
+                try:
+                    import sys as _sys
+                    import torch.hub as _hub
+                    try:
+                        _hub._validate_not_a_forked_repo = lambda *a, **k: None
+                    except Exception:
+                        pass
+                    _sys.path.insert(0, r'D:/training_data/midas_src/MiDaS-master')
+                    from midas.midas_net_custom import MidasNet_small
+                    import torchvision.transforms as _T
+                    if _os.path.exists(r"D:\training_data\midas_small.pt"):
+                        _m_model = MidasNet_small(path=r"D:\training_data\midas_small.pt", features=64,
+                                                  backbone='efficientnet_lite3', exportable=True,
+                                                  non_negative=True, blocks={'expand': True})
+                        _m_model.eval().cuda().half()
+                        _m_tr = _T.Compose([_T.ToTensor(), _T.Resize((256, 256)),
+                                            _T.Normalize([0.485, 0.456, 0.406], [0.229, 0.224, 0.225])])
+                        DEPTH = (_m_model, _m_tr)
+                        print("✅ MiDaS 深度估计已加载(空间立体感知, 后台线程)")
+                    else:
+                        print("⚠️ midas_small.pt 缺失, 深度感知未启用")
+                except Exception as _e:
+                    print(f"⚠️ MiDaS 加载失败(不阻塞系统): {type(_e).__name__} {str(_e)[:60]}")
+                continue
+            if DEPTH is None:
+                continue
+            with _depth_lock:
+                _fr = _depth_frame_cur
+            if _fr is None:
+                continue
+            _m, _tr = DEPTH
+            _rgb = _fr[:, :, ::-1].copy()
+            _x = _tr(_rgb).unsqueeze(0).cuda().half()
+            with torch.no_grad():
+                _pred = _m(_x)
+            _d = torch.nn.functional.interpolate(
+                _pred.unsqueeze(1), size=(72, 128), mode='bilinear', align_corners=False,
+            ).squeeze().float().cpu().numpy()
+            with _depth_lock:
+                _depth_map = _d
+                _depth_time = time.time()
+        except Exception:
+            pass
+if True:
+    threading.Thread(target=_depth_worker, daemon=True).start()
+    print("✅ MiDaS 深度线程已启动(懒初始化, 卡死不阻塞系统)")
 
 def _capture_worker():
     """★ 17:13 帧率修复: 1080p 只出现在采集环节!
@@ -1115,6 +1186,9 @@ while True:
     # ★ 20:33 MediaPipe 线程取帧(21点手部检测)
     with _mp_lock:
         _mp_frame_cur = frame
+    # ★ 23:52 MiDaS 深度线程取帧(空间感知)
+    with _depth_lock:
+        _depth_frame_cur = frame
     # ★ 18:36 手检测补充通道: pose 手腕(隔帧, 预训练零训练) — hand_v12 实拍分布偏移失败(只出巨型假框)
     #   14:26 原始机制: 预训练 pose 直接找手(手腕关键点9/10); 15:31 因头画框不准废弃, 手腕定位本身可靠
     if _gframe % 2 == 0:
@@ -1134,7 +1208,9 @@ while True:
     #   验证: 实拍图 15/15 检出(BOTSORT 工作正常)
     #   ★ 17:31 conf 0.55→0.50: 手误检靠"头框宽高比钳制"处理(见下方), 0.55会致遮挡时头检测
     #   时有时无(忽闪), 0.50更连续稳定; 误检由BOTSORT低分恢复+追踪过滤兜底
-    res = HEAD.track(frame, persist=True, tracker='botsort.yaml', conf=0.50, iou=0.5, imgsz=640, verbose=False)
+    #   ★★ 23:26 彻查结论: BOTSORT双层(内部宽松关联+外层update)放大手/胳膊挡脸的偏框污染
+    #     → 回归 V8 直接检测(单层 KalmanBox), 与 V8 逻辑一致(用户: 对比V8, 像V8一样稳)
+    res = HEAD(frame, conf=0.50, iou=0.5, imgsz=640, verbose=False)
     det_heads = []
     for r in res:
         if r.boxes is None: continue
@@ -1154,7 +1230,7 @@ while True:
 
     matched_ids = set(); matched_det = set()
     for j, dh in enumerate(det_heads):
-        best_i, best_score = -1, 0.15
+        best_i, best_iou = -1, 0.15
         for i, t in enumerate(tracks):
             if t[1] in matched_ids: continue
             iou_val = iou(t[0].bbox, dh)
@@ -1162,48 +1238,36 @@ while True:
                 kf = t[0].kf; ps = kf.statePre.flatten()
                 pb = (ps[0]-ps[2]/2, ps[1]-ps[3]/2, ps[0]+ps[2]/2, ps[1]+ps[3]/2)
                 iou_val = iou(pb, dh)
-            # ★★ 17:41 中心距通道(治高速移动跟不上): 头高速移动时帧间位移大 → IoU≈0 匹配失败
-            #   → lost+1 速度衰减 → 框减速跟不上。IoU低但中心距近(≤1.2头宽) → 同一头, 直接匹配
-            #   (速度自适应显示平滑已有: 快移α0.92紧跟; 静止α0.60稳定)
-            _score = iou_val
-            if iou_val < 0.15:
-                _tc = ((t[0].bbox[0]+t[0].bbox[2])/2, (t[0].bbox[1]+t[0].bbox[3])/2)
-                _dc = ((dh[0]+dh[2])/2, (dh[1]+dh[3])/2)
-                _tw2 = max(15.0, t[0].bbox[2]-t[0].bbox[0])
-                _dist = ((_tc[0]-_dc[0])**2 + (_tc[1]-_dc[1])**2) ** 0.5
-                if _dist < _tw2 * 2.5:   # 17:47 中心距阈值 2.0→2.5头宽: 更快的移动也匹配得上
-                    _score = 0.20   # 中心距近 → 匹配成功(略高于IoU阈值, 优先IoU)
-            if _score > best_score: best_score = _score; best_i = i
+            # ★★ 23:26 彻查: 移除 17:41 加的"中心距 2.5头宽 通道"(V8 没有此机制)
+            #   它是头框"慢慢偏移"的根因: 手/胳膊挡脸偏框 IoU<0.15 但中心距<2.5头宽
+            #   → 偏框匹配成功→update→头轨被逐步拖动→慢慢偏移(补丁压不住)
+            #   V8 靠纯 IoU 0.15 严格匹配, 偏框天然被拒 → 头框稳定。回归 V8 逻辑
+            if iou_val > best_iou: best_iou = iou_val; best_i = i
         if best_i >= 0:
             _tb = tracks[best_i][0].bbox
             _tw, _th = _tb[2]-_tb[0], _tb[3]-_tb[1]
             _nw, _nh = dh[2]-dh[0], dh[3]-dh[1]
-            # ★★ 17:35 手挡头锁定(治手挡头时头框抖动/变形): 头轨与手轨重叠 → 检测框被手污染
-            #   完全信任 Kalman 预测(已 predict, 位置延续真头/尺寸保持) → 框稳定不抖
-            #   手移开(不重叠) → 恢复检测框接管(跟头移动)
-            #   ★ 17:45 增强: 重叠判定加"中心距"通道(IoU对手挡头部分重叠可能偏小) +
-            #   锁定期间 disp_bbox 硬跟随预测框(不EMA, 彻底消除变形)
-            _hand_ovl2 = False
-            for _ht in hand_tracks:
-                _hb2 = _ht[0].bbox
-                if iou(_tb, _hb2) > 0.10:
-                    _hand_ovl2 = True; break
-                _hcc = ((_hb2[0]+_hb2[2])/2, (_hb2[1]+_hb2[3])/2)
-                _tcc = ((_tb[0]+_tb[2])/2, (_tb[1]+_tb[3])/2)
-                _hw_sum = (_tw + (_hb2[2]-_hb2[0])) / 2
-                if ((_hcc[0]-_tcc[0])**2 + (_hcc[1]-_tcc[1])**2) ** 0.5 < _hw_sum * 0.9:
-                    _hand_ovl2 = True; break
-            if _hand_ovl2:
-                _htrk = tracks[best_i][0]
-                _htrk.lost = 0   # 保持存活(不 update, 用预测框)
-                _htrk.disp_bbox = _htrk.bbox   # 硬跟随: 显示框=预测框(无EMA滞后, 无变形)
+            # ★★ 00:15 回归 V8 精神(详细对比 V8 后清理): V8 头上零防御, 靠"纯IoU严格匹配"
+            #   天然拒绝遮挡偏框(IoU<0.15 不匹配→不update→头框不动)。V12 模型(head_v12)弱,
+            #   手挡头边缘时偏框与旧轨部分重叠 IoU>0.15 会匹配上 → 需要唯一等价拦截:
+            #   [预测一致性拦截] 新框中心 vs Kalman预测中心(已含速度外推)偏移 > 0.4头宽
+            #     = 遮挡偏框 → 不 update(用预测框, 头框保持)
+            #     快速转头: 预测已外推 → 新框≈预测位置 → 偏移小 → 正常 update ✅
+            #   [保险] 连续拦截>20帧强制 update(防长时间遮挡预测漂移)
+            #   (手挡头锁定/深度判定/尺寸钳制已删除 — 均依赖手轨或延迟高, 与 V8 行为不一致)
+            _ncx3 = (dh[0]+dh[2])/2; _ncy3 = (dh[1]+dh[3])/2
+            _pcx3 = (_tb[0]+_tb[2])/2; _pcy3 = (_tb[1]+_tb[3])/2
+            _dist3 = ((_ncx3-_pcx3)**2 + (_ncy3-_pcy3)**2) ** 0.5
+            _skip3 = getattr(tracks[best_i][0], '_skip_upd', 0)
+            if _tw > 15 and _th > 15 and _dist3 > _tw * 0.4 and _skip3 < 20:
+                # 遮挡偏框: 不 update, 用预测框(头框保持原位, 不飘)
+                _htrk3 = tracks[best_i][0]
+                _htrk3._skip_upd = _skip3 + 1
+                _htrk3.lost = 0
+                _htrk3.disp_bbox = _htrk3.bbox   # 硬跟预测框(无EMA滞后)
                 matched_ids.add(tracks[best_i][1]); matched_det.add(j)
                 continue
-            # ★★ 17:31 尺寸钳制(治头遮挡时框变形): 新框与旧轨尺寸偏差>35% → 保持旧尺寸
-            #   17:35 阈值 50%→35%(更稳): 遮挡时模型只检出半头/变形头框, 直接 update 会忽大忽小
-            if _tw > 15 and _th > 15 and (_nw > _tw*1.35 or _nh > _th*1.35 or _nw < _tw*0.65 or _nh < _th*0.65):
-                _ncx = (dh[0]+dh[2])/2; _ncy = (dh[1]+dh[3])/2
-                dh = (_ncx-_tw/2, _ncy-_th/2, _ncx+_tw/2, _ncy+_th/2)
+            tracks[best_i][0]._skip_upd = 0
             tracks[best_i][0].update(dh); matched_ids.add(tracks[best_i][1]); matched_det.add(j)
     for t in tracks:
         if t[1] not in matched_ids: t[0].lost += 1
@@ -1211,6 +1275,8 @@ while True:
         if j in matched_det: continue
         # ★★ 17:31 新建轨抑制(治头遮挡时框分裂): 与任何现有头轨中心距 < 1.5×最大头宽
         #   → 视为同一头(遮挡导致IoU小未匹配) → 不新建, 顺手喂给最近轨
+        #   ★ 00:03 治"挡头时头框飘": 偏框经"顺手喂给"直接update旧轨 → 旧轨被拖走
+        #     → 喂给前加偏框校验(速度自适应): 旧轨速度小+偏移大 = 偏框 → 不喂(丢弃, 不新建)
         _dup_track = False
         for _t in tracks:
             _tb = _t[0].bbox
@@ -1219,16 +1285,22 @@ while True:
             if _d2 < (_tw_max * 1.5) ** 2:
                 _dup_track = True
                 if _t[1] not in matched_ids:
-                    tracks[tracks.index(_t)][0].update(dh)
-                    matched_ids.add(_t[1])
+                    _tv = tracks[tracks.index(_t)][0].kf.statePost.flatten()
+                    _tvel2 = (_tv[4]**2 + _tv[5]**2) ** 0.5
+                    _tdist2 = _d2 ** 0.5
+                    _tthr2 = max(_tw_max * 0.6, _tvel2 * 1.5 + 15)
+                    if _tdist2 <= _tthr2:   # 偏移在速度自适应阈值内 = 正常帧 → 喂
+                        tracks[tracks.index(_t)][0].update(dh)
+                        matched_ids.add(_t[1])
                 break
         if not _dup_track and len(tracks) < 20:
-            # ★★ 17:32 新建轨互斥(治"手独立出现被误检成头"): 新头框与上帧手轨重叠>0.25
-            #   → 孤立手位置的头框=手误检 → 不新建轨(绿框不会出现在手上)
+            # ★★ 17:32 新建轨互斥(治"手独立出现被误检成头"): 新头框与上帧手轨重叠
+            #   ★ 22:03 收严 0.25→0.4(治"头手靠近头消失"): 手在头旁轻微重叠(0.25-0.4)不再拦头
+            #     → 头轨丢失重建时不会被旁边的手挡住; 只有手基本盖住头框(IoU>0.4)才拦
             #   ⚠️ 不影响已有头轨: 手挡头前时头轨已存在, 保留(不删不压) → 挡头仍识别
             _hand_ovl = False
             for _ht in hand_tracks:
-                if iou(dh, _ht[0].bbox) > 0.25:
+                if iou(dh, _ht[0].bbox) > 0.40:
                     _hand_ovl = True; break
             if not _hand_ovl:
                 tracks.append([KalmanBox(dh), next_id]); next_id += 1
@@ -1287,7 +1359,9 @@ while True:
     # ★ 15:07 手框时间平滑(21:18 治漂移: alpha 0.60→0.55 更重平滑) — MediaPipe帧间EMA已在上游
     det_hands, _prev_hand_boxes = smooth_boxes(det_hands, _prev_hand_boxes, alpha=0.55)
     # ★★ 手部检测去重(治"方框分裂/重叠"): 同一只手被模型输出多个框(微小偏移/双检)
-    #   ★ 15:35 中心距 0.8→1.2 手宽: 快速移动时运动模糊导致双检框中心距大, 放宽合并
+    #   ★ 21:44 治"两手一起时一只识别不出": 中心距阈值 1.2→0.8手宽
+    #     两手靠一起时中心距常为 1.0-1.5手宽, 1.2会误合并成一只 → 收紧到0.8
+    #     同手双框(中心距<0.8手宽 + IoU>0.3)仍合并, 不受影响
     det_hands_dedup = []
     for _dh in sorted(det_hands, key=lambda b: -(b[2]-b[0])*(b[3]-b[1])):
         _dup = False
@@ -1295,7 +1369,7 @@ while True:
             if iou(_dh, _dh2) > 0.3:
                 _dup = True; break
             _d = ((_dh[0]+_dh[2])/2 - (_dh2[0]+_dh2[2])/2)**2 + ((_dh[1]+_dh[3])/2 - (_dh2[1]+_dh2[3])/2)**2
-            if _d < ((_dh2[2]-_dh2[0]) * 1.2) ** 2:
+            if _d < ((_dh2[2]-_dh2[0]) * 0.8) ** 2:
                 _dup = True; break
         if not _dup:
             det_hands_dedup.append(_dh)
@@ -1380,12 +1454,17 @@ while True:
             # ★★ 19:54 新建轨抑制(治"手移动→方框分裂"): 新检测框与任何现有手轨
             #   中心距 < 1.5×最大手宽 → 视为同一只手(运动模糊导致未匹配) → 不新建
             #   (否则快速移动时 IoU 小未匹配 → 新建第二条轨 → 双框)
+            #   ★ 21:44 治"两手一起时一只识别不出": 检测框数 > 手轨数(出现新手/两手场景)
+            #     → 抑制阈值 1.8→0.8手宽(只抑制同手微偏移, 允许第二只手建轨)
+            _suppress_r = 1.8
+            if len(det_hands) > len(hand_tracks):
+                _suppress_r = 0.8
             _dup_track = False
             for _ht in hand_tracks:
                 _hb = _ht[0].bbox
                 _d2 = ((dh[0]+dh[2])/2 - (_hb[0]+_hb[2])/2)**2 + ((dh[1]+dh[3])/2 - (_hb[1]+_hb[3])/2)**2
                 _hw_max = max(dh[2]-dh[0], _hb[2]-_hb[0])
-                if _d2 < (_hw_max * 1.8) ** 2:   # ★ 21:18 治分裂: 1.5→1.8手宽(更不易新建第二轨)
+                if _d2 < (_hw_max * _suppress_r) ** 2:
                     _dup_track = True
                     # ★ 顺手把它匹配给最近的轨(加速收敛, 框立刻跟上手)
                     if _ht[1] not in h_matched_ids:
@@ -1396,7 +1475,8 @@ while True:
                 # ★ ReID: 新建轨携带外观签名(后续匹配用)
                 hand_tracks.append([KalmanBox(dh, pn=0.50, mn=0.05, sig=_hand_sigs[j] if j < len(_hand_sigs) else None),
                                     next_id + 1000]); next_id += 1
-    hand_tracks = [ht for ht in hand_tracks if ht[0].lost < 5]
+    # ★ 21:36 模糊续轨: 丢失容忍 5→6帧(Kalman预测继续外推, 快速移动不丢轨)
+    hand_tracks = [ht for ht in hand_tracks if ht[0].lost < 6]
     # ★ 17:31 手/头互斥已移除(用户要求: 手挡头前时头仍需识别)
     #   手挡头时两框都保留(互斥会删真头, 不可取); 头稳定性靠下方"建轨抑制+尺寸钳制"解决
 
@@ -1848,9 +1928,11 @@ while True:
     # --- 绘制(在 _disp 上, 覆盖涂暗层, 标注框颜色保持鲜艳) ---
     # ★★ 手部蓝色框(新架构): 追踪框随手掌大小动态变化(Kalman更新)
     #   15:35 防分裂: lost>=2 的旧轨不画(快速移动时旧位置残影立刻消失, 不再与新位置双框)
+    #   ★ 21:36 治"快速移动框消失": 运动模糊→MediaPipe失败→lost增长→lost>=2隐藏=消失
+    #   放宽到 lost>=4: 模糊1-3帧时用Kalman预测位置继续显示(不消失), 第4帧才隐藏
     for ht in hand_tracks:
-        if ht[0].lost >= 2:
-            continue   # ★ 旧残影快速隐藏(防"手移动快→方框分裂")
+        if ht[0].lost >= 4:
+            continue   # ★ 丢失4帧才隐藏(模糊续显; 新建轨抑制1.8已防分裂, 放宽安全)
         hx1, hy1, hx2, hy2 = map(int, ht[0].disp_bbox if hasattr(ht[0], 'disp_bbox') else ht[0].bbox)
         cv2.rectangle(_disp, (hx1,hy1), (hx2,hy2), (255,0,0), 2)   # 蓝色
         cv2.putText(_disp, "HAND", (hx1, hy1-6), cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,0,0), 1)
