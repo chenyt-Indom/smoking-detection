@@ -1409,15 +1409,14 @@ while True:
                     det_hands.append((x1, y1, x2, y2))
         except Exception:
             pass
-    # ★ 去重(沿用 V8: 中心距 1.2 手宽 + IoU 0.3 合并同手双检框)
+    # ★ 去重(★ 08-12 只按IoU>0.3合并同手双检框): 移除"中心距<1.2手宽"合并
+    #   [旧] 中心距<1.2手宽即合并 → 两只手平行靠近时中心距近但框不重叠 → 第二只手框被合并掉
+    #   [新] 只合并"真正重叠"的双检框(IoU>0.3) → 两手靠近各自框保留 → 双手都有框
     det_hands_dedup = []
     for _dh in sorted(det_hands, key=lambda b: -(b[2]-b[0])*(b[3]-b[1])):
         _dup = False
         for _dh2 in det_hands_dedup:
             if iou(_dh, _dh2) > 0.3:
-                _dup = True; break
-            _d = ((_dh[0]+_dh[2])/2 - (_dh2[0]+_dh2[2])/2)**2 + ((_dh[1]+_dh[3])/2 - (_dh2[1]+_dh2[3])/2)**2
-            if _d < ((_dh2[2]-_dh2[0]) * 1.2) ** 2:   # ★ 00:36 沿用V8: 0.8→1.2手宽
                 _dup = True; break
         if not _dup:
             det_hands_dedup.append(_dh)
@@ -1459,7 +1458,10 @@ while True:
                 if _d2 < _w_ref * 1.5:
                     _near_n += 1
             _app = 0.0
-            if _near_n <= 1 and ht[0].sig is not None and _hand_sigs[j] is not None:
+            # ★★ 08-12 外观收严(治"两手靠近→第二只手没框"): 画面≥2检测框(两手
+            #   场景) → 禁用外观通道。两手肤色一致, 外观会把第二只手的检测框吸给
+            #   第一只手轨(IoU低但外观像也匹配) → 第二只手永远建不了轨
+            if len(det_hands) <= 1 and _near_n <= 1 and ht[0].sig is not None and _hand_sigs[j] is not None:
                 _corr, _size_ok = sig_similarity(ht[0].sig, _hand_sigs[j])
                 if _size_ok:
                     _app = max(0.0, _corr)   # 相关性[-1,1] → [0,1]
@@ -1501,8 +1503,19 @@ while True:
             if iou(dh, _b2) > 0.3:
                 _merge_box = True; break
         if (_size_jump and _near_head2) or _merge_box:
+            # ★★ 08-12 位置-尺寸分离更新(治"手碰头/手碰手时挤压排斥漂移"):
+            #   [旧] 维持预测框(不吸收任何测量) → 手长期靠Kalman外推 → 框被头/
+            #        另一只手"顶住"(排斥感) + 预测误差累积(漂移) ❌
+            #   [新] 位置半跟随检测(检测中心与KF预测中心取平均: 手动框动不被顶住,
+            #        污染框也不完全拉飞), 尺寸保持轨值(不被头/合并框撑大) →
+            #        框自然跟随且大小稳定 → 无排斥无挤压无漂移
             hand_tracks[best_i][0].lost = 0
-            hand_tracks[best_i][0].disp_bbox = hand_tracks[best_i][0].bbox   # 硬跟预测框
+            _kfp2 = hand_tracks[best_i][0].kf.statePre.flatten()
+            _cx2 = ((dh[0]+dh[2])/2 + _kfp2[0]) * 0.5
+            _cy2 = ((dh[1]+dh[3])/2 + _kfp2[1]) * 0.5
+            _clx = _cx2 - _tw_h*0.5; _cly = _cy2 - _th_h*0.5
+            _crx = _cx2 + _tw_h*0.5; _cry = _cy2 + _th_h*0.5
+            hand_tracks[best_i][0].update((_clx, _cly, _crx, _cry))
         else:
             # ★★ 08-12 位置突变验证(防遮挡/误检把框拉飞): 测量中心与KF预测中心
             #   距离 > 2.0手宽 → 测量不可信(跳到别的物体/另一只手) → 维持预测框
@@ -1599,31 +1612,44 @@ while True:
             #   ★ 01:47 完全沿用V8: 固定 1.5手宽(19:54 V8 原版), 移除 2.5/动态0.8
             _suppress_r = 1.5
             _dup_track = False
-            for _ht in hand_tracks:
-                _hb = _ht[0].bbox
-                _d2 = ((dh[0]+dh[2])/2 - (_hb[0]+_hb[2])/2)**2 + ((dh[1]+dh[3])/2 - (_hb[1]+_hb[3])/2)**2
-                _hw_max = max(dh[2]-dh[0], _hb[2]-_hb[0])
-                if _d2 < (_hw_max * _suppress_r) ** 2:
-                    _dup_track = True
-                    # ★ 顺手把它匹配给最近的轨(加速收敛, 框立刻跟上手)
-                    # ★★ 08-12 顺手更新防合并框: 检测框若覆盖其他活跃轨中心(±0.25手宽)
-                    #   → 是合并框/另一只手 → 不顺手更新(否则绕过合并框保护把轨拉偏)
-                    if _ht[1] not in h_matched_ids:
-                        _steal3 = False
-                        _hba = _ht[0].bbox
-                        _hw_ref = max(dh[2]-dh[0], _hba[2]-_hba[0], 20.0)
-                        for _ht3 in hand_tracks:
-                            if _ht3 is _ht or _ht3[1] in h_matched_ids: continue
-                            if _ht3[0].lost >= 2: continue
-                            _b3 = _ht3[0].bbox
-                            _c3x = (_b3[0]+_b3[2])/2; _c3y = (_b3[1]+_b3[3])/2
-                            _pad3 = _hw_ref * 0.25
-                            if (dh[0]-_pad3) <= _c3x <= (dh[2]+_pad3) and (dh[1]-_pad3) <= _c3y <= (dh[3]+_pad3):
-                                _steal3 = True; break
-                        if not _steal3:
-                            hand_tracks[hand_tracks.index(_ht)][0].update(dh)
-                            h_matched_ids.add(_ht[1])
-                    break
+            # ★★ 08-12 取消"手间距离限制"(治"两手靠近→其中一只手没框"):
+            #   [旧] 新检测框与任何手轨中心距<1.5手宽 → 视为同手 → 抑制建轨
+            #        → 两手靠近时第二只手永远建不了轨 ❌
+            #   [新] 若该检测框与画面中【另一检测框】中心距<1.5手宽(两只手靠在一起,
+            #        且非同一只手——同手双检已被IoU去重合并) → 突破抑制, 第二只手
+            #        立即建轨出框; 只有单独一个检测框时(快速移动/同手)才保留抑制
+            _near_other_det = False
+            for _dk, _dh2 in enumerate(det_hands):
+                if _dk == j: continue
+                _d2d = ((dh[0]+dh[2])/2-(_dh2[0]+_dh2[2])/2)**2 + ((dh[1]+dh[3])/2-(_dh2[1]+_dh2[3])/2)**2
+                if _d2d < (max(dh[2]-dh[0], _dh2[2]-_dh2[0], 20.0) * 1.5) ** 2:
+                    _near_other_det = True; break
+            if not _near_other_det:
+                for _ht in hand_tracks:
+                    _hb = _ht[0].bbox
+                    _d2 = ((dh[0]+dh[2])/2 - (_hb[0]+_hb[2])/2)**2 + ((dh[1]+dh[3])/2 - (_hb[1]+_hb[3])/2)**2
+                    _hw_max = max(dh[2]-dh[0], _hb[2]-_hb[0])
+                    if _d2 < (_hw_max * _suppress_r) ** 2:
+                        _dup_track = True
+                        # ★ 顺手把它匹配给最近的轨(加速收敛, 框立刻跟上手)
+                        # ★★ 08-12 顺手更新防合并框: 检测框若覆盖其他活跃轨中心(±0.25手宽)
+                        #   → 是合并框/另一只手 → 不顺手更新(否则绕过合并框保护把轨拉偏)
+                        if _ht[1] not in h_matched_ids:
+                            _steal3 = False
+                            _hba = _ht[0].bbox
+                            _hw_ref = max(dh[2]-dh[0], _hba[2]-_hba[0], 20.0)
+                            for _ht3 in hand_tracks:
+                                if _ht3 is _ht or _ht3[1] in h_matched_ids: continue
+                                if _ht3[0].lost >= 2: continue
+                                _b3 = _ht3[0].bbox
+                                _c3x = (_b3[0]+_b3[2])/2; _c3y = (_b3[1]+_b3[3])/2
+                                _pad3 = _hw_ref * 0.25
+                                if (dh[0]-_pad3) <= _c3x <= (dh[2]+_pad3) and (dh[1]-_pad3) <= _c3y <= (dh[3]+_pad3):
+                                    _steal3 = True; break
+                            if not _steal3:
+                                hand_tracks[hand_tracks.index(_ht)][0].update(dh)
+                                h_matched_ids.add(_ht[1])
+                        break
             if not _dup_track and len(hand_tracks) < 10:
                 # ★ ReID: 新建轨携带外观签名(后续匹配用)
                 hand_tracks.append([KalmanBox(dh, pn=0.50, mn=0.05, sig=_hand_sigs[j] if j < len(_hand_sigs) else None),
