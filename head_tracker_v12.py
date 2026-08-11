@@ -267,11 +267,11 @@ def init_dlss():
     except Exception as e:
         print(f'⚠️ DLSS超分未启用: {e}')
     try:
-        if os.path.exists(r'D:/training_data/rife_torch.pkl'):
-            from rife_torch import RIFE  # 需安装 rife_torch
-            _rife_model = RIFE(r'D:/training_data/rife_torch.pkl', device='cuda')
+        # ★ 16:15 RIFE 已就绪(ncnn-vulkan exe 下载完成, 431MB)
+        if os.path.exists(r'D:/training_data/rife-ncnn/rife-ncnn-vulkan-20221029-windows/rife-ncnn-vulkan.exe'):
+            _rife_model = True   # exe 方式(标记可用)
             ok_rife = True
-            print('✅ DLSS插帧: RIFE 已启用')
+            print('✅ DLSS插帧: RIFE(ncnn-vulkan) 已启用')
     except Exception as e:
         print(f'⚠️ DLSS插帧未启用: {e}')
     return ok_sr, ok_rife
@@ -321,11 +321,26 @@ def dlss_super_resolve(frame):
         return frame
 
 def dlss_interp(prev_frame, curr_frame):
-    """★ RIFE 插帧(仅显示): 前后帧生成中间帧 → 显示丝滑"""
-    if _rife_model is None or prev_frame is None or curr_frame is None:
+    """★ 16:15 RIFE 插帧(ncnn-vulkan exe, 本地GPU): 前后帧生成中间帧 → 显示丝滑
+    降尺寸到320x180加速(插帧只求视觉流畅, 显示时resize回)"""
+    global _rife_model
+    if prev_frame is None or curr_frame is None:
         return None
     try:
-        return _rife_model.inference(prev_frame, curr_frame)
+        import subprocess
+        _h1, _w1 = prev_frame.shape[:2]
+        _small = lambda f: cv2.resize(f, (320, 180), interpolation=cv2.INTER_AREA)
+        cv2.imwrite(r'D:/training_data/_rife_a.png', _small(prev_frame))
+        cv2.imwrite(r'D:/training_data/_rife_b.png', _small(curr_frame))
+        subprocess.run([
+            r'D:/training_data/rife-ncnn/rife-ncnn-vulkan-20221029-windows/rife-ncnn-vulkan.exe',
+            '-0', r'D:/training_data/_rife_a.png', '-1', r'D:/training_data/_rife_b.png',
+            '-o', r'D:/training_data/_rife_mid.png', '-g', '0'],
+            timeout=8, capture_output=True)
+        mid = cv2.imread(r'D:/training_data/_rife_mid.png')
+        if mid is not None:
+            return cv2.resize(mid, (_w1, _h1))
+        return None
     except Exception:
         return None
 
@@ -873,8 +888,9 @@ while True:
     frame_enh = frame
 
     # --- 头检测(15:31 完全用 V12 模型, 废掉 pose): head_v12 模型检测(完整头框) ---
-    #   V8 机制: 模型输出 → 过滤 → 追踪(完整框, 稳定)
-    res = HEAD(frame, conf=0.45, iou=0.5, verbose=False)
+    #   ★ 15:51 BoT-SORT 全面接入: HEAD.track(botsort) — 模型检测 + BOTSORT追踪(ReID/GMC/低分恢复)
+    #   验证: 实拍图 15/15 检出(BOTSORT 工作正常)
+    res = HEAD.track(frame, persist=True, tracker='botsort.yaml', conf=0.45, iou=0.5, imgsz=640, verbose=False)
     det_heads = []
     for r in res:
         if r.boxes is None: continue
@@ -918,8 +934,11 @@ while True:
     hand_low_pool = []
     if HAND_READY:
         try:
-            res_h = HAND(frame, conf=0.12, iou=0.5, verbose=False)
+            # ★ 15:51 BoT-SORT 全面接入: HAND.track(botsort) — 低分恢复/ReID外观匹配
+            res_h = HAND.track(frame, persist=True, tracker='botsort.yaml',
+                               conf=0.25, iou=0.5, imgsz=640, verbose=False)
             for r in res_h:
+                if r.boxes is None: continue
                 for box in r.boxes:
                     b = box.xyxy[0].cpu().numpy()
                     conf = float(box.conf.cpu().numpy()[0]) if box.conf is not None else 1.0
@@ -1100,42 +1119,19 @@ while True:
     #   无头无手 → sr空 → 烟识别关闭
     sr = []
     if focus_regions:
-        _roi_budget = 6
-        # ★ 14:22 smoke_v12 conf 低(0.1-0.46, 数据500张): 头区0.30→0.15(漏检优先)
-        #   误检由后续"红框贴手/头"互斥+纹理验证兜底
-        _batches = [('head', [], 0.15), ('hand', [], 0.15)]
-        for (frx1, fry1, frx2, fry2, _kind) in focus_regions:
-            if _roi_budget <= 0: break
-            # ★ 坐标转int再切片(模型输出float, numpy切片必须整数)
-            _frx1, _fry1 = max(0, int(frx1)), max(0, int(fry1))
-            _frx2, _fry2 = min(W, int(frx2)), min(H, int(fry2))
-            _frw, _frh = _frx2-_frx1, _fry2-_fry1
-            if _frw < 24 or _frh < 24: continue
-            _roi = frame_enh[_fry1:_fry2, _frx1:_frx2]
-            _scale = 768.0 / max(_frw, _frh)      # ★ 放大目标768(质量)
-            _tw, _th = int(_frw*_scale+0.5), int(_frh*_scale+0.5)
-            if _tw < 16 or _th < 16: continue
-            _roi_big = cv2.resize(_roi, (_tw, _th), interpolation=cv2.INTER_LINEAR)
-            # 放入对应批次
-            for (_bk, _blist, _bc) in _batches:
-                if _bk == _kind:
-                    _blist.append((_roi_big, _frx1, _fry1, _scale))
-            _roi_budget -= 1
-        # 逐批次推理
-        for (_bk, _blist, _bc) in _batches:
-            if not _blist: continue
-            try:
-                _rr_all = SMOKE([b[0] for b in _blist], conf=_bc, iou=0.5,
-                                imgsz=768, verbose=False)
-                for _rrc, (_img, _frx1, _fry1, _scale) in zip(_rr_all, _blist):
-                    for _b2 in _rrc.boxes:
-                        _bcx = float(_b2.conf[0])
-                        _bx1, _by1, _bx2, _by2 = _b2.xyxy[0].cpu().numpy()
-                        _ox1 = _frx1 + _bx1/_scale; _oy1 = _fry1 + _by1/_scale
-                        _ox2 = _frx1 + _bx2/_scale; _oy2 = _fry1 + _by2/_scale
-                        sr.append(_RoiRes([_RoiBox(_ox1, _oy1, _ox2, _oy2, _bcx)]))
-            except Exception:
-                pass
+        # ★ 15:56 BoT-SORT 接入烟: 全帧 SMOKE.track(botsort) — ReID找回/低分恢复(追踪更稳定)
+        #   防误检: 后续"候选中心必须在focus_regions内"互斥过滤保留(全帧只出追踪, 区域外不显示)
+        try:
+            _rr_all = SMOKE.track(frame_enh, persist=True, tracker='botsort.yaml',
+                                  conf=0.12, iou=0.5, imgsz=640, verbose=False)
+            for _rrc in _rr_all:
+                if _rrc.boxes is None: continue
+                for _b2 in _rrc.boxes:
+                    _bcx = float(_b2.conf[0])
+                    _bx1, _by1, _bx2, _by2 = _b2.xyxy[0].cpu().numpy()
+                    sr.append(_RoiRes([_RoiBox(_bx1, _by1, _bx2, _by2, _bcx)]))
+        except Exception:
+            pass
     else:
         sr = []   # 无头无手 → 本帧不检测烟
     for r in sr:
