@@ -1437,7 +1437,19 @@ while True:
                 for _t in tracks:
                     if iou(dh, _t[0].bbox) > 0.1:
                         _near_head2 = True; break
-            if _size_jump and _near_head2:
+            # ★★ 08-12 合并框保护(治"两手握紧/靠近→框挤压暴涨/双框同一手"):
+            #   hand.pt 在两手靠近时输出"合并框"(一个框框住两只手),
+            #   若检测框与【另一活跃手轨】重叠(IoU>0.3) → 判定为合并框:
+            #   - 本轨不吸收合并框的暴涨尺寸 → 用预测框维持(框不被挤大/拉向中间)
+            #   - 另一轨也不会被低分池/找回拉过来(见下方互斥) → 不会双框同一手
+            #   手分开后检测框分离(IoU<0.3) → 自动恢复正常跟踪
+            _merge_box = False
+            for _ht2 in hand_tracks:
+                if _ht2 is hand_tracks[best_i] or _ht2[1] in h_matched_ids: continue
+                if _ht2[0].lost >= 2: continue          # 对方已丢失(领地空出) → 不算合并
+                if iou(dh, _ht2[0].bbox) > 0.3:
+                    _merge_box = True; break
+            if (_size_jump and _near_head2) or _merge_box:
                 hand_tracks[best_i][0].lost = 0
                 hand_tracks[best_i][0].disp_bbox = hand_tracks[best_i][0].bbox   # 硬跟预测框
             else:
@@ -1456,6 +1468,16 @@ while True:
             for _lp in hand_low_pool:
                 _io = iou(_pb, _lp[:4])
                 if _io > _best_iou_low:
+                    # ★★ 08-12 低分池互斥(治"两手握紧→双框同一手"): 低分候选若与
+                    #   另一活跃手轨重叠(IoU>0.3) → 那是另一只手的框(或合并框),
+                    #   吸过来=两个轨粘同一只手 → 跳过该候选
+                    _steal = False
+                    for _ht2 in hand_tracks:
+                        if _ht2 is _ht or _ht2[1] in h_matched_ids: continue
+                        if _ht2[0].lost >= 2: continue
+                        if iou(_ht2[0].bbox, _lp[:4]) > 0.3:
+                            _steal = True; break
+                    if _steal: continue
                     _best_iou_low = _io; _best_low = _lp
             if _best_low is not None:
                 _ht[0].update(_best_low[:4])
@@ -1494,9 +1516,19 @@ while True:
                     break
                 if _found3 is not None: break
             if _found3 is not None:
-                _ht[0].update(_found3)
-                _ht[0].lost = 0
-                h_matched_ids.add(_ht[1])
+                # ★★ 08-12 找回互斥(治"两手靠近→另一只手被抢"): 找回框若与另一
+                #   活跃手轨重叠(IoU>0.3) → 那是另一只手的检测(局部重检常命中
+                #   合并框/对方的手) → 放弃找回, 本轨正常丢失(防两个轨粘同一只手)
+                _steal2 = False
+                for _ht2 in hand_tracks:
+                    if _ht2 is _ht or _ht2[1] in h_matched_ids: continue
+                    if _ht2[0].lost >= 2: continue
+                    if iou(_ht2[0].bbox, _found3) > 0.3:
+                        _steal2 = True; break
+                if not _steal2:
+                    _ht[0].update(_found3)
+                    _ht[0].lost = 0
+                    h_matched_ids.add(_ht[1])
         except Exception:
             pass
     for j, dh in enumerate(det_hands):
