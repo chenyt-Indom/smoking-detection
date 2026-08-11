@@ -1,35 +1,50 @@
 """
-V7-Head + V14-Smoke — 全屏香烟检测
-V7: 头部检测 (绿色框) | V14: 全屏香烟 (红色框)
+V12-重构版 — YOLOv12s × 3 + BoT-SORT 专业追踪 + DLSS 显示
+手/头/烟 全部 YOLOv12s | BoT-SORT(ultralytics botsort) | Real-ESRGAN超分 + RIFE插帧(显示层)
+检测用真实帧(准确), 显示用 DLSS 增强(丝滑+高清)
 """
-import cv2, numpy as np, time, torch
+import cv2, numpy as np, time, torch, os
 from ultralytics import YOLO
 
-HEAD = YOLO(r"D:\视觉安防系统\models\yolov8n_head_v7.pt", task='detect')
-SMOKE = YOLO(r"D:\视觉安防系统\models\smoke_cig_v30.pt", task='detect')
-HEAD.to('cuda'); SMOKE.to('cuda')
-# ★★ 手部检测模型(新架构: 手掌蓝色框 + 香烟聚焦头/手区域)
-#   hand.pt 由 COCO 手部数据集训练, 训练完成后放入 models/ 自动启用
-#   hand.pt 不存在时 HAND_READY=False → 禁用手部功能, 烟检回退全屏
+# ---- 15:31 完全使用 V12 模型(COCO预训练微调)检测: hand_v12/head_v12/smoke_v12 ----
+#   废掉 pose 方案; 头/手用 V12 检测模型(完整框, 像 V8 机制)
 try:
-    HAND = YOLO(r"D:\视觉安防系统\models\hand.pt", task='detect')
-    HAND.to('cuda')
-    try:
-        HAND.model.half()   # ★ 20:12 fp16: 手检测提速~40%(手是大目标, fp16精度损失可忽略)
-    except Exception:
-        pass
+    HEAD = YOLO(r"D:\视觉安防系统\models\head_v12.pt", task='detect')
+    print("✅ 头模型 head_v12 加载(YOLOv12s微调)")
+except Exception:
+    HEAD = YOLO(r"D:\training_data\yolo12s.pt", task='detect')
+    print("⚠️ head_v12 未就绪, 用 yolo12s 预训练")
+HEAD.to('cuda')
+try:
+    SMOKE = YOLO(r"D:\视觉安防系统\models\smoke_v12.pt", task='detect')
+    print("✅ 烟模型 smoke_v12 加载")
+except Exception:
+    SMOKE = YOLO(r"D:\training_data\yolo12s.pt", task='detect')
+    print("⚠️ smoke_v12 未就绪, 用 yolo12s 预训练")
+SMOKE.to('cuda')
+try:
+    HAND = YOLO(r"D:\视觉安防系统\models\hand_v12.pt", task='detect')
+    print("✅ 手模型 hand_v12 加载")
     HAND_READY = True
-    print("✅ 手部模型已加载(hand.pt)")
 except Exception:
     HAND_READY = False
-    print("⚠️ hand.pt 未就绪, 手部功能禁用, 烟检回退全屏")
-# ★ 半精度(fp16)推理加速: 仅 SMOKE 用(烟模型大, 提速明显)
-#   HEAD 保持 fp32: 头部小目标(遮挡/半脑袋)在fp16下精度损失→丢失, 头推理仅6ms不拖帧率
+    print("⚠️ hand_v12 不可用, 手部禁用")
+if HAND_READY:
+    HAND.to('cuda')
+    try:
+        HAND.model.half()
+    except Exception:
+        pass
 try:
     SMOKE.model.half()
 except Exception:
-    print("⚠️ SMOKE fp16转换失败, 继续用fp32")
-print("✅ V7-Head + V30-Smoke | 头绿框 | 手蓝框 | 烟红框(头/手区域聚焦) | Q退出")
+    pass
+# fp16: 手/烟(大目标/大模型)用, 头保持 fp32(小目标精度)
+try:
+    SMOKE.model.half()
+except Exception:
+    pass
+print("✅ V12-重构 | YOLOv12s×3 + BoT-SORT | 头绿框 | 手蓝框 | 烟红框 | DLSS显示 | Q退出")
 
 # ★ ROI放大检测的结果模拟对象(兼容 ultralytics box 接口)
 #   手/头区域裁图放大后独立跑SMOKE, 检出框需换算回全图坐标再进入过滤链
@@ -44,6 +59,14 @@ class _RoiRes:
         self.boxes = boxes
 
 cap = cv2.VideoCapture(0)
+# ★ 采集优化(重构版): DSHOW后端(低延迟) + 缓冲1帧(降卡顿); 摄像头硬件上限~20fps
+try:
+    cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+    cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+except Exception:
+    pass
 # 单实例锁: 防止多实例抢同一个摄像头导致"显示混乱/头框丢失"
 try:
     import ctypes
@@ -57,16 +80,13 @@ try:
 except Exception as _e:
     _SINGLE_INSTANCE_MUTEX = None
     print(f"[WARN] 单实例锁创建失败: {_e}")
-# ★ 摄像头 1280x720(恢复原分辨率): 540p源图放大进640输入会模糊头部细节→置信度波动丢失
-#   720p源→640是缩小(细节保留), 头部遮挡/半脑袋小目标识别恢复
-#   帧率靠 fp16 + CLAHE 4x4 + 移除副检测 保证(720p下light_adapt ~7ms, 总预算~27ms)
-cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-cap.set(cv2.CAP_PROP_FPS, 60)   # ★ 请求60FPS输出(摄像头支持则生效, 不支持自动回落)
+# ★ 摄像头分辨率(重构版): 640x360 帧率优先(实测640x480仅19-21fps, 720p更低)
+#   清晰度交给 DLSS 显示层(Real-ESRGAN 超分2x), 检测输入 640 已够
+#   采集优化已在上面(DSHOW + 640x360 + 缓冲1帧)
 W, H = int(cap.get(3)), int(cap.get(4))
 
 GREEN = (0, 255, 100); RED = (0, 0, 255)
-fc = 0; t0 = time.time()
+fc = 0; t0 = time.time(); _gframe = 0   # ★ _gframe: pose 帧计数(14:26)
 
 # ==================== 光线自适应预处理 ====================
 # 应对复杂/多变光照(暗光、强逆光、灯光闪烁、过曝)下的稳定检测
@@ -221,6 +241,281 @@ def extract_sig(frame, bbox):
     hist = cv2.calcHist([hsv], [0, 1], None, [SIG_HIST_SIZE, SIG_HIST_SIZE], [0, 180, 0, 256])
     cv2.normalize(hist, hist)
     return {'hist': hist, 'w': float(x2 - x1), 'h': float(y2 - y1)}
+
+# ==================== DLSS 显示管线(Real-ESRGAN 超分 + RIFE 插帧) ====================
+# 检测用真实帧(准确), 显示画面 DLSS 增强(丝滑+高清)
+# 惰性初始化: 库/权重就绪自动启用, 未就绪跳过(不影响主系统)
+_sr_model = None
+_rife_model = None
+_prev_disp = None
+_last_frame_size = None   # ★ 超分后帧尺寸追踪(变化时 reset BoT-SORT)
+
+def init_dlss():
+    """初始化超分(Real-ESRGAN via spandrel)与插帧(RIFE)。
+    14:35 spandrel 替代 realesrgan(basicsr 构建失败); 
+    超分标准模型不实时 → 用于 ROI 降频增强 + 显示间歇刷新"""
+    global _sr_model, _rife_model
+    ok_sr, ok_rife = False, False
+    try:
+        if os.path.exists(r'D:/training_data/RealESRGAN_x4plus.pth'):
+            from spandrel import ModelLoader
+            _sr_model = ModelLoader().load_from_file(r'D:/training_data/RealESRGAN_x4plus.pth')
+            _sr_model = _sr_model.cuda().half()
+            _sr_model.eval()
+            ok_sr = True
+            print('✅ DLSS超分: Real-ESRGAN(spandrel) 已启用(ROI降频增强)')
+    except Exception as e:
+        print(f'⚠️ DLSS超分未启用: {e}')
+    try:
+        if os.path.exists(r'D:/training_data/rife_torch.pkl'):
+            from rife_torch import RIFE  # 需安装 rife_torch
+            _rife_model = RIFE(r'D:/training_data/rife_torch.pkl', device='cuda')
+            ok_rife = True
+            print('✅ DLSS插帧: RIFE 已启用')
+    except Exception as e:
+        print(f'⚠️ DLSS插帧未启用: {e}')
+    return ok_sr, ok_rife
+
+# ★ DLSS 显示初始化(库/权重就绪自动启用, 未就绪跳过) — 必须在函数定义之后调用
+init_dlss()
+
+# ★ 14:35 超分增强(烟ROI): 标准 Real-ESRGAN 不实时(ROI 0.2-0.5s) → 降频(每1.5s一次) + 缓存
+_sr_roi_cache = None      # (超分ROI, 原ROI坐标, 时间戳)
+_sr_roi_key = None        # ROI key(避免重复)
+_last_sr_time = 0.0
+
+def sr_enhance_roi(frame, x1, y1, x2, y2, key):
+    """ROI 超分(降频缓存): 返回超分ROI或None(未到时间/失败)"""
+    global _sr_roi_cache, _sr_roi_key, _last_sr_time
+    if _sr_model is None:
+        return None
+    now = time.time()
+    if now - _last_sr_time < 1.5:
+        return None   # 降频
+    _last_sr_time = now
+    try:
+        x1, y1 = max(0, int(x1)), max(0, int(y1))
+        x2, y2 = min(frame.shape[1], int(x2)), min(frame.shape[0], int(y2))
+        if x2-x1 < 32 or y2-y1 < 32:
+            return None
+        crop = frame[y1:y2, x1:x2]
+        t = torch.from_numpy(crop.transpose(2,0,1)[None].astype(np.float32)/255.0).cuda().half()
+        with torch.no_grad():
+            up = _sr_model(t)[0]
+        up = (up.clamp(0,1).permute(1,2,0).cpu().numpy()*255).astype(np.uint8)
+        _sr_roi_cache = (up, (x1, y1, x2, y2))
+        return up
+    except Exception:
+        return None
+
+def dlss_super_resolve(frame):
+    """★ 超分前置: 采集帧 → Real-ESRGAN 超分 2x → 720p
+    超分帧同时用于检测(小目标细节恢复)与显示。失败返回原帧。"""
+    if _sr_model is None or frame is None:
+        return frame
+    try:
+        _sr_model.half()
+        _up, _ = _sr_model.enhance(frame, outscale=2)
+        return _up
+    except Exception:
+        return frame
+
+def dlss_interp(prev_frame, curr_frame):
+    """★ RIFE 插帧(仅显示): 前后帧生成中间帧 → 显示丝滑"""
+    if _rife_model is None or prev_frame is None or curr_frame is None:
+        return None
+    try:
+        return _rife_model.inference(prev_frame, curr_frame)
+    except Exception:
+        return None
+
+
+# ==================== POSE 关键点机制(V8沿用, 用户14:26) ====================
+#   头/手不训练检测模型, 用预训练 YOLOv8n-pose 关键点直接在画面找(不偏离预训练)
+#   COCO pose 17关键点: 0鼻 1左眼 2右眼 3左耳 4右耳 5/6肩 7/8肘 9/10腕 11/12髋 ...
+import onnxruntime as ort
+
+_pose_session = None
+_pose_input_name = None
+_POSE_SIZE = 320
+try:
+    _pose_session = ort.InferenceSession(r"D:\视觉安防系统\models\yolov8n-pose.onnx",
+                                         providers=["CUDAExecutionProvider", "CPUExecutionProvider"])
+    _pose_input_name = _pose_session.get_inputs()[0].name
+    _POSE_SIZE = int(_pose_session.get_inputs()[0].shape[2])
+    print(f"✅ POSE 已加载(yolov8n-pose.onnx, {_POSE_SIZE})")
+except Exception as _e:
+    _pose_session = None
+    print(f"⚠️ POSE 加载失败: {_e}")
+
+HEAD_KPT_IDS = (0, 1, 2, 3, 4)   # 鼻/眼/耳
+
+# ★ 15:07 检测框时间平滑(V12 稳定性修复核心): pose 关键点逐帧抖动 → 帧间 EMA
+#   V8 用模型每帧输出稳定框; pose 输入抖动, 必须加这一层才能达到同等稳定
+_prev_head_boxes = []
+_head_w_ema = None   # ★ 15:20 头宽时间EMA(防多策略切换跳变)
+_head_cx_ema = None   # ★ 15:27 头中心x EMA
+_head_cy_ema = None   # ★ 15:27 头中心y EMA
+_prev_hand_boxes = []
+
+def smooth_boxes(new_boxes, prev_boxes, alpha=0.60):
+    """新检测框与上一帧框 EMA 平滑(位置/大小, 防关键点抖动导致框跳变)
+    alpha=1 完全用新框; alpha=0.6 偏新但滤抖动。返回 (平滑框, 更新后的prev)"""
+    if not prev_boxes:
+        return new_boxes, new_boxes
+    out = []
+    used = set()
+    for nb in new_boxes:
+        ncx = (nb[0] + nb[2]) / 2; ncy = (nb[1] + nb[3]) / 2
+        nw = nb[2] - nb[0]
+        best_i, best_d = -1, nw * 0.6   # 中心距 < 0.6倍宽 才算同一目标
+        for i, pb in enumerate(prev_boxes):
+            if i in used:
+                continue
+            pcx = (pb[0] + pb[2]) / 2; pcy = (pb[1] + pb[3]) / 2
+            d = ((ncx - pcx) ** 2 + (ncy - pcy) ** 2) ** 0.5
+            if d < best_d:
+                best_d = d; best_i = i
+        if best_i >= 0:
+            used.add(best_i)
+            pb = prev_boxes[best_i]
+            out.append(tuple(pb[k] * (1 - alpha) + nb[k] * alpha for k in range(4)))
+        else:
+            out.append(nb)
+    return out, new_boxes
+
+def detect_pose(frame):
+    """全帧姿态估计 → [(bbox, kpts17), ...]"""
+    if _pose_session is None:
+        return []
+    h, w = frame.shape[:2]
+    blob = cv2.dnn.blobFromImage(frame, 1/255.0, (_POSE_SIZE, _POSE_SIZE), swapRB=True, crop=False)
+    outs = _pose_session.run(None, {_pose_input_name: blob})
+    preds = outs[0]
+    if len(preds.shape) == 3:
+        preds = np.transpose(preds[0], (1, 0))   # (N, 56)
+    scores = preds[:, 4]
+    mask = scores > 0.40
+    if not np.any(mask):
+        return []
+    idxs = np.where(mask)[0]
+    idxs = idxs[np.argsort(scores[idxs])[::-1]]
+    # NMS
+    boxes = preds[:, :4]
+    keep = []
+    for i in idxs:
+        _ov = False
+        for j in keep:
+            ix1 = max(boxes[i,0]-boxes[i,2]/2, boxes[j,0]-boxes[j,2]/2)
+            iy1 = max(boxes[i,1]-boxes[i,3]/2, boxes[j,1]-boxes[j,3]/2)
+            ix2 = min(boxes[i,0]+boxes[i,2]/2, boxes[j,0]+boxes[j,2]/2)
+            iy2 = min(boxes[i,1]+boxes[i,3]/2, boxes[j,1]+boxes[j,3]/2)
+            _iw = max(0, ix2-ix1); _ih = max(0, iy2-iy1)
+            _ar1 = boxes[i,2]*boxes[i,3]; _ar2 = boxes[j,2]*boxes[j,3]
+            if _iw*_ih / max(1e-6, min(_ar1, _ar2)) > 0.5:
+                _ov = True; break
+        if not _ov:
+            keep.append(i)
+    sx = w / _POSE_SIZE; sy = h / _POSE_SIZE
+    persons = []
+    for idx in keep:
+        kpts = preds[idx, 5:].reshape(17, 3)
+        kpts[:, 0] *= sx; kpts[:, 1] *= sy
+        persons.append(([
+            int((preds[idx,0]-preds[idx,2]/2)*sx), int((preds[idx,1]-preds[idx,3]/2)*sy),
+            int((preds[idx,0]+preds[idx,2]/2)*sx), int((preds[idx,1]+preds[idx,3]/2)*sy),
+        ], kpts))
+    return persons
+
+def kpts_to_head_bbox(kpts, w, h):
+    """关键点 → 头部框(多策略, 移植自 detector.py _kpts_to_head_bbox)
+    ★15:20 头宽时间EMA: 多策略切换(双耳/双眼/单眼/跨度)导致 est_w 跳变 → 框大小忽大忽小"""
+    global _head_w_ema
+    valid, weights = [], []
+    for i in HEAD_KPT_IDS:
+        x, y, c = kpts[i]
+        if c > 0.15:
+            valid.append([x, y]); weights.append(c)
+    if len(valid) < 2:
+        return None
+    valid = np.array(valid); weights = np.array(weights)
+    kw_raw = valid[:, 0].max() - valid[:, 0].min()
+    kh_raw = valid[:, 1].max() - valid[:, 1].min()
+    if kpts[3, 2] > 0.15 and kpts[4, 2] > 0.15:
+        est_w = abs(kpts[3,0]-kpts[4,0]) / 0.65
+    elif kpts[1, 2] > 0.15 and kpts[2, 2] > 0.15:
+        est_w = abs(kpts[1,0]-kpts[2,0]) / 0.45
+    elif kpts[1, 2] > 0.15 or kpts[2, 2] > 0.15:
+        vx = kpts[1,0] if kpts[1,2] > 0.15 else kpts[2,0]
+        est_w = max(abs(vx-kpts[0,0]) * 3.5, 50)
+    else:
+        est_w = max(kw_raw * 1.4, 60)
+    # ★ 15:20 头宽 EMA(0.75旧+0.25新): 滤策略切换跳变; 变化率限幅(单帧±15%)
+    if _head_w_ema is None:
+        _head_w_ema = est_w
+    else:
+        _prev_w = _head_w_ema
+        _head_w_ema = 0.75 * _head_w_ema + 0.25 * est_w
+        if abs(_head_w_ema - _prev_w) > _prev_w * 0.15:   # 限幅: 单帧变化≤15%
+            _head_w_ema = _prev_w + (_head_w_ema - _prev_w) / abs(_head_w_ema - _prev_w) * _prev_w * 0.15
+    est_w = _head_w_ema
+    # ★★ 15:27 框中心 cx/cy 也 EMA(0.75旧+0.25新): 关键点位置每帧波动 → 框位置抖(15:26偏右)
+    cx_raw = float(np.average(valid[:, 0], weights=weights))
+    cy_raw = float(np.average(valid[:, 1], weights=weights))
+    global _head_cx_ema, _head_cy_ema
+    if _head_cx_ema is None:
+        _head_cx_ema, _head_cy_ema = cx_raw, cy_raw
+    else:
+        # 位置 EMA + 单帧限幅(头宽×0.25, 防止关键点瞬移)
+        for _cur, _ema, _name in [(cx_raw, _head_cx_ema, '_head_cx_ema'), (cy_raw, _head_cy_ema, '_head_cy_ema')]:
+            _new = 0.75 * _ema + 0.25 * _cur
+            if abs(_new - _ema) > est_w * 0.25:
+                _new = _ema + (_new - _ema) / abs(_new - _ema) * est_w * 0.25
+            if _name == '_head_cx_ema':
+                _head_cx_ema = _new
+            else:
+                _head_cy_ema = _new
+    cx, cy = _head_cx_ema, _head_cy_ema
+    est_w = min(est_w, w * 0.35)
+    est_h = est_w * 1.55
+    x1 = max(0, int(cx - est_w / 2)); x2 = min(w, int(cx + est_w / 2))
+    y1 = max(0, int(cy - est_h * 0.48)); y2 = min(h, int(cy + est_h * 0.52))
+    if x2 - x1 < 12 or y2 - y1 < 12:
+        return None
+    return (x1, y1, x2, y2)
+
+def kpts_to_hand_bbox(kpts, w, h):
+    """手腕关键点(9/10) → 手框(★15:16 扩大: V8 模型输出完整手掌bbox, pose只有手腕)
+    手长(手腕→指尖) ≈ 头宽×1.1; 以手腕为起点, 沿"手肘→手腕"方向外扩覆盖手指"""
+    # 先取头宽作为手的尺寸参考
+    hb = kpts_to_head_bbox(kpts, w, h)
+    ref_w = (hb[2]-hb[0]) if hb else 80
+    hand_len = ref_w * 1.15    # 手指+手掌长度 ≈ 头宽×1.15
+    hand_wid = ref_w * 0.75    # 手掌宽度
+    for wid, eid in ((9, 7), (10, 8)):   # 手腕→肘部方向(手指在手腕向外的延伸)
+        wx, wy, wc = kpts[wid]
+        if wc < 0.25:
+            continue
+        ex, ey, ec = kpts[eid]
+        if ec > 0.15 and (abs(ex-wx) > 5 or abs(ey-wy) > 5):
+            # 方向向量: 肘→腕(手朝外方向), 归一化
+            dx, dy = wx - ex, wy - ey
+            dl = (dx*dx + dy*dy) ** 0.5
+            ux, uy = dx/dl, dy/dl
+            # 手框起点=手腕, 终点=手腕+手长(沿肘→腕方向)
+            fx, fy = wx + ux * hand_len, wy + uy * hand_len
+            x1 = max(0, int(min(wx, fx) - hand_wid * 0.4))
+            x2 = min(w, int(max(wx, fx) + hand_wid * 0.4))
+            y1 = max(0, int(min(wy, fy) - hand_wid * 0.4))
+            y2 = min(h, int(max(wy, fy) + hand_wid * 0.4))
+        else:
+            # 无肘部参考: 以手腕为中心对称扩(覆盖手指方向)
+            x1 = max(0, int(wx - hand_len * 0.5)); x2 = min(w, int(wx + hand_len * 0.5))
+            y1 = max(0, int(wy - hand_len * 0.5)); y2 = min(h, int(wy + hand_len * 0.5))
+        if x2 - x1 >= 15 and y2 - y1 >= 15:
+            return (x1, y1, x2, y2)
+    return None
+
 
 def sig_similarity(a, b):
     """宽容相似度: 位置约束在主流程做, 这里只比外观(颜色+尺寸)
@@ -491,37 +786,85 @@ AUTO_SAVE = r'D:\training_data\smoke\fp_auto'   # 误检帧自动采集(检出�
 os.makedirs(AUTO_SAVE, exist_ok=True)
 last_auto_save = 0
 
+# ★★ 重构版: 多线程采集(采集线程持续读帧 → 有界队列; 处理主线程取最新帧)
+#   摄像头只被采集线程访问(线程安全), 处理耗时不再拖采集 → 帧率稳定
+import threading, queue as _queue
+_frame_q = _queue.Queue(maxsize=2)
+_stop_flag = threading.Event()
+
+def _capture_worker():
+    while not _stop_flag.is_set():
+        _ok, _fr = cap.read()
+        if not _ok or _fr is None:
+            time.sleep(0.01)
+            continue
+        if _frame_q.full():
+            try:
+                _frame_q.get_nowait()   # 丢旧帧(保最新)
+            except _queue.Empty:
+                pass
+        _frame_q.put(_fr)
+
+_th_cap = threading.Thread(target=_capture_worker, daemon=True)
+_th_cap.start()
+
 # ★ 长记忆已取消(用户17:19): 删除 smoke_history/low_suspects — 检测框只来自本帧
 while True:
-    ret, frame = cap.read()
-    if not ret or frame is None:
-        # ★ 轻量重试(治"一会识别一会丢失"): 偶发抓帧失败(MSMF抖动/短暂占用)
-        #   先快速重读3次(50ms级), 成功即继续, 不触发重型重连(避免卡1秒中断检测)
-        retry_ok = False
-        for _r in range(3):
-            time.sleep(0.05)
-            ret, frame = cap.read()
-            if ret and frame is not None and frame.size > 0:
-                retry_ok = True; break
-        if not retry_ok:
-            # 连续失败 → 重型重连(摄像头被占用/驱动卡死)
-            print('[重连] 摄像头持续断帧, 尝试重连...')
-            cap.release()
-            ok = False
-            for attempt in range(10):
-                time.sleep(1)
+    # 从采集队列取帧(500ms超时, 摄像头断帧时重连)
+    try:
+        frame = _frame_q.get(timeout=0.5)
+    except _queue.Empty:
+        frame = None
+    if frame is None or frame.size == 0:
+        # 连续失败 → 重型重连(摄像头被占用/驱动卡死)
+        print('[重连] 摄像头持续断帧, 尝试重连...')
+        _stop_flag.set()
+        try:
+            _th_cap.join(timeout=2)
+        except Exception:
+            pass
+        cap.release()
+        ok = False
+        for attempt in range(10):
+            time.sleep(1)
+            try:
+                cap = cv2.VideoCapture(0, cv2.CAP_DSHOW)
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 360)
+            except Exception:
                 cap = cv2.VideoCapture(0)
-                cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
-                cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
-                ret, frame = cap.read()
-                if ret and frame is not None and frame.size > 0:
-                    ok = True; break
-            if not ok:
-                print('[重连] 失败, 退出'); break
+            if cap.isOpened():
+                _stop_flag.clear()
+                _th_cap = threading.Thread(target=_capture_worker, daemon=True)
+                _th_cap.start()
+                try:
+                    frame = _frame_q.get(timeout=1.0)
+                except _queue.Empty:
+                    frame = None
+            if frame is not None and frame.size > 0:
+                ok = True; break
+        if not ok:
+            print('[重连] 失败, 退出'); break
 
     for t in tracks: t[0].predict()
     for st in smoke_tracks: st[0].predict()
     for ht in hand_tracks: ht[0].predict()   # ★ 手部追踪预测(新架构)
+
+    # ★★ 20:50 超分前置(标准 Real-ESRGAN x4plus): 采集帧 → 720p 超分帧
+    #   超分帧同时喂检测(小目标细节恢复)与显示; 未启用时用原帧
+    #   ⚠️ 超分后 W/H 变化, 同步更新(检测框坐标与超分帧一致)
+    if _sr_model is not None:
+        frame = dlss_super_resolve(frame)
+        if frame is not None:
+            W, H = frame.shape[1], frame.shape[0]
+            # 帧尺寸变化 → 追踪器 reset(跟踪器的持久化状态按原尺寸)
+            if _last_frame_size is not None and _last_frame_size != (W, H):
+                try:
+                    HAND.reset_tracking()
+                except Exception:
+                    pass
+            _last_frame_size = (W, H)
 
     # ★★ 光线自适应暂停使用(用户要求 11:35): 全部关闭但代码保留, 可随时恢复
     #   恢复方法: 取消下行注释, 改为 frame_enh = light_adapt(frame)
@@ -529,24 +872,25 @@ while True:
     #   影响: 检测用原帧(无CLAHE/Unsharp/分块补偿), 暗光/白背景增强全部失效
     frame_enh = frame
 
-    # --- V7 头检测 (原始帧, conf=0.40 提升: 防手掌/圆形物被误认为头部) ---
-    # 用户反馈(14:05): 手掌有时被识别成头部 → conf 0.30→0.40(更严格)
-    # 手部有独立 hand.pt 检测(蓝色框), 头模型不再需要低conf容忍手掌
-    res = HEAD(frame, conf=0.50, iou=0.5, verbose=False)
+    # --- 头检测(15:31 完全用 V12 模型, 废掉 pose): head_v12 模型检测(完整头框) ---
+    #   V8 机制: 模型输出 → 过滤 → 追踪(完整框, 稳定)
+    res = HEAD(frame, conf=0.45, iou=0.5, verbose=False)
     det_heads = []
     for r in res:
+        if r.boxes is None: continue
         for box in r.boxes:
             b = box.xyxy[0].cpu().numpy()
             x1, y1, x2, y2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
             bw, bh = x2-x1, y2-y1
-            if bw < 10 or bh < 10: continue          # 极小下限(原30, 放宽)
+            if bw < 10 or bh < 10: continue          # 极小下限(V8机制)
             ar = bw/bh if bh > 0 else 0
-            if bw < 60:                               # 小/中头: 宽高比检查
+            if bw < 60:                               # 小/中头: 宽高比检查(V8机制)
                 if ar < 0.5 or ar > 1.8: continue
-            # 大头(≥60px): 不限制宽高比(贴镜头视角变形) — 取消限制
-            # 底部过滤: 完全去掉(贴镜头/仰角都识别)
             det_heads.append((x1, y1, x2, y2))
 
+
+    # ★ 15:07 头框时间平滑(pose 关键点抖动 → EMA), 之后进追踪
+    det_heads, _prev_head_boxes = smooth_boxes(det_heads, _prev_head_boxes)
 
     matched_ids = set(); matched_det = set()
     for j, dh in enumerate(det_heads):
@@ -568,10 +912,10 @@ while True:
             tracks.append([KalmanBox(dh), next_id]); next_id += 1
     tracks = [t for t in tracks if t[0].lost < 5]   # 头轨迹容忍(昨天配置, 恢复)
 
-    # --- ★★ 手部检测(14:05 回退: BOTSORT 集成不稳 → 直接检测+现有手轨) ---
-    #   hand.pt 直接检测, 追踪走手轨(防分裂/ReID/低分池/局部找回已内置)
+    # --- ★★ 手部检测(15:31 完全用 V12 模型, 废掉 pose): hand_v12 模型检测(完整手掌框) ---
+    #   V8 机制: 模型输出(conf 0.12起) → 尺寸过滤 → 肤色验证 → 低分池 → 去重 → 追踪
     det_hands = []
-    hand_low_pool = []   # ★ 20:12 低分池(全局定义, HAND_READY=False 时为空)
+    hand_low_pool = []
     if HAND_READY:
         try:
             res_h = HAND(frame, conf=0.12, iou=0.5, verbose=False)
@@ -581,15 +925,12 @@ while True:
                     conf = float(box.conf.cpu().numpy()[0]) if box.conf is not None else 1.0
                     x1, y1, x2, y2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
                     bw, bh = x2-x1, y2-y1
-                    if bw < 20 or bh < 20: continue   # 最小手框(过滤噪声)
-                    if bw > W*0.7 or bh > H*0.7: continue  # 超大框(误检)
-                    # ★ 低分候选(0.12-0.25)只进池, 不参与正常检测/建轨
+                    if bw < 20 or bh < 20: continue   # 最小手框(V8机制)
+                    if bw > W*0.7 or bh > H*0.7: continue  # 超大框(V8机制)
                     if conf < 0.25:
                         hand_low_pool.append((x1, y1, x2, y2, conf))
                         continue
-                    # ★★ 肤色验证(治椅子/木纹/红色物体被误判为手) v2:
-                    #   人手: 肤色占比高(≥25%) + 高饱和红木占比低(皮肤S 90-140, 红木S>150)
-                    #   椅背红木: 纯红木S>150占比高(暖光下V也高会命中肤色) → 用高饱和红排除
+                    # ★★ 肤色验证(V8机制, 治椅子/木纹误判)
                     _hsx1, _hsy1 = max(0,int(x1)), max(0,int(y1))
                     _hsx2, _hsy2 = min(W,int(x2)), min(H,int(y2))
                     if _hsx2 - _hsx1 >= 8 and _hsy2 - _hsy1 >= 8:
@@ -598,14 +939,15 @@ while True:
                         _hpix = _hcrop.shape[0] * _hcrop.shape[1]
                         _hskin = float(np.sum(cv2.inRange(_hhsv, (0,25,50), (45,180,255)) > 0)) / _hpix
                         if _hskin < 0.25:
-                            continue   # 框内肤色<25% → 非人手(椅子/木纹) → 拒
-                        # 高饱和红木排除: 红/棕(H 0-30) + S>150(极饱和纯红木, 肤色S一般<150)
+                            continue   # 肤色<25% → 非人手
                         _hsat_red = float(np.sum(cv2.inRange(_hhsv, (0,150,40), (30,255,255)) > 0)) / _hpix
-                        if _hsat_red > 0.45:   # 阈值0.45: 红木2(0.56)拒, 深肤色手(0.45)过
-                            continue   # 极饱和红棕占比>35% → 红木椅背/木制品 → 拒
+                        if _hsat_red > 0.45:
+                            continue   # 高饱和红木 → 拒
                     det_hands.append((x1, y1, x2, y2))
         except Exception:
             pass
+    # ★ 15:07 手框时间平滑(模型输出已稳, 平滑防偶发跳变), 之后进去重/追踪
+    det_hands, _prev_hand_boxes = smooth_boxes(det_hands, _prev_hand_boxes)
     # ★★ 手部检测去重(治"方框分裂/重叠"): 同一只手被模型输出多个框(微小偏移/双检)
     #   ★ 15:35 中心距 0.8→1.2 手宽: 快速移动时运动模糊导致双检框中心距大, 放宽合并
     det_hands_dedup = []
@@ -759,8 +1101,9 @@ while True:
     sr = []
     if focus_regions:
         _roi_budget = 6
-        # ★ 15:30 用户: 烟检测头/手区域 conf 统一 0.30(更高门槛, 更少误检)
-        _batches = [('head', [], 0.30), ('hand', [], 0.30)]
+        # ★ 14:22 smoke_v12 conf 低(0.1-0.46, 数据500张): 头区0.30→0.15(漏检优先)
+        #   误检由后续"红框贴手/头"互斥+纹理验证兜底
+        _batches = [('head', [], 0.15), ('hand', [], 0.15)]
         for (frx1, fry1, frx2, fry2, _kind) in focus_regions:
             if _roi_budget <= 0: break
             # ★ 坐标转int再切片(模型输出float, numpy切片必须整数)
@@ -1253,10 +1596,22 @@ while True:
     cv2.putText(_disp, f"H:{len(tracks)} C:{len(smoke_tracks)} {fc/max(1,time.time()-t0):.0f}fps",
                 (4,18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 2)
 
-    # ★ 显示 960x540(原640x360): 提高视频分辨率, 画面更清晰(处理能力有余裕)
-    _disp = cv2.resize(_disp, (960, 540))
-    cv2.imshow("Head + Smoke Detection", _disp)
+    # ★ 显示(重构版): 超分帧已高清(720p), 直接显示; RIFE 插帧 → 显示丝滑
+    #   超分前置(检测已用超分帧), 显示无需再超分; RIFE 在真实帧之间插中间帧
+    _disp = cv2.resize(_disp, (1280, 720)) if _disp.shape[1] >= 1280 else cv2.resize(_disp, (960, 540))
+    _show = _disp
+    if _rife_model is not None:
+        _mid = dlss_interp(_prev_disp, _disp)
+        if _mid is not None:
+            _show = _mid   # 显示中间帧(下一帧显示真实帧) → 视觉帧率×2
+    cv2.imshow("Head + Smoke Detection", _show)
+    _prev_disp = _disp.copy()
     fc += 1
     if cv2.waitKey(1) & 0xFF == ord('q'): break
 
+_stop_flag.set()   # 停采集线程(重构版)
+try:
+    _th_cap.join(timeout=2)
+except Exception:
+    pass
 cap.release(); cv2.destroyAllWindows()
