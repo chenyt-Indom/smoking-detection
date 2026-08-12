@@ -663,7 +663,9 @@ def detect_hand_mp(frame):
         _boxes = []
         if _res.hand_landmarks:
             for _lm in _res.hand_landmarks:
-                _xs = [p.x for p in _lm]; _ys = [p.y for p in _lm]
+                # ★ 01:06 排除0号手腕点(与线程一致, 防框到手肘)
+                _xs = [p.x for _i, p in enumerate(_lm) if _i > 0]
+                _ys = [p.y for _i, p in enumerate(_lm) if _i > 0]
                 _x1 = max(0, int(min(_xs) * _w)); _y1 = max(0, int(min(_ys) * _h))
                 _x2 = min(_w, int(max(_xs) * _w)); _y2 = min(_h, int(max(_ys) * _h))
                 # 4% padding: 贴合手掌不留白(完美不多余)
@@ -1251,7 +1253,11 @@ def _mp_worker():
             _boxes = []
             if _res.hand_landmarks:
                 for _lm in _res.hand_landmarks:
-                    _xs = [p.x for p in _lm]; _ys = [p.y for p in _lm]
+                    # ★ 01:06 排除0号手腕点(治"手框框到手肘"): 21点中0=手腕(前臂末端),
+                    #   外接框含它 → 框向手臂方向延伸(握拳时更明显=框到手肘)
+                    #   只用1-20(手掌+手指) → 框只覆盖手本体
+                    _xs = [p.x for _i, p in enumerate(_lm) if _i > 0]
+                    _ys = [p.y for _i, p in enumerate(_lm) if _i > 0]
                     _x1 = max(0, int(min(_xs)*_w)); _y1 = max(0, int(min(_ys)*_h))
                     _x2 = min(_w, int(max(_xs)*_w)); _y2 = min(_h, int(max(_ys)*_h))
                     # ★ 21:25 用户要求: 手框适当放大一圈(4%→12% padding, 每边外扩)
