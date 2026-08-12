@@ -1671,12 +1671,18 @@ while True:
             iou_pred = iou(_pb, dh)
             iou_val = max(iou_cur, iou_pred * 1.15)
             # ★ 位置突变惩罚: 检测框中心与【预测中心】距离归一化(>1.5手宽惩罚, >2.5拒)
+            #   ★★ 08-12 15:28 高速轨豁免(治"快速移动追不上"): 快速甩手时 Kalman
+            #     速度大, 检测框离预测位置远(>2.5手宽)被拒 → 丢轨。高速轨(速度>
+            #     0.6手宽/帧)放宽拒绝阈值到3.5手宽 + 惩罚斜率减半 → 快速移动也能匹配
+            _kfps = ht[0].kf.statePost.flatten()
+            _spd = ((_kfps[4]**2 + _kfps[5]**2) ** 0.5)
+            _fast = _spd > _w_ref * 0.6
             _dist = ((_dhc[0]-_kfp[0])**2 + (_dhc[1]-_kfp[1])**2) ** 0.5
             _w_ref = max(_dhw, _hb[2]-_hb[0], 20.0)
             _dr = _dist / _w_ref
-            if _dr > 2.5:
+            if _dr > (3.5 if _fast else 2.5):
                 continue
-            _pos_pen = max(0.0, _dr - 1.5) * 0.5
+            _pos_pen = max(0.0, _dr - 1.5) * (0.25 if _fast else 0.5)
             # ★ 受限外观: 该检测框周围1.5手宽内的活跃轨数量
             _near_n = 0
             for _ht2 in hand_tracks:
@@ -1820,9 +1826,15 @@ while True:
                     # ★★ 08-12 中心距验证(治"两手一前一后打圈→丢失轨乱飘"): 丢失轨
                     #   只接受"离预测中心≤0.3手宽"的低分候选(原0.5太松, 前面手弱检测
                     #   落在后面手预测附近会被误喂 → 框被带偏乱飘)
+                    #   ★★ 08-12 15:28 高速轨豁免(治"快速移动追不上"): 快速甩手时
+                    #     手已离开原位置>0.3手宽 → 低分候选被拒 → 丢轨。轨速度大时
+                    #     放宽到0.9手宽(低分候选通常就是快速移动手的模糊帧)
                     _lpc = ((_lp[0]+_lp[2])/2 - (_pb[0]+_pb[2])/2)**2 + ((_lp[1]+_lp[3])/2 - (_pb[1]+_pb[3])/2)**2
                     _lpw = max(_pb[2]-_pb[0], _lp[2]-_lp[0], 20.0)
-                    if _lpc > (_lpw * 0.3) ** 2:
+                    _kfps2 = _ht[0].kf.statePost.flatten()
+                    _spd2 = ((_kfps2[4]**2 + _kfps2[5]**2) ** 0.5)
+                    _fast2 = _spd2 > _lpw * 0.6
+                    if _lpc > (_lpw * (0.9 if _fast2 else 0.3)) ** 2:
                         continue
                     _best_iou_low = _io; _best_low = _lp
             if _best_low is not None:
@@ -1840,8 +1852,13 @@ while True:
         _pb = _ht[0].bbox
         _hw3, _hh3 = _pb[2]-_pb[0], _pb[3]-_pb[1]
         if _hw3 < 20 or _hh3 < 20: continue
-        _ex1, _ey1 = max(0, int(_pb[0]-_hw3*0.6)), max(0, int(_pb[1]-_hh3*0.6))
-        _ex2, _ey2 = min(W, int(_pb[2]+_hw3*0.6)), min(H, int(_pb[3]+_hh3*0.6))
+        # ★★ 08-12 15:28 高速轨找回区域扩大(治"快速移动追不上"): 快速甩手时手已
+        #   离开预测位置±0.6手宽外 → crop搜不到 → 丢轨。轨速度大时搜索区扩到±1.2手宽
+        _kfps3 = _ht[0].kf.statePost.flatten()
+        _spd3 = ((_kfps3[4]**2 + _kfps3[5]**2) ** 0.5)
+        _fast3 = _spd3 > _hw3 * 0.6
+        _ex1, _ey1 = max(0, int(_pb[0]-_hw3*(1.2 if _fast3 else 0.6))), max(0, int(_pb[1]-_hh3*(1.2 if _fast3 else 0.6)))
+        _ex2, _ey2 = min(W, int(_pb[2]+_hw3*(1.2 if _fast3 else 0.6))), min(H, int(_pb[3]+_hh3*(1.2 if _fast3 else 0.6)))
         if _ex2-_ex1 < 24 or _ey2-_ey1 < 24: continue
         try:
             _crop3 = frame[_ey1:_ey2, _ex1:_ex2]
@@ -1858,8 +1875,10 @@ while True:
                     #   ★ 08-12 0.8→0.5手宽: 两手一前一后时找回常命中"前面手"的检测
                     #     (快速移动消失由主匹配的"距离得分+惯性"兜底, 找回可收紧防乱飘)
                     #   ★★ 08-12 10:44 0.5→0.3手宽: 更严, 前面手检测不被误救(根治乱飘)
+                    #   ★★ 08-12 15:28 高速轨0.3→0.9手宽: 快速甩手时找回框离预测远,
+                    #     0.3太严救不回 → 丢轨。高速轨放宽, 低速轨保持0.3防乱飘
                     _gc = ((_gx1+_gx2)/2 - (_pb[0]+_pb[2])/2)**2 + ((_gy1+_gy2)/2 - (_pb[1]+_pb[3])/2)**2
-                    if _gc > (_hw3 * 0.3) ** 2:
+                    if _gc > (_hw3 * (0.9 if _fast3 else 0.3)) ** 2:
                         continue
                     _found3 = (_gx1, _gy1, _gx2, _gy2)
                     break
