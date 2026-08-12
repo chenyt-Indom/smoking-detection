@@ -1244,9 +1244,9 @@ def _mp_worker():
                 _mp_latest_time = time.time()
         except Exception:
             pass
-if False and MP_HANDS is not None:   # ★ 01:47 完全沿用V8手部: MediaPipe 停用(代码保留)
+if MP_HANDS is not None:   # ★★ 08-12 10:44 MediaPipe关节验证器(不产新框,防分裂): 治伸直手识别不出+框小臂
     threading.Thread(target=_mp_worker, daemon=True).start()
-    print("✅ MediaPipe 独立线程已启动(21点关节识别主通道, 卡死自动降级 hand.pt)")
+    print("✅ MediaPipe独立线程已启动(21点关节验证器: 治伸直手/框小臂, 卡死自动降级hand.pt)")
 
 # ★★ 23:52 MiDaS 深度线程(空间立体感知): 每0.5s对最新帧算深度图(128x72)
 #   独立线程, 不阻塞主循环; 深度图用于"手/胳膊挡头"判定(谁在前)
@@ -1586,6 +1586,33 @@ while True:
                     det_hands.append((x1, y1, x2, y2))
         except Exception:
             pass
+    # ★★ 08-12 10:44 MediaPipe关节验证器(治伸直手识别不出+框小臂):
+    #   对宽高比>2.2 的可疑 hand.pt 框用 MediaPipe 21点验证:
+    #     找到匹配 → 替换为 MediaPipe 手掌框(精确, 天然不含小臂) → 治伸直手+治框小臂
+    #     未匹配 → 拒该框(可能是小臂误检) → 治框小臂
+    #   正常宽高比(≤2.2)直接用 hand.pt 框(MediaPipe 外接框可能偏小, 不用)
+    #   MediaPipe 仅验证(不产新检测框)→ 无分裂风险(吸取a599a8d教训)
+    #   卡死/超时(_mpb空或时间过期)→ 不处理, 降级纯hand.pt
+    try:
+        with _mp_lock:
+            _mpb = list(_mp_latest_boxes)
+        if _mpb and (time.time() - _mp_latest_time) < 0.5:
+            _new_det = []
+            for _dh in det_hands:
+                _dhw = _dh[2]-_dh[0]; _dhh = _dh[3]-_dh[1]
+                _dh_ar = max(_dhw, _dhh) / max(15.0, min(_dhw, _dhh))
+                if _dh_ar <= 2.2:
+                    _new_det.append(_dh); continue  # 正常宽高比 → 直接用
+                _matched_mp = None
+                for _mb in _mpb:
+                    if iou(_dh, _mb) > 0.2:
+                        _matched_mp = _mb; break
+                if _matched_mp is not None:
+                    _new_det.append(_matched_mp)  # 替换为精确手掌框(治伸直手+治小臂)
+                # else: 拒(不加入) — MediaPipe有结果但无匹配=小臂误检
+            det_hands = _new_det
+    except Exception:
+        pass
     # ★ 去重(★ 08-12 只按IoU>0.3合并同手双检框): 移除"中心距<1.2手宽"合并
     #   [旧] 中心距<1.2手宽即合并 → 两只手平行靠近时中心距近但框不重叠 → 第二只手框被合并掉
     #   [新] 只合并"真正重叠"的双检框(IoU>0.3) → 两手靠近各自框保留 → 双手都有框
@@ -1692,9 +1719,14 @@ while True:
             _pad = _tw_h * 0.25
             if (dh[0]-_pad) <= _c2x <= (dh[2]+_pad) and (dh[1]-_pad) <= _c2y <= (dh[3]+_pad):
                 _merge_box = True; break
-            if iou(dh, _b2) > 0.3:
+            # ★★ 08-12 10:44 IoU 0.3→0.4(收紧防临界抖动)+ 加退出保护(hysteresis):
+            #   原 0.3 临界时反复触发/退出 → 合并框位置在"完全预测/正常update"间
+            #   切换 → 抖且大小不稳定。0.4 明确重叠才触发, 退出后轨对象保护3帧
+            #   仍走完全预测, 4帧后才恢复正常update → 临界不抖
+            if iou(dh, _b2) > 0.4:
                 _merge_box = True; break
-        if (_size_jump and _near_head2) or _merge_box:
+        _merge_protect = getattr(hand_tracks[best_i][0], '_merge_protect', 0)
+        if (_size_jump and _near_head2) or _merge_box or _merge_protect > 0:
             # ★★ 08-12 位置-尺寸分离更新(治"手碰头/手碰手时挤压排斥漂移"):
             #   [旧] 维持预测框(不吸收任何测量) → 手长期靠Kalman外推 → 框被头/
             #        另一只手"顶住"(排斥感) + 预测误差累积(漂移) ❌
@@ -1704,10 +1736,16 @@ while True:
             #   ★★ 08-12 10:30 合并框时位置完全用预测中心(不漂向中间, 治"框抖动/大小不稳定"):
             #     两手重叠/合并时, 检测框中心在两手中间, 半跟随会让框每帧微微漂向中间
             #     → 抖动+大小被合并框影响 → 完全用预测中心 + 尺寸保持 = 稳定不动 ✅
+            #   ★★ 08-12 10:44 退出保护(hysteresis): merge_box 触发后设 _merge_protect=3,
+            #     后续3帧即使 IoU<0.4 不触发, 也走完全预测 → 临界不抖, 第4帧才恢复
+            if _merge_box:
+                hand_tracks[best_i][0]._merge_protect = 3
+            elif _merge_protect > 0:
+                hand_tracks[best_i][0]._merge_protect = _merge_protect - 1
             hand_tracks[best_i][0].lost = 0
             _kfp2 = hand_tracks[best_i][0].kf.statePre.flatten()
-            if _merge_box and not (_size_jump and _near_head2):
-                # 合并框: 位置完全用预测中心(稳定, 不漂向合并框中心)
+            if (_merge_box or _merge_protect > 0) and not (_size_jump and _near_head2):
+                # 合并框/退出保护期: 位置完全用预测中心(稳定)
                 _cx2 = _kfp2[0]; _cy2 = _kfp2[1]
             else:
                 # 手摸头: 半跟随(检测与预测平均, 跟手走)
@@ -1760,12 +1798,11 @@ while True:
                             _steal = True; break
                     if _steal: continue
                     # ★★ 08-12 中心距验证(治"两手一前一后打圈→丢失轨乱飘"): 丢失轨
-                    #   只接受"离预测中心≤0.5手宽"的低分候选。两手前后重叠时, 前面
-                    #   手的弱检测常落在后面手的预测位置附近 → 不加此验证会被误喂 →
-                    #   框被带偏乱飘(而不是正常丢失隐藏)
+                    #   只接受"离预测中心≤0.3手宽"的低分候选(原0.5太松, 前面手弱检测
+                    #   落在后面手预测附近会被误喂 → 框被带偏乱飘)
                     _lpc = ((_lp[0]+_lp[2])/2 - (_pb[0]+_pb[2])/2)**2 + ((_lp[1]+_lp[3])/2 - (_pb[1]+_pb[3])/2)**2
                     _lpw = max(_pb[2]-_pb[0], _lp[2]-_lp[0], 20.0)
-                    if _lpc > (_lpw * 0.5) ** 2:
+                    if _lpc > (_lpw * 0.3) ** 2:
                         continue
                     _best_iou_low = _io; _best_low = _lp
             if _best_low is not None:
@@ -1800,8 +1837,9 @@ while True:
                     # ★ 02:21 中心距验证: 找回框须离预测位置 ≤0.5手宽(否则是背景误检)
                     #   ★ 08-12 0.8→0.5手宽: 两手一前一后时找回常命中"前面手"的检测
                     #     (快速移动消失由主匹配的"距离得分+惯性"兜底, 找回可收紧防乱飘)
+                    #   ★★ 08-12 10:44 0.5→0.3手宽: 更严, 前面手检测不被误救(根治乱飘)
                     _gc = ((_gx1+_gx2)/2 - (_pb[0]+_pb[2])/2)**2 + ((_gy1+_gy2)/2 - (_pb[1]+_pb[3])/2)**2
-                    if _gc > (_hw3 * 0.5) ** 2:
+                    if _gc > (_hw3 * 0.3) ** 2:
                         continue
                     _found3 = (_gx1, _gy1, _gx2, _gy2)
                     break
