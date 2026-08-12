@@ -971,6 +971,39 @@ def iou(a, b):
     aa = (a[2]-a[0])*(a[3]-a[1]); bb = (b[2]-b[0])*(b[3]-b[1])
     return iw*ih/(aa+bb-iw*ih+1e-6)
 
+def hand_guard_bbox(dh, tb, tracks):
+    """★ 20:48 手挡头防护V4(治"手挡头时手框被头干扰变形"):
+    V3失败教训: 触发太宽(手贴脸/摸头/侧位也触发)→框被压小+位置重锚抖动.
+    V4 严格触发(只治"真手挡头"= 手投影在头区域内):
+      ①手检测框中心在头部框内部 ②与头IoU>0.3 ③面积>头部面积(合并框≈头或更大, 正常手<头)
+    保守动作(框基本不动, 防抖):
+      尺寸 = min(手轨当前, 头部×0.9) — 手轨正常时不缩(正常手<头×0.9), 污染时拉回
+      位置 = 预测中心0.85 + 检测中心0.15 — 重锚向手轨, 抖动最小
+    手正常时 → 原框直通, 完全 V8 行为."""
+    if not tracks:
+        return dh
+    _da = (dh[2]-dh[0])*(dh[3]-dh[1])
+    _dcx = (dh[0]+dh[2])/2; _dcy = (dh[1]+dh[3])/2
+    for _hb_t in tracks:
+        _hb = _hb_t[0].bbox
+        if not (_hb[0] < _dcx < _hb[2] and _hb[1] < _dcy < _hb[3]):
+            continue   # 手检测框中心不在头框内 → 非"手挡头"(贴脸/摸头/侧位) → 不触发
+        if iou(_hb, dh) <= 0.3:
+            continue
+        _hba = (_hb[2]-_hb[0]) * (_hb[3]-_hb[1])
+        if _da <= _hba:
+            continue   # 面积≤头 → 正常手(手比头小) → 不触发
+        # 真手挡头: 尺寸钳制 + 位置重锚
+        _hw_max = min(tb[2]-tb[0], (_hb[2]-_hb[0]) * 0.9)
+        _hh_max = min(tb[3]-tb[1], (_hb[3]-_hb[1]) * 0.9)
+        if _hw_max < 20: _hw_max = tb[2]-tb[0]
+        if _hh_max < 20: _hh_max = tb[3]-tb[1]
+        _pcx = (tb[0]+tb[2])/2; _pcy = (tb[1]+tb[3])/2
+        _mcx = _dcx*0.15 + _pcx*0.85
+        _mcy = _dcy*0.15 + _pcy*0.85
+        return (_mcx-_hw_max/2, _mcy-_hh_max/2, _mcx+_hw_max/2, _mcy+_hh_max/2)
+    return dh
+
 def hand_skin_ok(frame, x1, y1, x2, y2, W, H):
     """★ 08-12 肤色验证(抽取自检测链, 低分候选升级建轨复用):
     人手: 肤色占比≥25% + 高饱和红木占比≤45% (治椅子/木纹误判)"""
@@ -1551,15 +1584,14 @@ while True:
                     det_hands.append((x1, y1, x2, y2))
         except Exception:
             pass
-    # ★ 去重(沿用 V8: 中心距 1.2 手宽 + IoU 0.3 合并同手双检框)
+    # ★ 去重(★20:48 只按 IoU 0.3 合并): 去掉"中心距<1.2手宽合并"(两手靠近时第二手框被吞)
+    #   V8原限制在单手场景防双检; 但两手平行靠近(中心距近、框不重叠)时误吞 → 一手消失
+    #   03:40 用户已验证方案(eac21fa): 同手双检框必然重叠, IoU>0.3 足够
     det_hands_dedup = []
     for _dh in sorted(det_hands, key=lambda b: -(b[2]-b[0])*(b[3]-b[1])):
         _dup = False
         for _dh2 in det_hands_dedup:
             if iou(_dh, _dh2) > 0.3:
-                _dup = True; break
-            _d = ((_dh[0]+_dh[2])/2 - (_dh2[0]+_dh2[2])/2)**2 + ((_dh[1]+_dh[3])/2 - (_dh2[1]+_dh2[3])/2)**2
-            if _d < ((_dh2[2]-_dh2[0]) * 1.2) ** 2:   # ★ 00:36 沿用V8: 0.8→1.2手宽
                 _dup = True; break
         if not _dup:
             det_hands_dedup.append(_dh)
@@ -1645,19 +1677,31 @@ while True:
             #   中心距 < 1.5×最大手宽 → 视为同一只手(运动模糊导致未匹配) → 不新建
             #   (否则快速移动时 IoU 小未匹配 → 新建第二条轨 → 双框)
             #   ★ 01:47 完全沿用V8: 固定 1.5手宽(19:54 V8 原版), 移除 2.5/动态0.8
-            _suppress_r = 1.5
-            _dup_track = False
-            for _ht in hand_tracks:
-                _hb = _ht[0].bbox
-                _d2 = ((dh[0]+dh[2])/2 - (_hb[0]+_hb[2])/2)**2 + ((dh[1]+dh[3])/2 - (_hb[1]+_hb[3])/2)**2
-                _hw_max = max(dh[2]-dh[0], _hb[2]-_hb[0])
-                if _d2 < (_hw_max * _suppress_r) ** 2:
-                    _dup_track = True
+            #   ★★ 20:48 两手突破(03:40 用户已验证 eac21fa): 画面有另一手检测框(两手靠一起)
+            #     → 不抑制建轨 + 不顺手喂(否则第二只手永远建不了轨 → 一手消失)
+            _two_hand = False
+            for _dh2 in det_hands:
+                if _dh2 is dh: continue
+                _do = ((dh[0]+dh[2])/2 - (_dh2[0]+_dh2[2])/2)**2 + ((dh[1]+dh[3])/2 - (_dh2[1]+_dh2[3])/2)**2
+                _ow = max(dh[2]-dh[0], _dh2[2]-_dh2[0])
+                if _do < (_ow * 1.5) ** 2:
+                    _two_hand = True; break
+            if not _two_hand:
+                _suppress_r = 1.5
+                _dup_track = False
+                for _ht in hand_tracks:
+                    _hb = _ht[0].bbox
+                    _d2 = ((dh[0]+dh[2])/2 - (_hb[0]+_hb[2])/2)**2 + ((dh[1]+dh[3])/2 - (_hb[1]+_hb[3])/2)**2
+                    _hw_max = max(dh[2]-dh[0], _hb[2]-_hb[0])
+                    if _d2 < (_hw_max * _suppress_r) ** 2:
+                        _dup_track = True
                     # ★ 顺手把它匹配给最近的轨(加速收敛, 框立刻跟上手)
                     if _ht[1] not in h_matched_ids:
                         hand_tracks[hand_tracks.index(_ht)][0].update(dh)
                         h_matched_ids.add(_ht[1])
-                    break
+                        break
+            else:
+                _dup_track = False
             if not _dup_track and len(hand_tracks) < 10:
                 # ★ ReID: 新建轨携带外观签名(后续匹配用)
                 hand_tracks.append([KalmanBox(dh, pn=0.50, mn=0.05, sig=_hand_sigs[j] if j < len(_hand_sigs) else None),
@@ -2120,9 +2164,31 @@ while True:
     #   ★ 21:36 治"快速移动框消失": 运动模糊→MediaPipe失败→lost增长→lost>=2隐藏=消失
     #   放宽到 lost>=4: 模糊1-3帧时用Kalman预测位置继续显示(不消失), 第4帧才隐藏
     # ★ 01:47 完全沿用V8: 显示隐藏 lost>=2(15:35 V8原版, 残影快速隐藏防双框)
+    # ★★ 20:52 V5 手挡头隐藏(治"挤压+变形"视觉): 手挡头时 KF 仍被含头大框污染,
+    #   手追踪框会与头框重叠/挤压 → 直接隐藏(V4钳制到头部内反而更糟).
+    #   触发 = 手追踪框中心在头部框内部 + IoU>0.3 + 面积>头部面积(真手挡头, 合并框残留).
+    #   KF 继续 update(状态会被污染, 但用户看不到), 等手离开头后正常显示.
+    _hand_hidden = set()
+    for ht in hand_tracks:
+        if ht[0].lost >= 2: continue
+        _tbx, _tby, _tbw, _tbh = ht[0].bbox
+        _ta = _tbw * _tbh
+        _tcx = (_tbx + _tbx + _tbw) / 2; _tcy = (_tby + _tby + _tbh) / 2
+        for _hb_t in tracks:
+            _hbx, _hby, _hbw, _hbh = _hb_t[0].bbox
+            if not (_hbx < _tcx < _hbx + _hbw and _hby < _tcy < _hby + _hbh):
+                continue
+            if iou(_hb_t[0].bbox, ht[0].bbox) <= 0.3:
+                continue
+            _hba = _hbw * _hbh
+            if _ta > _hba:
+                _hand_hidden.add(ht[1])
+                break
     for ht in hand_tracks:
         if ht[0].lost >= 2:
             continue   # 丢失2帧隐藏(V8机制)
+        if ht[1] in _hand_hidden:
+            continue   # ★ 20:52 V5: 手挡头隐藏(防挤压+变形视觉)
         # ★★ 08-12 乱飘兜底(治"两手一前一后打圈→丢失轨乱飘"): 丢失期间(lost≥1)
         #   若显示框已漂离最后确认位置>1.5手宽 → 隐藏。即使前面手的检测漏网喂入,
         #   显示也不允许框飘远(宁可消失, 不乱飘)
