@@ -60,7 +60,7 @@ try:
     if _os.path.exists(r"D:\training_data\hand_landmarker.task"):
         _mp_opts = _mp_vision.HandLandmarkerOptions(
             base_options=_mp_python.BaseOptions(model_asset_path=r"D:\training_data\hand_landmarker.task"),
-            num_hands=2, min_hand_detection_confidence=0.4, min_tracking_confidence=0.4)
+            num_hands=4, min_hand_detection_confidence=0.2, min_tracking_confidence=0.3)   # ★ 08-12 0.4→0.2/0.3(部分遮挡手也能检出)
         MP_HANDS = _mp_vision.HandLandmarker.create_from_options(_mp_opts)
         print("✅ MediaPipe Hands 已加载(21点手部关键点, 精准手掌)")
     else:
@@ -1590,8 +1590,12 @@ while True:
     #   对宽高比>2.2 的可疑 hand.pt 框用 MediaPipe 21点验证:
     #     找到匹配 → 替换为 MediaPipe 手掌框(精确, 天然不含小臂) → 治伸直手+治框小臂
     #     未匹配 → 拒该框(可能是小臂误检) → 治框小臂
+    #   ★★ 08-12 10:52 匹配放宽(IoU>0.2→IoU>0.1或中心距<0.8手宽):
+    #     手肘框(手+小臂)中心在手臂上, 与手掌框IoU可能仅0.1-0.2 → 原0.2漏配 → 手肘框没被替换
     #   正常宽高比(≤2.2)直接用 hand.pt 框(MediaPipe 外接框可能偏小, 不用)
-    #   MediaPipe 仅验证(不产新检测框)→ 无分裂风险(吸取a599a8d教训)
+    #   ★★ 08-12 10:52 补充通道(治"半遮挡手识别不出"): MediaPipe检出的手掌框
+    #     未被 hand.pt 覆盖(hand.pt对部分遮挡手检不出) → 直接补充为检测;
+    #     与已有框"中心距<1.2手宽或IoU>0.3"=同手 → 替换为MediaPipe框(精确, 防分裂)
     #   卡死/超时(_mpb空或时间过期)→ 不处理, 降级纯hand.pt
     try:
         with _mp_lock:
@@ -1605,12 +1609,28 @@ while True:
                     _new_det.append(_dh); continue  # 正常宽高比 → 直接用
                 _matched_mp = None
                 for _mb in _mpb:
-                    if iou(_dh, _mb) > 0.2:
+                    _dwi = max(_dhw, _dhh, 20.0)
+                    _mdc = ((_dh[0]+_dh[2])/2-(_mb[0]+_mb[2])/2)**2 + \
+                           ((_dh[1]+_dh[3])/2-(_mb[1]+_mb[3])/2)**2
+                    if iou(_dh, _mb) > 0.1 or _mdc < (_dwi * 0.8) ** 2:
                         _matched_mp = _mb; break
                 if _matched_mp is not None:
                     _new_det.append(_matched_mp)  # 替换为精确手掌框(治伸直手+治小臂)
                 # else: 拒(不加入) — MediaPipe有结果但无匹配=小臂误检
             det_hands = _new_det
+            # 补充通道: MediaPipe 检出的手掌框(部分遮挡/伸直手 hand.pt 检不出的)
+            for _mb in _mpb:
+                _mb_dup = False
+                for _k, _dh in enumerate(det_hands):
+                    _mwi = max(_mb[2]-_mb[0], _dh[2]-_dh[0], 20.0)
+                    _mdc = ((_mb[0]+_mb[2])/2-(_dh[0]+_dh[2])/2)**2 + \
+                           ((_mb[1]+_mb[3])/2-(_dh[1]+_dh[3])/2)**2
+                    if _mdc < (_mwi * 1.2) ** 2 or iou(_mb, _dh) > 0.3:
+                        det_hands[_k] = _mb   # 同手 → 替换为MediaPipe精确框(防分裂)
+                        _mb_dup = True
+                        break
+                if not _mb_dup:
+                    det_hands.append(_mb)     # 新增(半遮挡手也识别)
     except Exception:
         pass
     # ★ 去重(★ 08-12 只按IoU>0.3合并同手双检框): 移除"中心距<1.2手宽"合并
