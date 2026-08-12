@@ -1734,16 +1734,17 @@ while True:
             if not _dup:
                 _hb_dedup.append(_hb)
         hand_boxes = _hb_dedup
-    # ★ 00:58 位移感知EMA(用户: 稳定多了但移速延迟): 00:55固定阻尼(0.75/0.65/0.55)
-    #   把真实移动也拖慢了. 升级: 按帧间位移比例动态调α
-    #   位移小(≤0.15框宽=噪声/静止) → 强平滑压噪; 位移大(>0.5框宽=真实快速移动)
-    #   → 轻平滑快跟随(无延迟). 兼顾"远处稳定"与"移速实时"
+    # ★ 01:02 位置/尺寸分离EMA(用户: 大小变化与移速还有阻尼): 00:58对4坐标整体平滑
+    #   → 尺寸变化(握拳/张开)也被位置阻尼拖慢. 分离:
+    #   位置(中心): 位移感知EMA(位移小强平滑防漂, 位移大快跟随) — 阈值调低更灵敏
+    #   尺寸(宽高): 轻平滑α=0.35(65%新) → 大小变化立即响应, 无阻尼感
     if _prev_hand_boxes:
         _hb_out = []
         _used_hb = set()
         for _hb in hand_boxes:
             _hc = ((_hb[0]+_hb[2])/2, (_hb[1]+_hb[3])/2)
             _hw_ = _hb[2]-_hb[0]
+            _hh_ = _hb[3]-_hb[1]
             _pi, _pd = -1, max(30.0, _hw_ * 1.2)
             for _i, _pb in enumerate(_prev_hand_boxes):
                 if _i in _used_hb:
@@ -1755,14 +1756,21 @@ while True:
             if _pi >= 0:
                 _used_hb.add(_pi)
                 _pb = _prev_hand_boxes[_pi]
-                _ratio = _pd / max(_hw_, 15.0)   # 帧间位移/框宽 (0=噪声, >0.5=快速移动)
-                if _ratio < 0.15:
+                _pbc = ((_pb[0]+_pb[2])/2, (_pb[1]+_pb[3])/2)
+                # 位置: 位移感知EMA(更灵敏)
+                _ratio = _pd / max(_hw_, 15.0)   # 帧间位移/框宽
+                if _ratio < 0.10:
                     _a = 0.80   # 静止/微动(噪声) → 强平滑(框纹丝不动)
-                elif _ratio < 0.5:
-                    _a = 0.65   # 轻微移动 → 中平滑
+                elif _ratio < 0.35:
+                    _a = 0.55   # 轻微移动 → 中平滑
                 else:
-                    _a = 0.25   # 真实快速移动 → 轻平滑(快跟随, 无延迟)
-                _hb_out.append(tuple(int(_pb[k]*_a + _hb[k]*(1-_a)) for k in range(4)))
+                    _a = 0.15   # 真实移动 → 轻平滑(85%跟随, 几乎无延迟)
+                _ncx = _pbc[0]*_a + _hc[0]*(1-_a)
+                _ncy = _pbc[1]*_a + _hc[1]*(1-_a)
+                # 尺寸: 轻平滑(65%新) → 握拳/张开立即响应
+                _nw = (_pb[2]-_pb[0])*0.35 + _hw_*0.65
+                _nh = (_pb[3]-_pb[1])*0.35 + _hh_*0.65
+                _hb_out.append((int(_ncx-_nw/2), int(_ncy-_nh/2), int(_ncx+_nw/2), int(_ncy+_nh/2)))
             else:
                 _hb_out.append(_hb)
         hand_boxes = _hb_out
