@@ -1292,9 +1292,9 @@ def _mp_worker():
                 _mp_latest_time = time.time()
         except Exception:
             pass
-if False and MP_HANDS is not None:   # ★ 20:55 回归V8手: MediaPipe 停用(单源hand.pt, 代码保留)
+if MP_HANDS is not None:   # ★ 00:35 重新启用(用户: 加入手部关节MediaPipe做手框大小自适应; 独立线程不卡主循环)
     threading.Thread(target=_mp_worker, daemon=True).start()
-    print("✅ MediaPipe独立线程已启动(21点关节验证器: 治伸直手/框小臂, 卡死自动降级hand.pt)")
+    print("✅ MediaPipe独立线程已启动(21点关节: 手框大小自适应, 卡死自动降级hand.pt)")
 
 # ★★ 23:52 MiDaS 深度线程(空间立体感知): 每0.5s对最新帧算深度图(128x72)
 #   独立线程, 不阻塞主循环; 深度图用于"手/胳膊挡头"判定(谁在前)
@@ -1366,6 +1366,9 @@ def _capture_worker():
             continue
         if _fr.shape[1] > 1280:
             _fr = cv2.resize(_fr, (1280, 720), interpolation=cv2.INTER_AREA)
+        # ★ 00:35 喂帧给 MediaPipe 独立线程(21点手部关节, 异步不卡主循环)
+        with _mp_lock:
+            _mp_frame_cur = _fr
         if _frame_q.full():
             try:
                 _frame_q.get_nowait()   # 丢旧帧(保最新)
@@ -1618,27 +1621,19 @@ while True:
         else:
             _sm_wrists.append((wx, wy))
     _prev_wrists = list(_sm_wrists)
-    # 2. 手框 = 手腕+方向锚定(手长≈0.9头宽, 手宽≈0.43头宽; 中心向指尖偏移0.45手长)
-    #   ★ 00:20 重构: 不再是"以手腕为中心的正方形"(框一半在小臂上)
+    # 2. 手框 = 手腕+方向锚定(位置稳) + 大小三层自适应(用户00:35: 手部关节mediapipe+hand预训练)
+    #   ①MediaPipe 21点外接框尺寸(握拳小/张开大, 手势大小自适应) — 独立线程异步, 0.8s超时降级
+    #   ②hand.pt 检测框尺寸(MediaPipe失败时参考)
+    #   ③固定比例(0.9×0.43头宽)兜底
     _hand_sz = 40.0
     if tracks:
         _hw0 = tracks[0][0].bbox[2] - tracks[0][0].bbox[0]
         _hand_sz = max(20.0, _hw0 * 0.45)
-    _hand_len = max(30.0, _hand_sz * 2.0)     # 手长(腕→指尖)≈0.9头宽
-    _hand_wid = max(18.0, _hand_sz * 0.95)    # 手掌宽≈0.43头宽
-    hand_boxes = []
-    for (wx, wy), (ux, uy) in zip(_sm_wrists, _g_wrists_dir):
-        if not (0 <= wx < W and 0 <= wy < H):   # 手腕在画面内才框(手出画面自然消失)
-            continue
-        _cx = wx + ux * _hand_len * 0.45   # 中心向指尖方向偏移(覆盖手主体, 不框小臂)
-        _cy = wy + uy * _hand_len * 0.45
-        if abs(ux) >= abs(uy):             # 水平伸 → 长边沿x
-            _bw, _bh = _hand_len, _hand_wid
-        else:                              # 竖直伸 → 长边沿y
-            _bw, _bh = _hand_wid, _hand_len
-        hand_boxes.append((_cx-_bw/2, _cy-_bh/2, _cx+_bw/2, _cy+_bh/2))
-    # 3. 无手腕 → hand.pt 检测兜底(近处/pose失败)
-    if not hand_boxes and HAND_READY:
+    _hand_len = max(30.0, _hand_sz * 2.0)     # 兜底手长(腕→指尖)≈0.9头宽
+    _hand_wid = max(18.0, _hand_sz * 0.95)    # 兜底手掌宽≈0.43头宽
+    _mp_boxes = list(_mp_latest_boxes) if (time.time() - _mp_latest_time) < 0.8 else []   # 线程最新框(新鲜才用)
+    _hand_dets = []
+    if not _mp_boxes and HAND_READY:   # 仅MediaPipe失败时跑hand.pt(尺寸参考)
         try:
             res_h = HAND(frame, conf=0.15, iou=0.5, imgsz=640, verbose=False)
             for r in res_h:
@@ -1646,9 +1641,54 @@ while True:
                     b = box.xyxy[0].cpu().numpy()
                     _bx1, _by1, _bx2, _by2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
                     if _bx2-_bx1 >= 15 and _by2-_by1 >= 15:
-                        hand_boxes.append((_bx1, _by1, _bx2, _by2))
+                        _hand_dets.append((_bx1, _by1, _bx2, _by2))
         except Exception:
             pass
+    hand_boxes = []
+    for (wx, wy), (ux, uy) in zip(_sm_wrists, _g_wrists_dir):
+        if not (0 <= wx < W and 0 <= wy < H):   # 手腕在画面内才框(手出画面自然消失)
+            continue
+        _cx = wx + ux * _hand_len * 0.45   # 位置: 方向锚定中心(稳, 不框小臂)
+        _cy = wy + uy * _hand_len * 0.45
+        _bw, _bh = _hand_len, _hand_wid    # 默认兜底尺寸
+        if _mp_boxes:                      # ①MediaPipe 21点尺寸(手势自适应)
+            _bm = None; _bd = 1e9
+            for _mb in _mp_boxes:
+                _mc = ((_mb[0]+_mb[2])/2, (_mb[1]+_mb[3])/2)
+                _d = ((_mc[0]-wx)**2 + (_mc[1]-wy)**2) ** 0.5
+                if _d < _bd:
+                    _bd = _d; _bm = _mb
+            if _bm is not None and _bd < _hand_len * 2.0:   # 距手腕<2手长 → 同手
+                _bw = max(_bm[2]-_bm[0], 15.0)
+                _bh = max(_bm[3]-_bm[1], 15.0)
+        elif _hand_dets:                   # ②hand.pt 检测框尺寸(MediaPipe失败)
+            _bm2 = None; _bd2 = 1e9
+            for _db in _hand_dets:
+                _dc2 = ((_db[0]+_db[2])/2, (_db[1]+_db[3])/2)
+                _d = ((_dc2[0]-wx)**2 + (_dc2[1]-wy)**2) ** 0.5
+                if _d < _bd2:
+                    _bd2 = _d; _bm2 = _db
+            if _bm2 is not None and _bd2 < _hand_len * 2.0:
+                _bw = max(_bm2[2]-_bm2[0], 15.0)
+                _bh = max(_bm2[3]-_bm2[1], 15.0)
+        hand_boxes.append((_cx-_bw/2, _cy-_bh/2, _cx+_bw/2, _cy+_bh/2))
+    # 3. 无手腕 → 兜底建框(优先MediaPipe, 其次hand.pt; 近处/pose失败)
+    if not hand_boxes:
+        if _mp_boxes:
+            hand_boxes = list(_mp_boxes)
+        elif _hand_dets:
+            hand_boxes = list(_hand_dets)
+        elif HAND_READY:
+            try:
+                res_h = HAND(frame, conf=0.15, iou=0.5, imgsz=640, verbose=False)
+                for r in res_h:
+                    for box in r.boxes:
+                        b = box.xyxy[0].cpu().numpy()
+                        _bx1, _by1, _bx2, _by2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+                        if _bx2-_bx1 >= 15 and _by2-_by1 >= 15:
+                            hand_boxes.append((_bx1, _by1, _bx2, _by2))
+            except Exception:
+                pass
     det_hands = list(hand_boxes)   # 供后续段(交集判定/物品检测)使用
 
     # ==================== ★★ 08-12 摒弃实时香烟检测(新架构: 后台静态识别) ====================
