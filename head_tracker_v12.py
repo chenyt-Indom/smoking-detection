@@ -2199,6 +2199,13 @@ while True:
                 _hand_hidden.add(ht[1])
                 break
     for ht in hand_tracks:
+        # ★★ 22:51 新轨需2帧确认才显示(治"幽灵框: 同一方框瞬间跳屏幕随机位置"):
+        #   根因: hand.pt 屏幕随机位置误检框(conf≥0.25) → 匹配失败 → 新建轨 → 立即显示
+        #   1帧后误检消失 → lost++ → 删除 → 随机位置闪框
+        #   修复: confirmed(连续确认帧数) < 2 不显示 → 单帧误检建的轨用户看不到
+        #   (真手连续2帧检测到 → confirmed≥2 → 显示, 延迟约1帧可接受)
+        if ht[0].confirmed < 2:
+            continue
         if ht[0].lost >= 2:
             continue   # 丢失2帧隐藏(V8机制)
         if ht[1] in _hand_hidden:
