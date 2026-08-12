@@ -1648,29 +1648,56 @@ while True:
     for (wx, wy), (ux, uy) in zip(_sm_wrists, _g_wrists_dir):
         if not (0 <= wx < W and 0 <= wy < H):   # 手腕在画面内才框(手出画面自然消失)
             continue
-        _cx = wx + ux * _hand_len * 0.45   # 位置: 方向锚定中心(稳, 不框小臂)
-        _cy = wy + uy * _hand_len * 0.45
-        _bw, _bh = _hand_len, _hand_wid    # 默认兜底尺寸
-        if _mp_boxes:                      # ①MediaPipe 21点尺寸(手势自适应)
+        # ★ 00:47 双重确认(极小改动): pose手腕必须附近有MediaPipe框(中心距<2手长)
+        #   否则视为误检(画面外/折叠/折叠另一只手)→ 不出框(治"两个同位置红框/身体上框出空手")
+        #   MediaPipe空(线程未出)时不强制 → 兜底段会用mp_boxes/h.pt兜底建框
+        if _mp_boxes:
             _bm = None; _bd = 1e9
             for _mb in _mp_boxes:
                 _mc = ((_mb[0]+_mb[2])/2, (_mb[1]+_mb[3])/2)
                 _d = ((_mc[0]-wx)**2 + (_mc[1]-wy)**2) ** 0.5
                 if _d < _bd:
                     _bd = _d; _bm = _mb
-            if _bm is not None and _bd < _hand_len * 2.0:   # 距手腕<2手长 → 同手
+            if _bm is None or _bd >= _hand_len * 2.0:
+                continue   # MP没验证该位置 → 不画手腕锚定框(兜底段仍可建)
+        # ★ 00:50 中心点每帧实时更新(用户: 手不同角度像素变化大, 固定偏移不适配):
+        #   中心/尺寸 优先用 MediaPipe 21点外接框几何中心(手实际中心, 每帧实时)
+        #   → 次选 hand.pt 检测框中心(实时) → 兜底方向锚定中心(固定偏移)
+        _bm = None; _bd = 1e9
+        if _mp_boxes:                      # ①MP几何中心+尺寸(实时, 手势自适应)
+            for _mb in _mp_boxes:
+                _mc = ((_mb[0]+_mb[2])/2, (_mb[1]+_mb[3])/2)
+                _d = ((_mc[0]-wx)**2 + (_mc[1]-wy)**2) ** 0.5
+                if _d < _bd:
+                    _bd = _d; _bm = _mb
+            if _bm is not None and _bd < _hand_len * 2.0:
+                _cx = (_bm[0]+_bm[2]) / 2   # MP几何中心(手实际中心, 实时)
+                _cy = (_bm[1]+_bm[3]) / 2
                 _bw = max(_bm[2]-_bm[0], 15.0)
                 _bh = max(_bm[3]-_bm[1], 15.0)
-        elif _hand_dets:                   # ②hand.pt 检测框尺寸(MediaPipe失败)
-            _bm2 = None; _bd2 = 1e9
-            for _db in _hand_dets:
-                _dc2 = ((_db[0]+_db[2])/2, (_db[1]+_db[3])/2)
-                _d = ((_dc2[0]-wx)**2 + (_dc2[1]-wy)**2) ** 0.5
-                if _d < _bd2:
-                    _bd2 = _d; _bm2 = _db
-            if _bm2 is not None and _bd2 < _hand_len * 2.0:
-                _bw = max(_bm2[2]-_bm2[0], 15.0)
-                _bh = max(_bm2[3]-_bm2[1], 15.0)
+            else:
+                _bm = None   # MP匹配失败 → 走hand.pt/兜底
+        if _bm is None:
+            if _hand_dets:                   # ②hand.pt 检测框中心+尺寸(实时)
+                _bm2 = None; _bd2 = 1e9
+                for _db in _hand_dets:
+                    _dc2 = ((_db[0]+_db[2])/2, (_db[1]+_db[3])/2)
+                    _d = ((_dc2[0]-wx)**2 + (_dc2[1]-wy)**2) ** 0.5
+                    if _d < _bd2:
+                        _bd2 = _d; _bm2 = _db
+                if _bm2 is not None and _bd2 < _hand_len * 2.0:
+                    _cx = (_bm2[0]+_bm2[2]) / 2   # hand.pt框中心(实时)
+                    _cy = (_bm2[1]+_bm2[3]) / 2
+                    _bw = max(_bm2[2]-_bm2[0], 15.0)
+                    _bh = max(_bm2[3]-_bm2[1], 15.0)
+                else:
+                    _bm2 = None
+            else:
+                _bm2 = None
+            if _bm2 is None:                 # ③兜底: 方向锚定中心+默认尺寸
+                _cx = wx + ux * _hand_len * 0.45
+                _cy = wy + uy * _hand_len * 0.45
+                _bw, _bh = _hand_len, _hand_wid
         hand_boxes.append((_cx-_bw/2, _cy-_bh/2, _cx+_bw/2, _cy+_bh/2))
     # 3. 无手腕 → 兜底建框(优先MediaPipe, 其次hand.pt; 近处/pose失败)
     if not hand_boxes:
