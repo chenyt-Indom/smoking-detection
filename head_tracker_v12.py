@@ -60,7 +60,7 @@ try:
     if _os.path.exists(r"D:\training_data\hand_landmarker.task"):
         _mp_opts = _mp_vision.HandLandmarkerOptions(
             base_options=_mp_python.BaseOptions(model_asset_path=r"D:\training_data\hand_landmarker.task"),
-            num_hands=4, min_hand_detection_confidence=0.2, min_tracking_confidence=0.3)   # ★ 08-12 0.4→0.2/0.3(部分遮挡手也能检出)
+            num_hands=4, min_hand_detection_confidence=0.15, min_tracking_confidence=0.3)   # ★ 08-12 0.2→0.15(更灵敏; MediaPipe关节检测精确, 误检率低)
         MP_HANDS = _mp_vision.HandLandmarker.create_from_options(_mp_opts)
         print("✅ MediaPipe Hands 已加载(21点手部关键点, 精准手掌)")
     else:
@@ -1534,7 +1534,7 @@ while True:
     hand_low_pool = []
     if HAND_READY:
         try:
-            res_h = HAND(frame, conf=0.12, iou=0.5, imgsz=640, verbose=False)
+            res_h = HAND(frame, conf=0.08, iou=0.5, imgsz=640, verbose=False)   # ★ 08-12 0.12→0.08(增强灵敏度: 更远/更小/更模糊的手也能入低分池; 误检由肤色验证+连续2帧确认挡)
             for r in res_h:
                 for box in r.boxes:
                     b = box.xyxy[0].cpu().numpy()
