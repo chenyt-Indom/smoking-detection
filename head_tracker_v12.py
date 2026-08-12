@@ -936,6 +936,20 @@ class KalmanBox:
         # 速度限幅 ±200px/帧 (17:47 用户: 还要更快 → 120→200, 极限跟速)
         s = self.kf.statePost.flatten()
         s[4] = float(np.clip(s[4], -200, 200)); s[5] = float(np.clip(s[5], -200, 200))
+        if self.pn == 0.50:
+            # ★★ 22:17 手速度死区+EMA(治"轻微小动作致方框漂移"):
+            #   用户视频实测: 19fps摄像头手摆臂时帧间位移5-200px/帧
+            #   旧死区3px太小 → 死区不触发 → KF持续外推 → 框漂移
+            #   新死区8px(覆盖5-10px帧间抖动)，明显移动(>50px)仍正常外推
+            if abs(s[4]) < 8.0 and abs(s[5]) < 8.0:
+                s[4] = 0.0; s[5] = 0.0
+            _ve = getattr(self, '_vel_ema', None)
+            if _ve is None:
+                _ve = (float(s[4]), float(s[5]))
+            else:
+                _ve = (_ve[0]*0.5 + s[4]*0.5, _ve[1]*0.5 + s[5]*0.5)
+            s[4] = _ve[0]; s[5] = _ve[1]
+            self._vel_ema = _ve
         self.kf.statePost = s.reshape(-1, 1)
         p = s
         self.bbox = (float(p[0]-p[2]/2), float(p[1]-p[3]/2), float(p[0]+p[2]/2), float(p[1]+p[3]/2))
