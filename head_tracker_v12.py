@@ -1716,6 +1716,57 @@ while True:
                             hand_boxes.append((_bx1, _by1, _bx2, _by2))
             except Exception:
                 pass
+    # ★ 01:00 手框去重(治"单手追踪方框分裂"): pose可能把同一只手/手+前臂输出成
+    #   2个手腕 → 2个hand_box; MediaPipe也可能对单手输出2个框 → 高度重叠即同一只手
+    #   按面积从大到小, IoU>0.5 或 中心距<0.6最大框宽 → 合并保留大的
+    if len(hand_boxes) > 1:
+        _hb_dedup = []
+        for _hb in sorted(hand_boxes, key=lambda b: -(b[2]-b[0])*(b[3]-b[1])):
+            _dup = False
+            _c1 = ((_hb[0]+_hb[2])/2, (_hb[1]+_hb[3])/2)
+            for _hb2 in _hb_dedup:
+                if iou(_hb, _hb2) > 0.5:
+                    _dup = True; break
+                _w2 = max(_hb2[2]-_hb2[0], 15.0)
+                _c2 = ((_hb2[0]+_hb2[2])/2, (_hb2[1]+_hb2[3])/2)
+                if ((_c1[0]-_c2[0])**2 + (_c1[1]-_c2[1])**2) ** 0.5 < _w2 * 0.6:
+                    _dup = True; break
+            if not _dup:
+                _hb_dedup.append(_hb)
+        hand_boxes = _hb_dedup
+    # ★ 00:58 位移感知EMA(用户: 稳定多了但移速延迟): 00:55固定阻尼(0.75/0.65/0.55)
+    #   把真实移动也拖慢了. 升级: 按帧间位移比例动态调α
+    #   位移小(≤0.15框宽=噪声/静止) → 强平滑压噪; 位移大(>0.5框宽=真实快速移动)
+    #   → 轻平滑快跟随(无延迟). 兼顾"远处稳定"与"移速实时"
+    if _prev_hand_boxes:
+        _hb_out = []
+        _used_hb = set()
+        for _hb in hand_boxes:
+            _hc = ((_hb[0]+_hb[2])/2, (_hb[1]+_hb[3])/2)
+            _hw_ = _hb[2]-_hb[0]
+            _pi, _pd = -1, max(30.0, _hw_ * 1.2)
+            for _i, _pb in enumerate(_prev_hand_boxes):
+                if _i in _used_hb:
+                    continue
+                _pc = ((_pb[0]+_pb[2])/2, (_pb[1]+_pb[3])/2)
+                _d = ((_hc[0]-_pc[0])**2 + (_hc[1]-_pc[1])**2) ** 0.5
+                if _d < _pd:
+                    _pd = _d; _pi = _i
+            if _pi >= 0:
+                _used_hb.add(_pi)
+                _pb = _prev_hand_boxes[_pi]
+                _ratio = _pd / max(_hw_, 15.0)   # 帧间位移/框宽 (0=噪声, >0.5=快速移动)
+                if _ratio < 0.15:
+                    _a = 0.80   # 静止/微动(噪声) → 强平滑(框纹丝不动)
+                elif _ratio < 0.5:
+                    _a = 0.65   # 轻微移动 → 中平滑
+                else:
+                    _a = 0.25   # 真实快速移动 → 轻平滑(快跟随, 无延迟)
+                _hb_out.append(tuple(int(_pb[k]*_a + _hb[k]*(1-_a)) for k in range(4)))
+            else:
+                _hb_out.append(_hb)
+        hand_boxes = _hb_out
+    _prev_hand_boxes = [tuple(map(int, hb)) for hb in hand_boxes]
     det_hands = list(hand_boxes)   # 供后续段(交集判定/物品检测)使用
 
     # ==================== ★★ 08-12 摒弃实时香烟检测(新架构: 后台静态识别) ====================
