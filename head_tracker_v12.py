@@ -1738,6 +1738,14 @@ while True:
                         if iou(_ht2[0].bbox, _lp[:4]) > 0.3:
                             _steal = True; break
                     if _steal: continue
+                    # ★★ 08-12 中心距验证(治"两手一前一后打圈→丢失轨乱飘"): 丢失轨
+                    #   只接受"离预测中心≤0.5手宽"的低分候选。两手前后重叠时, 前面
+                    #   手的弱检测常落在后面手的预测位置附近 → 不加此验证会被误喂 →
+                    #   框被带偏乱飘(而不是正常丢失隐藏)
+                    _lpc = ((_lp[0]+_lp[2])/2 - (_pb[0]+_pb[2])/2)**2 + ((_lp[1]+_lp[3])/2 - (_pb[1]+_pb[3])/2)**2
+                    _lpw = max(_pb[2]-_pb[0], _lp[2]-_lp[0], 20.0)
+                    if _lpc > (_lpw * 0.5) ** 2:
+                        continue
                     _best_iou_low = _io; _best_low = _lp
             if _best_low is not None:
                 _ht[0].update(_best_low[:4])
@@ -1769,9 +1777,10 @@ while True:
                     _gx2 = _ex1 + _bx2/_sc3; _gy2 = _ey1 + _by2/_sc3
                     if _gx2-_gx1 < 15 or _gy2-_gy1 < 15: continue
                     # ★ 02:21 中心距验证: 找回框须离预测位置 ≤0.5手宽(否则是背景误检)
-                    #   ★ 08-12 0.5→0.8手宽: 快速移动帧手已离开预测位置, 0.5太严救不回(框消失)
+                    #   ★ 08-12 0.8→0.5手宽: 两手一前一后时找回常命中"前面手"的检测
+                    #     (快速移动消失由主匹配的"距离得分+惯性"兜底, 找回可收紧防乱飘)
                     _gc = ((_gx1+_gx2)/2 - (_pb[0]+_pb[2])/2)**2 + ((_gy1+_gy2)/2 - (_pb[1]+_pb[3])/2)**2
-                    if _gc > (_hw3 * 0.8) ** 2:
+                    if _gc > (_hw3 * 0.5) ** 2:
                         continue
                     _found3 = (_gx1, _gy1, _gx2, _gy2)
                     break
@@ -1814,6 +1823,7 @@ while True:
                     _near_other_det = True; break
             if not _near_other_det:
                 for _ht in hand_tracks:
+                    if _ht[0].lost >= 1: continue   # ★★ 08-12 丢失轨不被顺手更新(治乱飘: 错误检测喂给丢失轨 → 框被带偏)
                     _hb = _ht[0].bbox
                     _d2 = ((dh[0]+dh[2])/2 - (_hb[0]+_hb[2])/2)**2 + ((dh[1]+dh[3])/2 - (_hb[1]+_hb[3])/2)**2
                     _hw_max = max(dh[2]-dh[0], _hb[2]-_hb[0])
@@ -2307,6 +2317,18 @@ while True:
     for ht in hand_tracks:
         if ht[0].lost >= 2:
             continue   # 丢失2帧隐藏(V8机制)
+        # ★★ 08-12 乱飘兜底(治"两手一前一后打圈→丢失轨乱飘"): 丢失期间(lost≥1)
+        #   若显示框已漂离最后确认位置>1.5手宽 → 隐藏。即使前面手的检测漏网喂入,
+        #   显示也不允许框飘远(宁可消失, 不乱飘)
+        if ht[0].lost >= 1:
+            _dchk = ht[0].disp_bbox
+            _lgck = getattr(ht[0], 'last_good', None)
+            if _lgck is not None:
+                _ddc = ((_dchk[0]+_dchk[2])/2 - (_lgck[0]+_lgck[2])/2)**2 + \
+                       ((_dchk[1]+_dchk[3])/2 - (_lgck[1]+_lgck[3])/2)**2
+                _wwc = max(_dchk[2]-_dchk[0], 20.0)
+                if _ddc > (_wwc * 1.5) ** 2:
+                    continue   # 丢失框已飘远 → 隐藏(不乱飘)
         hx1, hy1, hx2, hy2 = map(int, ht[0].disp_bbox if hasattr(ht[0], 'disp_bbox') else ht[0].bbox)
         # ★★ 08-12 新架构: 手框内物品检测(非人体天然物: 烟/杯子/手机等手持物)
         #   连续2帧有物才确认(防单帧误检闪烁); 有物 → 框变红 + 最清晰帧截图入库
