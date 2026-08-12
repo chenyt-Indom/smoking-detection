@@ -937,11 +937,11 @@ class KalmanBox:
         s = self.kf.statePost.flatten()
         s[4] = float(np.clip(s[4], -200, 200)); s[5] = float(np.clip(s[5], -200, 200))
         if self.pn == 0.50:
-            # ★★ 22:17 手速度死区+EMA(治"轻微小动作致方框漂移"):
-            #   用户视频实测: 19fps摄像头手摆臂时帧间位移5-200px/帧
-            #   旧死区3px太小 → 死区不触发 → KF持续外推 → 框漂移
-            #   新死区8px(覆盖5-10px帧间抖动)，明显移动(>50px)仍正常外推
-            if abs(s[4]) < 8.0 and abs(s[5]) < 8.0:
+            # ★★ 23:26 重构: 速度死区绝对8px → 相对(0.25×手宽)
+            #   近处手大(80px)→死区20px; 远处手小(20px)→死区5px → 自适应
+            #   (治"轻微小动作致方框漂移": 死区以下=静止, 不外推)
+            _dead_v = max(4.0, w * 0.25)   # 死区 = 手宽25% (最小4px保护)
+            if abs(s[4]) < _dead_v and abs(s[5]) < _dead_v:
                 s[4] = 0.0; s[5] = 0.0
             _ve = getattr(self, '_vel_ema', None)
             if _ve is None:
@@ -1451,6 +1451,21 @@ while True:
     #   影响: 检测用原帧(无CLAHE/Unsharp/分块补偿), 暗光/白背景增强全部失效
     frame_enh = frame
 
+    # ★★ 23:30 手腕关键点辅助手定位(用户: COCO/身体/胳膊辅助, 防手框乱飘):
+    #   yolov8n-pose 17关键点 9=左腕 10=右腕 → 手腕=手的位置锚点
+    #   用途: ①手检测框远离所有手腕 → 误检 → 拒绝(防乱飘) ②手丢失时手腕续框
+    #   pose 每2帧推理(320输入快, 省算力); 远处检测不到手腕 → 退化为无约束
+    _g_wrists = []
+    if _pose_session is not None and fc % 2 == 0:
+        try:
+            _persons = detect_pose(frame)
+            for _pb, _kpts in _persons:
+                for _wi in (9, 10):
+                    if _kpts[_wi, 2] > 0.2:
+                        _g_wrists.append((float(_kpts[_wi, 0]), float(_kpts[_wi, 1])))
+        except Exception:
+            pass
+
     # --- 头检测(15:31 完全用 V12 模型, 废掉 pose): head_v12 模型检测(完整头框) ---
     #   ★ 15:51 BoT-SORT 全面接入: HEAD.track(botsort) — 模型检测 + BOTSORT追踪(ReID/GMC/低分恢复)
     #   验证: 实拍图 15/15 检出(BOTSORT 工作正常)
@@ -1567,16 +1582,28 @@ while True:
     hand_low_pool = []
     if HAND_READY:
         try:
-            res_h = HAND(frame, conf=0.12, iou=0.5, imgsz=640, verbose=False)
+            # ★★ 23:30 重构(用户: 大幅降低conf + 手腕辅助定位):
+            #   conf 0.08→0.05: 大幅降低(配合手腕约束防误检, 低conf也安全)
+            #   imgsz 960: 远处小目标检测
+            res_h = HAND(frame, conf=0.05, iou=0.5, imgsz=960, verbose=False)
             for r in res_h:
                 for box in r.boxes:
                     b = box.xyxy[0].cpu().numpy()
                     conf = float(box.conf.cpu().numpy()[0]) if box.conf is not None else 1.0
                     x1, y1, x2, y2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
                     bw, bh = x2-x1, y2-y1
-                    if bw < 20 or bh < 20: continue   # 最小手框(过滤噪声)
+                    # ★★ 23:26 重构: 最小手框 20→8px(6米外的手可能只有20-40px, 20px阈值直接过滤)
+                    if bw < 8 or bh < 8: continue   # 最小手框(过滤噪声, 远处小手放行)
                     if bw > W*0.7 or bh > H*0.7: continue  # 超大框(误检)
-                    # ★ 低分候选(0.12-0.25)只进池, 不参与正常检测/建轨
+                    # ★★ 23:30 手腕约束(用户: 身体/胳膊辅助定位, 防手框乱飘):
+                    #   手检测框中心远离所有手腕关键点 > 3手宽 = 误检(手必须连着胳膊)
+                    #   → 拒绝. pose没检测到手腕(远处) → 退化为无约束
+                    if _g_wrists:
+                        _hcx0 = (x1+x2)/2; _hcy0 = (y1+y2)/2
+                        _min_wd = min(((wx-_hcx0)**2 + (wy-_hcy0)**2) ** 0.5 for wx, wy in _g_wrists)
+                        if _min_wd > max(bw, 20.0) * 3.0:
+                            continue   # 远离所有手腕 → 误检 → 拒
+                    # ★ 低分候选(0.05-0.25)只进池, 不参与正常检测/建轨
                     if conf < 0.25:
                         hand_low_pool.append((x1, y1, x2, y2, conf))
                         continue
@@ -1624,20 +1651,55 @@ while True:
                 pb = (ps[0]-ps[2]/2, ps[1]-ps[3]/2, ps[0]+ps[2]/2, ps[1]+ps[3]/2)
                 iou_val = iou(pb, dh)
             # ★ ReID 外观通道: 快速移动IoU≈0但同一只手肤色/纹理一致 → 外观补偿匹配
+            # ★★ 23:15 签名池匹配(治"手换角度像素剧变→重新识别→目标丢失"):
+            #   手翻转/旋转 → 外观变化 → 与"当前签名"不匹配 → 丢失
+            #   升级: 对比 sig_pool(历史签名池, 含多角度) 中任一 → 换角度不丢
             _app = 0.0
-            if ht[0].sig is not None and _hand_sigs[j] is not None:
-                _corr, _size_ok = sig_similarity(ht[0].sig, _hand_sigs[j])
-                if _size_ok:
-                    _app = max(0.0, _corr)   # 相关性[-1,1] → [0,1]
+            if _hand_sigs[j] is not None:
+                _sig_cands = [ht[0].sig] if ht[0].sig is not None else []
+                _sig_cands += [s for s in ht[0].sig_pool if s is not None]
+                for _cs in _sig_cands:
+                    try:
+                        _corr, _size_ok = sig_similarity(_cs, _hand_sigs[j])
+                    except Exception:
+                        _corr, _size_ok = 0.0, False
+                    if _size_ok:
+                        _app = max(_app, max(0.0, _corr))   # 历史池最高相似度
             # 组合分 = 位置IoU + 外观(权重0.8): 保留原IoU通道(≥0.15即匹配),
             # 同时 IoU低但外观像(如0.05+0.3)也匹配 → 快速移动帧不丢轨
             _score = iou_val + _app * 0.8
             if _score > best_score: best_score = _score; best_i = i
         if best_i >= 0:
-            hand_tracks[best_i][0].update(dh)
+            # ★★ 23:15 手轨更新签名池(治换角度丢失): 每帧匹配后把新外观存入历史池
+            #   (update_sig 原本只被烟调用, 手轨从未调用 → 池一直空 → 外观匹配失效)
+            _ht7 = hand_tracks[best_i][0]
+            if _hand_sigs[j] is not None:   # ★ 23:18 修复: extract_sig可能返回None(小框/裁剪失败)
+                _ht7.update_sig(_hand_sigs[j])
+            _ht7.update(dh)
             h_matched_ids.add(hand_tracks[best_i][1]); h_matched_det.add(j)
     for ht in hand_tracks:
         if ht[1] not in h_matched_ids: ht[0].lost += 1
+    # ★★ 23:30 手腕续框(用户: 增强手定位能力, 身体/胳膊辅助):
+    #   丢失手轨 + 手腕关键点可见 → 用最近手腕位置续框(手=手腕锚点)
+    #   → 手被遮挡/快速移动丢失时, 框回到手腕附近, 不丢不飘
+    if _g_wrists:
+        for _ht in hand_tracks:
+            if _ht[1] in h_matched_ids: continue
+            if _ht[0].lost < 1: continue      # 只救已丢失的轨
+            _tb = _ht[0].bbox
+            _tc = ((_tb[0]+_tb[2])/2, (_tb[1]+_tb[3])/2)
+            _best_w = None; _best_d = 1e9
+            for _wx, _wy in _g_wrists:
+                _d = ((_wx-_tc[0])**2 + (_wy-_tc[1])**2) ** 0.5
+                if _d < _best_d:
+                    _best_d = _d; _best_w = (_wx, _wy)
+            if _best_w is not None and _best_d < max(_tb[2]-_tb[0], 20.0) * 2.0:
+                # 最近手腕在 2 手宽内 → 用手腕续框(框=手腕±手尺寸)
+                _hw = _tb[2]-_tb[0]; _hh = _tb[3]-_tb[1]
+                _nb = (_best_w[0]-_hw/2, _best_w[1]-_hh/2, _best_w[0]+_hw/2, _best_w[1]+_hh/2)
+                _ht[0].update(_nb)
+                _ht[0].lost = 0
+                h_matched_ids.add(_ht[1])
     # ★★ 20:12 低分池维持(快速移动不消失): 未匹配的手轨, 用低分候选(conf 0.12-0.25)
     #   中与预测位置重叠的 → update + lost 复位(运动模糊帧的弱检测也能续轨)
     if hand_low_pool:
