@@ -948,6 +948,7 @@ class KalmanBox:
             d[2]*(1-alpha) + self.bbox[2]*alpha, d[3]*(1-alpha) + self.bbox[3]*alpha)
         self.last_good = bbox   # 更新最后确认位置
         self.candidates = []   # 恢复关联后清空候选
+        self._last_det = ((bbox[0]+bbox[2])/2, (bbox[1]+bbox[3])/2)   # ★ 08-12 上帧匹配检测中心(匹配惯性用)
     def update_sig(self, new_sig, max_pool=6):
         """更新外观签名: 多帧累积(0.7旧+0.3新) + 历史池记录代表外观
         注意: sig是dict(hist数组+w/h), 平滑只作用于hist; 尺寸取最近观测
@@ -1599,14 +1600,18 @@ while True:
         _dhw = max(20.0, dh[2]-dh[0])
         for i, ht in enumerate(hand_tracks):
             if ht[0].lost >= 2: continue      # 丢失2帧轨不抢主匹配
-            iou_val = iou(ht[0].bbox, dh)
-            if iou_val < 0.15:
-                kf = ht[0].kf; ps = kf.statePre.flatten()
-                pb = (ps[0]-ps[2]/2, ps[1]-ps[3]/2, ps[0]+ps[2]/2, ps[1]+ps[3]/2)
-                iou_val = iou(pb, dh)
-            # ★ 位置突变惩罚: 检测框中心与轨中心距 >1.5手宽 → 线性惩罚, >2.5 → 拒
             _hb = ht[0].bbox
-            _dist = ((_dhc[0]-(_hb[0]+_hb[2])/2)**2 + (_dhc[1]-(_hb[1]+_hb[3])/2)**2) ** 0.5
+            _kfp = ht[0].kf.statePre.flatten()   # ★ 08-12 预测中心(含速度外推)
+            _pb = (_kfp[0]-_kfp[2]/2, _kfp[1]-_kfp[3]/2, _kfp[0]+_kfp[2]/2, _kfp[1]+_kfp[3]/2)
+            # ★★ 08-12 预测优先匹配(治"两手晃动/交换/靠近时框乱跟"):
+            #   [旧] 主要用"当前框IoU" → 两手靠近时检测框互相重叠 → IoU无法区分 → 换手/抖动
+            #   [新] 预测框IoU(速度外推后"手应该在哪")权重略高 → 两手交叉时检测框与
+            #        "本手预测"更贴合 → 匹配正确, 不换手
+            iou_cur = iou(_hb, dh)
+            iou_pred = iou(_pb, dh)
+            iou_val = max(iou_cur, iou_pred * 1.15)
+            # ★ 位置突变惩罚: 检测框中心与【预测中心】距离归一化(>1.5手宽惩罚, >2.5拒)
+            _dist = ((_dhc[0]-_kfp[0])**2 + (_dhc[1]-_kfp[1])**2) ** 0.5
             _w_ref = max(_dhw, _hb[2]-_hb[0], 20.0)
             _dr = _dist / _w_ref
             if _dr > 2.5:
@@ -1628,7 +1633,18 @@ while True:
                 _corr, _size_ok = sig_similarity(ht[0].sig, _hand_sigs[j])
                 if _size_ok:
                     _app = max(0.0, _corr)   # 相关性[-1,1] → [0,1]
-            _score = iou_val + _app * 0.8 - _pos_pen
+            # ★★ 08-12 匹配惯性(治"两手晃动/靠近时框跳变"): 与上帧本轨匹配的检测
+            #   框位置接近 → 加分。两手各自晃动时检测框跟随各自的手 → 轨被惯性
+            #   粘住正确的手, 即使两框靠近也不互相抢
+            _inertia = 0.0
+            _ld = getattr(ht[0], '_last_det', None)
+            if _ld is not None:
+                _ldd = ((_dhc[0]-_ld[0])**2 + (_dhc[1]-_ld[1])**2) ** 0.5
+                _inertia = max(0.0, 1.0 - _ldd / (_w_ref * 2.0)) * 0.5
+            # ★★ 08-12 距离得分: 检测框离预测中心越近得分越高(快速移动IoU≈0时的
+            #   位置依据, 防快速晃动帧"无匹配"丢轨)
+            _dist_score = max(0.0, 1.0 - _dr / 1.5) * 0.35
+            _score = iou_val + _dist_score + _app * 0.8 - _pos_pen + _inertia
             if _score > 0.15:
                 _h_scores.append((_score, i, j))
     for _msc, best_i, j in sorted(_h_scores, key=lambda x: -x[0]):
@@ -1680,13 +1696,22 @@ while True:
             _crx = _cx2 + _tw_h*0.5; _cry = _cy2 + _th_h*0.5
             hand_tracks[best_i][0].update((_clx, _cly, _crx, _cry))
         else:
-            # ★★ 08-12 位置突变验证(防遮挡/误检把框拉飞): 测量中心与KF预测中心
-            #   距离 > 2.0手宽 → 测量不可信(跳到别的物体/另一只手) → 维持预测框
+            # ★★ 08-12 手肘框防护(治"剧烈运动/变换角度时框到手肘"): hand.pt 会
+            #   把"手+前臂"一起框(尺寸明显大于手掌), 中心偏向前臂 → 轨被拉到手肘
+            #   [判据] 检测框面积>轨1.5x 且 与预测中心偏移>0.8手宽 → 手肘/污染框
+            #   [行为] 半跟随(位置取检测与预测平均, 尺寸保持轨) → 框不漂到手肘
+            #   位置突变>2.0手宽(跳飞误检)也走半跟随(不硬维持, 避免长期不吸收漂移)
             _kfp = hand_tracks[best_i][0].kf.statePre.flatten()
             _mcd = ((dh[0]+dh[2])/2 - _kfp[0])**2 + ((dh[1]+dh[3])/2 - _kfp[1])**2
-            if _mcd > (max(_tw_h, _nw_h, 20.0) * 2.0) ** 2:
+            _ww2 = max(_tw_h, _nw_h, 20.0)
+            _elbow_box = ((_nw_h*_nh_h) > max(20.0, _tw_h*_th_h)*1.5) and _mcd > (_ww2*0.8)**2
+            if _elbow_box or _mcd > (_ww2*2.0)**2:
                 hand_tracks[best_i][0].lost = 0
-                hand_tracks[best_i][0].disp_bbox = hand_tracks[best_i][0].bbox
+                _cx2 = ((dh[0]+dh[2])/2 + _kfp[0]) * 0.5
+                _cy2 = ((dh[1]+dh[3])/2 + _kfp[1]) * 0.5
+                _clx = _cx2 - _tw_h*0.5; _cly = _cy2 - _th_h*0.5
+                _crx = _cx2 + _tw_h*0.5; _cry = _cy2 + _th_h*0.5
+                hand_tracks[best_i][0].update((_clx, _cly, _crx, _cry))
             else:
                 hand_tracks[best_i][0].update(dh)
         h_matched_ids.add(hand_tracks[best_i][1]); h_matched_det.add(j)
