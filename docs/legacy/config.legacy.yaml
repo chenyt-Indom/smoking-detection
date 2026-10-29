@@ -1,0 +1,50 @@
+cameras:
+- id: cam_01
+  name: 'USB摄像头 #0'
+  source: 0
+  enabled: true
+- id: cam_02
+  name: 'USB摄像头 #1'
+  source: 1
+  enabled: false
+- id: usb_0
+  name: 'USB摄像头 #0'
+  source: 0
+  enabled: false
+- id: usb_1
+  name: 'USB摄像头 #1'
+  source: 1
+  enabled: true
+model:
+  person_model: models/yolov8n.onnx
+  smoking_model: models/smoking.onnx
+  pose_model: models/yolov8n-pose.onnx
+  confidence_threshold: 0.50  # 提高门槛防误检 (屋顶/墙角误识别人)
+  iou_threshold: 0.5
+performance:
+  inference_interval: 1
+  display_interval: 1
+  max_queue_size: 3
+  display_fps: true
+  display_width: 960
+  display_height: 540
+  warmup_frames: 10
+decision:
+  confirm_frames: 1
+  confirm_window_seconds: 0.5
+  cooldown_seconds: 3
+alert:
+  save_screenshot: true
+  screenshot_dir: alerts
+logging:
+  level: INFO
+  file: logs/app.log
+  max_size_mb: 20
+ui:
+  title: AI 抽烟检测系统 - 安防智能体
+  window_size:
+  - 1280
+  - 720
+  refresh_interval_ms: 16
+  alert_history_max: 100
+  primary_color: '#1E5AA8'

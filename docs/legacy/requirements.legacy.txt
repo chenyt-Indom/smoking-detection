@@ -1,0 +1,24 @@
+# ============================================================
+# AI 抽烟检测系统 - 依赖清单
+# 完全本地推理，零网络依赖
+# ============================================================
+
+# 核心依赖
+opencv-python>=4.8
+numpy>=1.24
+pyyaml>=6.0
+pillow>=10.0
+
+# ONNX 推理（CPU 版本，默认安装）
+onnxruntime>=1.19
+
+# ONNX GPU 加速（Windows 选装其一）
+# onnxruntime-directml>=1.19    # DirectML - 支持所有 GPU (NVIDIA/AMD/Intel)
+# onnxruntime-gpu>=1.19         # CUDA - 仅 NVIDIA GPU
+
+# 模型训练（仅在首次准备模型时需要）
+ultralytics>=8.0
+# roboflow>=1.0                 # 从 Roboflow 下载数据集时使用
+
+# 打包
+# pyinstaller>=6.0
