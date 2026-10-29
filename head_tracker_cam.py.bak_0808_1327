@@ -1,0 +1,272 @@
+"""
+V7-Head + V14-Smoke — 全屏香烟检测
+V7: 头部检测 (绿色框) | V14: 全屏香烟 (红色框)
+"""
+import cv2, numpy as np, time
+from ultralytics import YOLO
+
+HEAD = YOLO(r"D:\视觉安防系统\models\yolov8n_head_v7.pt", task='detect')
+SMOKE = YOLO(r"D:\视觉安防系统\models\smoke_cig_v22.pt", task='detect')
+HEAD.to('cuda'); SMOKE.to('cuda')
+print("✅ V7-Head + V22-Smoke | 头绿框 | 烟红框(全屏) | Q退出")
+
+cap = cv2.VideoCapture(0)
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+W, H = int(cap.get(3)), int(cap.get(4))
+
+GREEN = (0, 255, 100); RED = (0, 0, 255)
+fc = 0; t0 = time.time()
+
+class KalmanBox:
+    def __init__(self, bbox):
+        self.kf = cv2.KalmanFilter(6, 4)
+        self.kf.transitionMatrix = np.array([[1,0,0,0,1,0],[0,1,0,0,0,1],[0,0,1,0,0,0],[0,0,0,1,0,0],[0,0,0,0,1,0],[0,0,0,0,0,1]], np.float32)
+        self.kf.measurementMatrix = np.eye(4, 6, dtype=np.float32)
+        self.kf.processNoiseCov = np.eye(6, dtype=np.float32) * 0.05
+        self.kf.measurementNoiseCov = np.eye(4, dtype=np.float32) * 0.1
+        self.kf.errorCovPost = np.eye(6, dtype=np.float32)
+        cx = (bbox[0] + bbox[2]) / 2; cy = (bbox[1] + bbox[3]) / 2
+        w = bbox[2] - bbox[0]; h = bbox[3] - bbox[1]
+        self.kf.statePost = np.array([[cx], [cy], [w], [h], [0], [0]], np.float32)
+        self.bbox = bbox; self.lost = 0; self.confirmed = 0
+    def predict(self):
+        p = self.kf.predict().flatten()
+        self.bbox = (float(p[0]-p[2]/2), float(p[1]-p[3]/2), float(p[0]+p[2]/2), float(p[1]+p[3]/2))
+        return self.bbox
+    def update(self, bbox):
+        cx = (bbox[0] + bbox[2]) / 2; cy = (bbox[1] + bbox[3]) / 2
+        w = bbox[2] - bbox[0]; h = bbox[3] - bbox[1]
+        self.kf.correct(np.array([[cx], [cy], [w], [h]], np.float32)); self.lost = 0
+        self.confirmed += 1
+        p = self.kf.statePost.flatten()
+        self.bbox = (float(p[0]-p[2]/2), float(p[1]-p[3]/2), float(p[0]+p[2]/2), float(p[1]+p[3]/2))
+
+def iou(a, b):
+    ix1 = max(a[0], b[0]); iy1 = max(a[1], b[1]); ix2 = min(a[2], b[2]); iy2 = min(a[3], b[3])
+    iw = max(0, ix2-ix1); ih = max(0, iy2-iy1)
+    aa = (a[2]-a[0])*(a[3]-a[1]); bb = (b[2]-b[0])*(b[3]-b[1])
+    return iw*ih/(aa+bb-iw*ih+1e-6)
+
+tracks = []; smoke_tracks = []; next_id = 0
+
+while True:
+    ret, frame = cap.read()
+    if not ret or frame is None:
+        print('[重连] 摄像头断帧, 尝试重连...')
+        cap.release()
+        ok = False
+        for attempt in range(10):
+            time.sleep(1)
+            cap = cv2.VideoCapture(0)
+            cap.set(cv2.CAP_PROP_FRAME_WIDTH, 1280)
+            cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 720)
+            ret, frame = cap.read()
+            if ret and frame is not None and frame.size > 0:
+                ok = True; break
+        if not ok:
+            print('[重连] 失败, 退出'); break
+
+    for t in tracks: t[0].predict()
+    for st in smoke_tracks: st[0].predict()
+
+    # --- V7 头检测 (低阈值, 远距小头也检出) ---
+    res = HEAD(frame, conf=0.3, iou=0.5, verbose=False)
+    det_heads = []
+    for r in res:
+        for box in r.boxes:
+            b = box.xyxy[0].cpu().numpy()
+            x1, y1, x2, y2 = float(b[0]), float(b[1]), float(b[2]), float(b[3])
+            bw, bh = x2-x1, y2-y1
+            if bw < 30 or bh < 30: continue
+            ar = bw/bh if bh > 0 else 0
+            if ar < 0.6 or ar > 1.5: continue
+            if y2 > H * 0.85: continue
+            det_heads.append((x1, y1, x2, y2))
+
+    matched_ids = set(); matched_det = set()
+    for j, dh in enumerate(det_heads):
+        best_i, best_iou = -1, 0.15
+        for i, t in enumerate(tracks):
+            if t[1] in matched_ids: continue
+            iou_val = iou(t[0].bbox, dh)
+            if iou_val < 0.15:
+                kf = t[0].kf; ps = kf.statePre.flatten()
+                pb = (ps[0]-ps[2]/2, ps[1]-ps[3]/2, ps[0]+ps[2]/2, ps[1]+ps[3]/2)
+                iou_val = iou(pb, dh)
+            if iou_val > best_iou: best_iou = iou_val; best_i = i
+        if best_i >= 0:
+            tracks[best_i][0].update(dh); matched_ids.add(tracks[best_i][1]); matched_det.add(j)
+    for t in tracks:
+        if t[1] not in matched_ids: t[0].lost += 1
+    for j, dh in enumerate(det_heads):
+        if j not in matched_det and len(tracks) < 20:
+            tracks.append([KalmanBox(dh), next_id]); next_id += 1
+    tracks = [t for t in tracks if t[0].lost < 5]
+
+    # --- V18 全屏烟检 + 智能过滤(距离机制) ---
+    raw_smoke = []
+    head_list = [(t[0].bbox, t[0].bbox[2]-t[0].bbox[0]) for t in tracks
+                 if (t[0].bbox[2]-t[0].bbox[0]) > 0 and (t[0].bbox[3]-t[0].bbox[1]) > 0]
+    sr = SMOKE(frame, conf=0.08, iou=0.45, verbose=False)
+    for r in sr:
+        for box in r.boxes:
+            conf = float(box.conf[0])
+            x1, y1, x2, y2 = box.xyxy[0].cpu().numpy()
+            w, h = x2 - x1, y2 - y1
+            if min(w, h) < 3: continue
+            area_ratio = (w * h) / (W * H)
+            aspect = max(w, h) / min(w, h)
+            cx, cy = (x1 + x2) / 2, (y1 + y2) / 2
+
+            # ===== 距离机制: 头框宽 → 距离分级 → 阈值 + 尺寸一致性校验 =====
+            nearest_hw = None
+            best_d2 = 1e18
+            for hb, hw0 in head_list:
+                hcx, hcy = (hb[0]+hb[2])/2, (hb[1]+hb[3])/2
+                d2 = (cx-hcx)**2 + (cy-hcy)**2
+                if d2 < best_d2:
+                    best_d2 = d2; nearest_hw = hw0
+            if nearest_hw is not None:
+                hw = nearest_hw
+                # 距离分级阈值(灵敏度优先, 靠距离校验兜底)
+                if hw >= 150: dt = 0.30    # 近(<1m): 竖直/圆头烟也检出
+                elif hw >= 60: dt = 0.22   # 中(1-3m)
+                else: dt = 0.20            # 远(>3m)
+                if conf < dt: continue
+                # 尺寸一致性: 烟像素宽≈头宽×0.05(±余量); 胳膊/烟盒/手机≈0.25-0.40被拒
+                if hw < 60:                       # 远距严格校验
+                    if w > hw * 0.12: continue     # 框宽>烟应有宽度2.4倍 → 胳膊/烟盒/手机
+                    if w < hw * 0.01: continue     # 远距太窄 → 噪点
+                elif hw < 150:                    # 中距: 放宽(手持烟框含手指)
+                    if w > hw * 0.22: continue     # 超0.22 → 胳膊/烟盒
+            else:
+                if conf < 0.40: continue           # 无头部检出 → 极保守
+
+            # 形状: 细长条(圆头/竖直需 conf≥0.30 例外); 极细长/大面积排除
+            if conf < 0.30 and aspect < 1.3: continue  # 低置信须细长, 圆头/竖直需≥0.30
+            if aspect > 6.0: continue                   # 极细长(窗帘褶/线)
+            if area_ratio > 0.08: continue              # 大面积(整只手/物体)
+
+            # 颜色过滤: 烟纸特征 vs 肤色占比分档判定
+            xi1, yi1 = max(0, int(x1)), max(0, int(y1))
+            xi2, yi2 = min(W, int(x2)), min(H, int(y2))
+            if xi2 - xi1 < 4 or yi2 - yi1 < 4: continue
+            crop = frame[yi1:yi2, xi1:xi2]
+            hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+            pix = max(1, crop.shape[0] * crop.shape[1])
+            skin = np.sum(cv2.inRange(hsv, (0,25,50), (45,180,255)) > 0) / pix
+            pure_white = np.sum(cv2.inRange(hsv, (0,0,200), (180,25,255)) > 0) / pix
+            saturated = np.sum(cv2.inRange(hsv, (0,60,60), (180,255,255)) > 0) / pix
+            paper = np.sum(cv2.inRange(hsv, (0,0,150), (180,40,255)) > 0) / pix
+            bright_high = np.sum(cv2.inRange(hsv, (0,0,220), (180,255,255)) > 0) / pix
+            if pure_white > 0.85: continue        # 整框纯白(白笔/管子/纸卷) → 丢
+            if saturated > 0.50: continue         # 大半鲜艳色(绿窗帘/彩物) → 丢
+            if bright_high > 0.45: continue       # 高亮均匀面>45%(手机屏幕/亮面反光) → 丢
+            glint = np.sum(cv2.inRange(hsv, (0,0,235), (180,60,255)) > 0) / pix
+            if glint > 0.08 and area_ratio > 0.01: continue  # 金属/边框高反光(手机侧面) → 丢
+
+            if area_ratio < 0.01:
+                # 远距离小目标: 手指含背景肤色占比仍>20%, 烟纸白肤色<10%
+                if skin > 0.20: continue
+            else:
+                # 近距离: 肤色主导=手指(绷直/弯曲); 手持烟肤色通常<50%
+                if skin > 0.80: continue
+                if skin > 0.50 and paper < skin * 0.5: continue
+
+            # 头框重叠: 中心在头框内的小框 = 脸上特征(鼻/嘴) 排除
+            in_face = False
+            for t in tracks:
+                hx1, hy1, hx2, hy2 = t[0].bbox
+                h_area = (hx2 - hx1) * (hy2 - hy1)
+                if h_area <= 0: continue
+                # 重叠面积
+                ix1 = max(x1, hx1); iy1 = max(y1, hy1)
+                ix2 = min(x2, hx2); iy2 = min(y2, hy2)
+                inter = max(0, ix2-ix1) * max(0, iy2-iy1)
+                # 情况A: 检测框几乎覆盖头框(>50%) = 整个头被当烟 → 丢
+                if inter / h_area > 0.5:
+                    in_face = True; break
+                # 情况B: 中心在头框内的极小框(<5%) = 脸上特征(鼻/嘴) → 丢
+                if hx1 <= cx <= hx2 and hy1 <= cy <= hy2:
+                    if (w * h) / h_area < 0.05:
+                        in_face = True; break
+            if in_face: continue
+            # 兜底: 无头框时, 大而圆的检测框(占画面3%+ 且 近圆形) = 头/大圆物 → 丢
+            if area_ratio > 0.03 and aspect < 1.5:
+                continue
+
+            raw_smoke.append((float(x1), float(y1), float(x2), float(y2)))
+
+    # 合并重叠检测框: 同一烟分裂的框合成一个(iou或中心近都合并)
+    merged = []
+    for sb in sorted(raw_smoke, key=lambda b: -(b[2]-b[0])*(b[3]-b[1])):
+        dup = False
+        scx, scy = (sb[0]+sb[2])/2, (sb[1]+sb[3])/2
+        for mb in merged:
+            if iou(sb, mb) > 0.3:
+                dup = True; break
+            mcx, mcy = (mb[0]+mb[2])/2, (mb[1]+mb[3])/2
+            if ((scx-mcx)**2 + (scy-mcy)**2) ** 0.5 < 40:
+                dup = True; break
+        if not dup:
+            merged.append(sb)
+    raw_smoke = merged
+
+    sm_matched = set(); sm_det = set()
+    for j, sb in enumerate(raw_smoke):
+        best_i, best_score = -1, 0.0
+        scx, scy = (sb[0]+sb[2])/2, (sb[1]+sb[3])/2
+        for i, st in enumerate(smoke_tracks):
+            if st[1] in sm_matched: continue
+            tb = st[0].bbox
+            tcx, tcy = (tb[0]+tb[2])/2, (tb[1]+tb[3])/2
+            iou_val = iou(tb, sb)
+            dist = ((scx-tcx)**2 + (scy-tcy)**2) ** 0.5
+            # 综合评分: IoU优先; 移动快时IoU低但中心近 → 距离补偿(120px)
+            score = iou_val
+            if iou_val < 0.15 and dist < 120:
+                score = 0.15 + 0.15 * (1 - dist / 120)
+            if score > best_score:
+                best_score = score; best_i = i
+        if best_i >= 0 and best_score >= 0.15:
+            smoke_tracks[best_i][0].update(sb); sm_matched.add(smoke_tracks[best_i][1]); sm_det.add(j)
+    for st in smoke_tracks:
+        if st[1] not in sm_matched: st[0].lost += 1
+    for j, sb in enumerate(raw_smoke):
+        if j not in sm_det and len(smoke_tracks) < 6:
+            smoke_tracks.append([KalmanBox(sb), next_id + 5000]); next_id += 1
+    for st in smoke_tracks:
+        # 漂移抑制: 预测框出画面直接淘汰
+        bx1, by1, bx2, by2 = st[0].bbox
+        if bx2 < 0 or by2 < 0 or bx1 > W or by1 > H:
+            st[0].lost = 99
+    # 未确认轨道(噪声)快速清除: confirmed<2 的5帧即清; 稳定轨道15帧
+    smoke_tracks = [st for st in smoke_tracks
+                    if st[0].lost < (15 if st[0].confirmed >= 2 else 5)]
+
+    # --- 绘制 ---
+    for t in tracks:
+        x1, y1, x2, y2 = map(int, t[0].bbox)
+        cv2.rectangle(frame, (x1,y1), (x2,y2), GREEN, 2)
+        lb = f"#{t[1]}"
+        (tw,th),_ = cv2.getTextSize(lb, cv2.FONT_HERSHEY_SIMPLEX, 0.35, 1)
+        cv2.rectangle(frame, (x1,y1-14), (x1+tw+4,y1), GREEN, -1)
+        cv2.putText(frame, lb, (x1+2,y1-3), cv2.FONT_HERSHEY_SIMPLEX, 0.35, (0,0,0), 1)
+
+    for st in smoke_tracks:
+        # 远距小框(面积<1%)第2帧起显示(1帧确认杀偶发, 移动烟快速恢复显示)
+        sw, sh = st[0].bbox[2]-st[0].bbox[0], st[0].bbox[3]-st[0].bbox[1]
+        if (sw*sh)/(W*H) < 0.01 and st[0].confirmed < 1:
+            continue
+        sx1, sy1, sx2, sy2 = map(int, st[0].bbox)
+        cv2.rectangle(frame, (sx1,sy1), (sx2,sy2), RED, 3)
+        cv2.putText(frame, "CIG", (sx1, sy2+18), cv2.FONT_HERSHEY_SIMPLEX, 0.45, RED, 2)
+
+    cv2.putText(frame, f"V14-Smoke | {len(tracks)} heads | {len(smoke_tracks)} cigs | {fc/max(1,time.time()-t0):.0f}fps",
+                (4,18), cv2.FONT_HERSHEY_SIMPLEX, 0.5, GREEN, 2)
+    cv2.imshow("Head + Smoke Detection", frame)
+    fc += 1
+    if cv2.waitKey(1) & 0xFF == ord('q'): break
+
+cap.release(); cv2.destroyAllWindows()
