@@ -112,7 +112,10 @@ def render(run: Path, rows: list[dict], epochs_total: int | None) -> str:
         rec = g(r, "metrics/recall(B)", default=0.0)
         m50 = g(r, "metrics/mAP50(B)", default=0.0)
         m95 = g(r, "metrics/mAP50-95(B)", default=0.0)
-        t = g(r, "time", default=0.0)
+        t_cum = g(r, "time", default=0.0) or 0.0
+        # ⚠️ results.csv 的 time 是**累计**秒数，不是本轮耗时。
+        # 之前直接拿它当每轮时间，ETA 算出 43 小时（错的）。这里用相邻两行差分。
+        t = t_cum - (g(rows[i - 1], "time", default=0.0) or 0.0) if i else t_cum
         maps.append(m95)
         if m95 > best_map:
             best_map, best_ep, best_row = m95, ep, r
@@ -130,7 +133,9 @@ def render(run: Path, rows: list[dict], epochs_total: int | None) -> str:
     # 底部统计
     done = len(rows)
     out.append("  " + "-" * 88)
-    avg_t = sum(g(r, "time", default=0.0) or 0 for r in rows) / max(done, 1)
+    cum = [g(r, "time", default=0.0) or 0.0 for r in rows]
+    deltas = [cum[i] - cum[i - 1] for i in range(1, len(cum)) if cum[i] > cum[i - 1]]
+    avg_t = (sum(deltas) / len(deltas)) if deltas else (cum[-1] / max(done, 1))
     eta = (total - done) * avg_t
     pct = done / max(total, 1) * 100
     out.append(f"  进度 {done}/{total}（{pct:.0f}%）  平均 {avg_t:.1f}s/轮  ETA {fmt_eta(eta)}")

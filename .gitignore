@@ -28,3 +28,4 @@ config/local.yaml
 *.bak
 *.bak_*
 training_data/
+backups/
