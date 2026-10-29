@@ -1,0 +1,10 @@
+# 时序判别的现场阈值（改这里，不要改代码）
+min_duration: 1.5
+area_growth_steam: 0.55
+area_growth_smoke: 0.25
+edge_drop_steam: -0.35
+gray_drop_smoke: -0.8
+short_life: 8.0
+long_life: 25.0
+conf_smoke: 0.55
+conf_steam: 0.55

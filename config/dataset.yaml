@@ -1,0 +1,12 @@
+# 火情/烟雾 检测数据集（YOLO 格式）
+# 3 类：fire / smoke / steam（steam 是显式负类，用来把水雾和烟分开）
+
+path: ../data/fire_smoke
+train: images/train
+val: images/val
+test: images/test
+
+names:
+  0: fire
+  1: smoke
+  2: steam

@@ -1,0 +1,21 @@
+# YOLO26l 起步配置（12GB 显存实测安全档）
+# 用法：python scripts/train.py --cfg config/train_l.yaml
+
+model: yolo26l.pt
+data: config/dataset.yaml
+epochs: 120
+imgsz: 640
+batch: 16            # 26x 改 4~8 并开 amp
+device: 0
+workers: 8
+amp: true
+patience: 30
+seed: 0
+
+# 小目标（早期烟点/远距火焰）：mosaic 保留，但关闭末期增强避免过拟合
+mosaic: 1.0
+close_mosaic: 15
+copy_paste: 0.1
+
+# 类别不平衡：火多烟少时靠它补偿（按实际统计改）
+# cls: 0.7
