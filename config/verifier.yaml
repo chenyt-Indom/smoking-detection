@@ -1,0 +1,25 @@
+# VLM 二次复核（DeepSeek V4.1 Flash）—— 全部可调，改这里不改代码
+enabled: true
+model: deepseek-flash                 # 注意：不是 "V4 Flash"，API 只认 deepseek-flash / deepseek-v4-pro
+url: https://api.deepseek.com/chat/completions
+api_key_env: DEEPSEEK_KEY
+
+# 生成参数（实测：不开 disabled 的话思维链会把输出预算吃光，content 返回空）
+thinking: disabled
+temperature: 0.1
+max_tokens: 300
+timeout_s: 15
+
+# 送审条件
+min_duration_s: 6.0                   # 轨迹持续不足 6 秒不送审（省调用、滤抖动）
+min_conf: 0.35                        # 检测置信度低于此不送审
+frames: 3                             # 送几帧（时间序列拼图，不要单帧）
+frame_gap_s: 5.0                      # 帧间隔
+hourly_limit: 200                     # 每小时最多调用次数，超了自动降级本地规则
+dedup_seconds: 120                    # 同一目标 2 分钟内只复核一次
+
+# 允许的标签（强制枚举，防止模型自创类别）
+labels: [fire, smoke, steam, light, other, uncertain]
+
+# 判定阈值：低于该置信度一律视为 uncertain（宁可不下结论）
+accept_conf: 0.6
