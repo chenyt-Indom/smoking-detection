@@ -23,3 +23,8 @@ alerts/
 *.log
 .env
 config/local.yaml
+
+# ---- 误入库的备份与训练数据（清理用）----
+*.bak
+*.bak_*
+training_data/

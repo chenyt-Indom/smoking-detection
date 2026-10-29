@@ -1,9 +1,0 @@
-# Head Detection Dataset (CrowdHuman)
-# 头部检测 - 单类别: head (class 0)
-path: D:/视觉安防系统/training_data/datasets/head
-train: train/images
-val: val/images
-
-nc: 1
-names:
-  0: head

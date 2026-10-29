@@ -1,7 +1,0 @@
-# Person Detection Config (CrowdHuman body annotations)
-path: D:/视觉安防系统/training_data/datasets/person
-train: train/images
-val: val/images
-names:
-  0: person
-nc: 1
