@@ -42,6 +42,7 @@ def parse() -> argparse.Namespace:
     ap.add_argument("--fraction", type=float, default=1.0, help="只用部分训练数据（标定/试跑用）")
     ap.add_argument("--close-mosaic", type=int, default=10, help="最后 N 轮关闭 mosaic")
     ap.add_argument("--resume", action="store_true")
+    ap.add_argument("--resume-path", default="", help="从指定 last.pt 续训（训练中断后用这个）")
     ap.add_argument("--dry-run", action="store_true")
     return ap.parse_args()
 
@@ -62,7 +63,16 @@ def main() -> int:
 
     from ultralytics import YOLO
 
-    model = YOLO(a.model)
+    # 续训：checkpoint 里带着优化器状态和 epoch 计数，必须用它自己的权重当 model
+    if a.resume_path:
+        ckpt = Path(a.resume_path)
+        if not ckpt.exists():
+            print(f"[x] 找不到续训权重：{ckpt}")
+            return 1
+        print(f"  续训   {ckpt}", flush=True)
+        model = YOLO(str(ckpt))
+    else:
+        model = YOLO(a.model)
     if a.dry_run:
         print("[dry-run] 权重加载成功，不训练")
         return 0
@@ -77,7 +87,7 @@ def main() -> int:
         project=a.project,
         name=a.name,
         exist_ok=True,
-        resume=a.resume,
+        resume=a.resume or bool(a.resume_path),
         multi_scale=a.multi_scale,
         fraction=a.fraction,
         # 小目标靠 mosaic 提高出现频率，末期关掉回归真实分布
