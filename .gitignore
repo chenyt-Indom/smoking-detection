@@ -29,3 +29,8 @@ config/local.yaml
 *.bak_*
 training_data/
 backups/
+
+# ---- 训练产出物：参数/指标/曲线/最优权重入库，训练集不入库 ----
+# （training_artifacts 里只有单份 best.pt，约 5MB，直接走普通 git，不上 LFS）
+!training_artifacts/**/*.pt
+!training_artifacts/**/*.json

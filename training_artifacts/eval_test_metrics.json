@@ -1,0 +1,13 @@
+{
+  "weights": "runs/fire_smoke_26n/weights/best.pt",
+  "split": "test",
+  "imgsz": 640,
+  "mAP50": 0.6064,
+  "mAP50-95": 0.3375,
+  "precision": 0.6913,
+  "recall": 0.573,
+  "per_class": {
+    "fire": 0.6078,
+    "smoke": 0.6049
+  }
+}

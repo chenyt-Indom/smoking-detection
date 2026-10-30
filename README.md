@@ -44,6 +44,9 @@
 
 **速度**：10.4 ms/张（约 96 FPS，含预处理与后处理，RTX 5070 Ti Laptop）
 
+> 训练参数、逐轮指标、曲线、混淆矩阵与**最优权重**见 [`training_artifacts/`](training_artifacts/README.md)。
+> 训练集（37,818 张 / 约 14 GB）不入库，只保留规模与切分口径。
+
 对比上一版（4,000 张）：mAP50 0.606 → 0.765，提升 **+15.9 点**；同模型未换，只加数据。
 
 已知短板：无 `steam` 负类（蒸汽会误报）、小目标（<0.25% 画面）占 28% 召回偏低、
@@ -65,6 +68,9 @@ config/
 scripts/
   test_sources.py     采集层自测（11 项，合成数据）
   test_temporal.py    时序判别自测（5 项，合成轨迹）
+  test_v3_effect.py   交付模型实跑：test 抽样预测 + 非火视频误报抽测
+training_artifacts/   训练产出物（参数/指标/曲线/最优权重；训练集不入库）
+  README.md           产出清单、指标口径、关键超参、已知短板
 docs/
   ARCHITECTURE.md     五级流水线、双模采集、评估规范、里程碑
 ```
