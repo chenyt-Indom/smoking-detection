@@ -49,6 +49,10 @@ import numpy as np
 
 # ---- 火焰色掩码参数 ----
 FLAME_MIN_AREA_PCT = 0.005    # 火焰候选连通域最小面积（占画面 %），只用于「建议补框」
+MIN_JUDGE_PCT = 0.5           # 框小于画面这个比例就不做「框内无火」判定
+                              # 实测（2026-10-30）：自采的打火机/小火堆样本，框占画面仅
+                              # 0.06%~1.35%、火像素 0~35 个，硬判会把这些正确标注全删掉。
+                              # 宁可漏判小框，也不能误删小目标火的正样本。
 
 # ---- 判定阈值：会被 thresholds.json 覆盖 ----
 DEFAULTS = {
@@ -61,11 +65,14 @@ DEFAULTS = {
 
 # 分位标定：flag 掉最差的一小撮。均带 floor，避免分布有质量堆积时算出退化阈值
 CALIB = {
-    "low_inside": ("p10", 0.02),        # P10 与 2% 取大者
+    # low_inside 是**绝对判据**：框内火焰像素不到 1% 基本等于框里没火，不按分位标定。
+    # 曾经按 P10 标成 0.0744，把「框里有 7% 火焰」的正常框也判成框错，实测误删小目标火标注。
+    "low_inside": ("fixed", 0.01),
     "high_tight": ("p90", 2.0),         # P90 与 2.0 取大者
     "high_uncover": ("p90", 20.0),
     "min_uncover_pct": ("p85", 4.0),
 }
+LOW_INSIDE_MAX_RATE = 0.25   # 固定阈值下命中率超过这个比例，说明掩码在本数据集失效，改回 P5 兜底
 
 
 def imread_u(p: Path) -> np.ndarray | None:
@@ -78,17 +85,26 @@ def imwrite_u(p: Path, img: np.ndarray, q: int = 90) -> None:
     buf.tofile(str(p))
 
 
-def flame_mask(bgr: np.ndarray) -> np.ndarray:
-    """火焰色掩码：橙红高饱和 + 高亮白心。"""
+def flame_mask(bgr: np.ndarray, relaxed: bool = False) -> np.ndarray:
+    """火焰色掩码：橙红高饱和 + 高亮白心。只用 3x3 闭运算补小孔，不做开运算。
+
+    两档灵敏度，分别服务两个不同的问题：
+      relaxed=True  「这个框里到底有没有火」—— 宁可多算，漏判会把正确标注误删。
+                    实测把 s/v 门槛从 110/140 降到 90/110，暗场景小火苗的识别率从 0% 提到 44%。
+      relaxed=False 「火到底有多大」—— 必须准，否则棕色土壤/木头混进来会把
+                    火区外接框撑大、让「框太松」判不出来。
+    """
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     h, s, v = cv2.split(hsv)
-    orange = (((h <= 28) | (h >= 165)) & (s >= 110) & (v >= 140))
-    core = ((v >= 235) & (s <= 70))                       # 火焰白心
-    m = ((orange | core).astype(np.uint8)) * 255
-    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
-    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
-    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k)
-    return m
+    if relaxed:
+        warm = (((h <= 35) | (h >= 165)) & (s >= 90) & (v >= 110))
+        core = ((v >= 215) & (s <= 90))
+    else:
+        warm = (((h <= 28) | (h >= 165)) & (s >= 110) & (v >= 140))
+        core = ((v >= 235) & (s <= 70))                   # 火焰白心
+    m = ((warm | core).astype(np.uint8)) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    return cv2.morphologyEx(m, cv2.MORPH_CLOSE, k)
 
 
 def regions(mask: np.ndarray, min_area: float) -> list[tuple[int, int, int, int]]:
@@ -122,7 +138,8 @@ def analyze(img_path: Path, want_vis: bool = False) -> dict | None:
     if not fire:
         return None
 
-    mask = flame_mask(img)
+    mask = flame_mask(img)                  # 严格：算火有多大
+    mask_r = flame_mask(img, relaxed=True)  # 高灵敏：只用来判断框里有没有火
 
     boxes = []
     for cx, cy, bw, bh in fire:
@@ -141,12 +158,15 @@ def analyze(img_path: Path, want_vis: bool = False) -> dict | None:
     for x1, y1, x2, y2 in boxes:
         sub = mask[y1:y2, x1:x2]
         area = float((x2 - x1) * (y2 - y1))
-        n = float(np.count_nonzero(sub))
+        n_r = float(np.count_nonzero(mask_r[y1:y2, x1:x2]))   # 高灵敏计数
+        n = float(np.count_nonzero(sub))                      # 严格计数
+        judgeable = (area / total * 100) >= MIN_JUDGE_PCT
         tight = 0.0
-        if n >= min_px:
+        if n >= min_px and judgeable:
             ys, xs = np.nonzero(sub)
             tight = area / max(float((xs.max() - xs.min() + 1) * (ys.max() - ys.min() + 1)), 1.0)
-        stats.append({"box": (x1, y1, x2, y2), "inside": n / area, "tight": tight})
+        stats.append({"box": (x1, y1, x2, y2), "inside": n_r / area,
+                      "tight": tight, "judgeable": judgeable})
 
     # ---- 整图：covered / uncovered ----
     cover = np.zeros((h, w), np.uint8)
@@ -156,14 +176,16 @@ def analyze(img_path: Path, want_vis: bool = False) -> dict | None:
     flame_total = float(np.count_nonzero(mask))
     uncovered = max(0.0, flame_total - flame_in)
     tights = [s["tight"] for s in stats if s["tight"] > 0]
+    judged = [s["inside"] for s in stats if s["judgeable"]]
 
     m = {
         "image": img_path.name,
         "n_fire": len(boxes),
+        "n_judged": len(judged),
         "box_pct": sum((x2 - x1) * (y2 - y1) for x1, y1, x2, y2 in boxes) / total * 100,
         "flame_pct": flame_total / total * 100,
-        "inside": min(s["inside"] for s in stats),
-        "inside_mean": float(np.mean([s["inside"] for s in stats])),
+        "inside": min(judged) if judged else 1.0,     # 没有可判框 → 视为正常
+        "inside_mean": float(np.mean(judged)) if judged else 1.0,
         "tight": max(tights) if tights else 0.0,
         "uncover": uncovered / max(flame_in, 1.0),
         "uncover_pct": uncovered / total * 100,
@@ -250,7 +272,17 @@ def do_calibrate(base: Path, n: int, seed: int, outdir: Path) -> int:
                  "high_uncover": "uncover", "min_uncover_pct": "uncover_pct"}
     thr = {"src": f"calibrated on {len(rows)} fire imgs ({base.parent.name}/{base.name})"}
     for key, (q, floor) in CALIB.items():
-        thr[key] = round(max(pct(series[metric_of[key]], qmap[q]), floor), 4)
+        arr = series[metric_of[key]]
+        if q == "fixed":
+            rate = sum(1 for v in arr if v < floor) / max(len(arr), 1)
+            if rate > LOW_INSIDE_MAX_RATE:      # 掩码在本数据集太弱，固定阈值会全命中 → 退回 P5
+                thr[key] = round(pct(arr, 5), 4)
+                print(f"[!] 固定阈值 {floor} 命中率 {rate * 100:.0f}% 过高，low_inside 改用 P5")
+            else:
+                thr[key] = floor
+                print(f"    low_inside 固定 {floor}，命中率 {rate * 100:.1f}%")
+        else:
+            thr[key] = round(max(pct(arr, qmap[q]), floor), 4)
     (outdir / "thresholds.json").write_text(json.dumps(thr, indent=2), encoding="utf-8")
     print("-" * 74)
     print(f"阈值 → inside<{thr['low_inside']}   tight>{thr['high_tight']}   "
@@ -277,7 +309,7 @@ def _clip(x: float, lo: float = 0.0, hi: float = 1.0) -> float:
 def judge(m: dict, th: dict) -> list[tuple[str, str]]:
     """返回 [(问题类型, 说明)]。三个判据互相独立，不再重复计同一信号。"""
     issues = []
-    n_wrong = sum(1 for s in m["stats"] if s["inside"] < th["low_inside"])
+    n_wrong = sum(1 for s in m["stats"] if s["judgeable"] and s["inside"] < th["low_inside"])
     if n_wrong:
         issues.append(("疑似框错物体",
                        f"{n_wrong}/{m['n_fire']} 个框内无火（最少 {m['inside'] * 100:.2f}%）"))
@@ -308,9 +340,9 @@ def draw(m: dict, issues: list[tuple[str, str]], th: dict) -> np.ndarray:
     vis = img.copy()
     for s in m["stats"]:
         x1, y1, x2, y2 = s["box"]
-        if s["inside"] < th["low_inside"]:
+        if s["judgeable"] and s["inside"] < th["low_inside"]:
             col = (0, 0, 255)
-        elif s["tight"] > th["high_tight"]:
+        elif s["judgeable"] and s["tight"] > th["high_tight"]:
             col = (0, 215, 255)
         else:
             col = (0, 140, 255)
