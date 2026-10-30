@@ -29,20 +29,25 @@ ROOT = Path(__file__).resolve().parent.parent
 CANDIDATE_ROOTS = [
     ROOT / "runs",                  # 仓库内（续训常常落在这里）
     Path("D:/fire_smoke_train/runs"),  # 纯英文训练目录
+    Path("D:/fire_runs"),           # 火烟 v4 起：输出直接放这里（不带 detect 层级）
 ]
 
 
 def find_latest_run(runs_dir: Path | None = None) -> Path | None:
     roots = [runs_dir] if runs_dir else CANDIDATE_ROOTS
-    best = None
+    best, best_ts = None, -1.0
     for runs in roots:
         if not runs or not runs.exists():
             continue
         for p in runs.iterdir():
+            if not p.is_dir():
+                continue
             f = p / "results.csv"
-            if f.exists():
-                if best is None or f.stat().st_mtime > (best / "results.csv").stat().st_mtime:
-                    best = p
+            # 刚启动、第一轮还没跑完的任务没有 results.csv ——
+            # 只看它的话会一直显示上一版旧训练，所以用目录时间兜底。
+            ts = f.stat().st_mtime if f.exists() else p.stat().st_mtime
+            if ts > best_ts:
+                best, best_ts = p, ts
     return best
 
 
@@ -173,8 +178,9 @@ def main() -> int:
     ap.add_argument("--once", action="store_true")
     a = ap.parse_args()
 
-    runs_root = Path(a.runs_dir) if a.runs_dir else (ROOT / "runs")
-    run = runs_root / a.run if a.run else find_latest_run(runs_root)
+    # 不指定 --runs-dir 时走 CANDIDATE_ROOTS 全量扫描（只给 ROOT/runs 会漏掉 D:/fire_runs 的新训练）
+    runs_root = Path(a.runs_dir) if a.runs_dir else None
+    run = (runs_root / a.run) if (runs_root and a.run) else find_latest_run(runs_root)
     if run is None or not run.exists():
         print(f"[x] 没找到训练目录（runs/ 下没有 results.csv）。先启动训练。")
         return 1
