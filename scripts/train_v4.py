@@ -40,6 +40,7 @@ def parse() -> argparse.Namespace:
     ap.add_argument("--patience", type=int, default=20)
     ap.add_argument("--multi-scale", type=float, default=0.5)
     ap.add_argument("--fraction", type=float, default=1.0, help="只用部分训练数据（标定/试跑用）")
+    ap.add_argument("--close-mosaic", type=int, default=10, help="最后 N 轮关闭 mosaic")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     return ap.parse_args()
@@ -56,7 +57,7 @@ def main() -> int:
     print("=" * 70)
     print("  火情/烟雾 v4 · yolo26s @ 960")
     print(f"  数据   {data}（train {n_train} 张）")
-    print(f"  配置   imgsz {a.imgsz} | batch {a.batch} | epochs {a.epochs} | multi_scale {a.multi_scale}")
+    print(f"  配置   imgsz {a.imgsz} | batch {a.batch} | epochs {a.epochs} | multi_scale {a.multi_scale} | close_mosaic {a.close_mosaic}")
     print("=" * 70, flush=True)
 
     from ultralytics import YOLO
@@ -81,7 +82,7 @@ def main() -> int:
         fraction=a.fraction,
         # 小目标靠 mosaic 提高出现频率，末期关掉回归真实分布
         mosaic=1.0,
-        close_mosaic=20,
+        close_mosaic=a.close_mosaic,
         # 火/烟对亮度、饱和度敏感
         hsv_h=0.015, hsv_s=0.7, hsv_v=0.5,
         degrees=5.0, translate=0.1, scale=0.5, shear=0.0,
