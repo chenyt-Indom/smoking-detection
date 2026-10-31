@@ -575,8 +575,11 @@ def run_scene(name: str, det: Detector, args) -> dict:
     # 显示成"测试失败"。真实火能不能过闸，由 scripts/verify_flicker_gate.py
     # 在 506 张**逐帧连续**的真火视频帧上单独验证。
     gate = name not in ("fire", "fire_smoke")
+    pcfg = {"fast_smoke": bool(args.fast), "flicker_gate": gate}
+    if args.detect:
+        pcfg["detect_mode"] = args.detect
     pipe = Pipeline(stub or det, sliced=bool(args.sliced) and stub is None, tile_grid=2,
-                    cfg={"fast_smoke": bool(args.fast), "flicker_gate": gate}, arbiter=arb)
+                    cfg=pcfg, arbiter=arb)
 
     events: list = []
     trace: list = []
@@ -651,6 +654,8 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--scene", default="all", choices=["all", *SCENES])
     ap.add_argument("--sliced", type=int, default=1, help="1 开切片 0 关")
+    ap.add_argument("--detect", default="", choices=["", "auto", "slice", "full"],
+                    help="检测策略；留空则按 --sliced 走旧行为。auto=粗筛没东西就不切片")
     ap.add_argument("--every", type=int, default=1, help="抽帧间隔")
     ap.add_argument("--imgsz", type=int, default=896)
     ap.add_argument("--n-mul", type=float, default=1.0, help="序列长度倍数（拉长测长期行为）")

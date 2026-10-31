@@ -59,11 +59,11 @@ def build_source(args):
         spec.loader.exec_module(tp)
 
         det = Detector(str(WEIGHTS), conf=0.20, imgsz=args.imgsz, device=0)
-        fp, _, _ = tp.pick_patch(det, cls_id=0, target_pct=0.012, other_cls=1)
-        sp, _, _ = tp.pick_patch(det, cls_id=1, target_pct=0.02, other_cls=0)
+        fire = tp.pick_patch(det, cls_id=0, target_pct=0.012, other_cls=1)
+        smoke = tp.pick_patch(det, cls_id=1, target_pct=0.02, other_cls=0)
         n = int(600 * args.n_mul)
         info = CameraInfo(cam_id="demo_01", kind="fixed", fps=tp.FPS)
-        src = FixedCameraSource(info, frames=tp.gen_smoke(fp, sp, n, with_fire=True),
+        src = FixedCameraSource(info, frames=tp.gen_smoke(fire, smoke, n, with_fire=True),
                                 warmup=tp.WARMUP_FRAMES)
         return src, det, n
 
@@ -97,6 +97,8 @@ def main() -> int:
     ap.add_argument("--every", type=int, default=2, help="抽帧间隔")
     ap.add_argument("--fast", type=int, default=1, help="1=开极快模式")
     ap.add_argument("--sliced", type=int, default=1)
+    ap.add_argument("--detect", default="auto", choices=["auto", "slice", "full"],
+                    help="auto=粗筛没东西就不切片（空白帧 45.9fps / 切片只有 16.3）")
     ap.add_argument("--llm", default="auto", choices=["auto", "off", "dry"],
                     help="auto=按 config/arbiter.yaml；dry=不发请求只验证接线")
     ap.add_argument("--n-mul", type=float, default=1.0)
@@ -130,11 +132,12 @@ def main() -> int:
     url = nf.start()
 
     pipe = Pipeline(det, sliced=bool(args.sliced), tile_grid=2,
-                    cfg={"fast_smoke": bool(args.fast)}, arbiter=arb)
+                    cfg={"fast_smoke": bool(args.fast), "detect_mode": args.detect},
+                    arbiter=arb)
 
     print(f"\n看板已启动：{url}")
     print(f"模型 {WEIGHTS.name}  imgsz={args.imgsz}  every={args.every}  "
-          f"fast_smoke={bool(args.fast)}  LLM={args.llm}")
+          f"detect={args.detect}  fast_smoke={bool(args.fast)}  LLM={args.llm}")
     print("按 Ctrl+C 停止\n" + "-" * 68)
 
     def on_event(ev, res):
