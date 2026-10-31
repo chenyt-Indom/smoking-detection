@@ -41,6 +41,16 @@ def parse() -> argparse.Namespace:
     ap.add_argument("--multi-scale", type=float, default=0.5)
     ap.add_argument("--fraction", type=float, default=1.0, help="只用部分训练数据（标定/试跑用）")
     ap.add_argument("--close-mosaic", type=int, default=10, help="最后 N 轮关闭 mosaic")
+    ap.add_argument("--lr0", type=float, default=0.01,
+                    help="初始学习率。从已有权重微调时建议 0.003~0.005，用默认 0.01 会把原能力冲掉")
+    ap.add_argument("--optimizer", default="auto",
+                    help="优化器。注意 ultralytics 在 optimizer=auto 时会**忽略 lr0**，"
+                         "强制用 MuSGD+SGD 的 lr=0.01（源码里就是这么写的）。"
+                         "微调时务必显式指定，如 --optimizer MuSGD 或 SGD，lr0 才会生效")
+    ap.add_argument("--warmup-bias-lr", type=float, default=0.0,
+                    help="warmup 起始学习率。ultralytics 默认 0.1，那是为从零训练准备的；"
+                         "微调时 0.1 会在第一轮就把预训练权重冲散。"
+                         "optimizer=auto 时它会被强制设为 0，显式指定优化器后必须自己传 0")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--resume-path", default="", help="从指定 last.pt 续训（训练中断后用这个）")
     ap.add_argument("--dry-run", action="store_true")
@@ -55,9 +65,14 @@ def main() -> int:
         return 1
 
     n_train = len(list((data.parent / "train" / "images").glob("*")))
+    if n_train == 0:
+        # 清单式数据集：dataset.yaml 里的 train 指向一个 .txt 而不是目录
+        n_train_s = "清单模式（路径见 dataset.yaml）"
+    else:
+        n_train_s = f"{n_train} 张"
     print("=" * 70)
-    print("  火情/烟雾 v4 · yolo26s @ 960")
-    print(f"  数据   {data}（train {n_train} 张）")
+    print("  火情/烟雾 · yolo26s")
+    print(f"  数据   {data}（train {n_train_s}）")
     print(f"  配置   imgsz {a.imgsz} | batch {a.batch} | epochs {a.epochs} | multi_scale {a.multi_scale} | close_mosaic {a.close_mosaic}")
     print("=" * 70, flush=True)
 
@@ -100,6 +115,12 @@ def main() -> int:
         fliplr=0.5,
         erasing=0.2,
         patience=a.patience,
+        lr0=a.lr0,
+        # optimizer=auto 会让 ultralytics 忽略上面的 lr0（源码硬编码成 0.01），
+        # 微调时必须显式指定优化器，lr0 才真正生效；
+        # 同时还要自己压住 warmup 起点，否则默认 0.1 会在第一轮冲击预训练权重
+        optimizer=a.optimizer,
+        warmup_bias_lr=a.warmup_bias_lr,
         verbose=True,
         seed=0,
         amp=True,

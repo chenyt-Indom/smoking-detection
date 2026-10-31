@@ -79,6 +79,9 @@ def main() -> int:
     ap.add_argument("--n", type=int, default=500, help="test 集取多少张（均匀抽）")
     ap.add_argument("--imgsz", type=int, default=896)
     ap.add_argument("--bg-n", type=int, default=400, help="背景图取多少张量代价")
+    ap.add_argument("--ious", default="",
+                    help="只做 IoU 敏感性诊断，如 0.1,0.2,0.3,0.45,0.5（跳过背景代价段）")
+    ap.add_argument("--cls", default="both", choices=["both", "fire", "smoke"])
     a = ap.parse_args()
 
     from src.infer import Detector
@@ -103,7 +106,7 @@ def main() -> int:
               for d in det.detect(im, sliced=True, tile_grid=2, overlap=0.25)]
         items.append((gts, pl))
 
-    def recall(cls: int, thr: float, lo: float, hi: float) -> tuple[int, int]:
+    def recall(cls: int, thr: float, lo: float, hi: float, iou_thr: float = 0.5) -> tuple[int, int]:
         """返回 (命中, 总数)，只在**同一张图内**匹配。"""
         hit = tot = 0
         for gts, pl in items:
@@ -112,9 +115,37 @@ def main() -> int:
                 if c != cls or not (lo <= ar < hi):
                     continue
                 tot += 1
-                if any(iou(gb, pb) >= 0.5 for _c, pb in cand):
+                if any(iou(gb, pb) >= iou_thr for _c, pb in cand):
                     hit += 1
         return hit, tot
+
+    # ── 诊断模式：IoU 敏感性 ──────────────────────────────
+    # 目的：区分"模型找不到火"还是"找到了但框不准"。
+    # 小目标的 IoU 对定位误差极敏感（20×20 的框偏 3px 就掉到 0.5 以下），
+    # 如果 IoU 0.3 时召回明显高于 0.5，那瓶颈是**定位**不是**检出**，
+    # 该改的是回归损失/输入尺度，而不是继续加训练数据。
+    if a.ious:
+        ious = [float(x) for x in a.ious.split(",")]
+        cls_list = {"fire": (0,), "smoke": (1,)}.get(a.cls, (1, 0))
+        for cls in cls_list:
+            print(f"── {NAMES[cls]}：IoU 敏感性（conf 固定 {THRS[0]}）──────────────")
+            print(f"{'面积档':22s}" + "".join(f"{'IoU' + format(t, '.2f'):>10}" for t in ious))
+            for lo, hi, tag in BUCKETS:
+                n = recall(cls, THRS[0], lo, hi, ious[0])[1]
+                if n == 0:
+                    continue
+                row = f"{tag:22s}"
+                for t in ious:
+                    h_, _ = recall(cls, THRS[0], lo, hi, t)
+                    row += f"{h_ / max(1, n) * 100:9.0f}%"
+                print(row + f"  (n={n})")
+            n = recall(cls, THRS[0], 0.0, 9.9, ious[0])[1]
+            row = f"{'合计':22s}"
+            for t in ious:
+                h_, _ = recall(cls, THRS[0], 0.0, 9.9, t)
+                row += f"{h_ / max(1, n) * 100:9.0f}%"
+            print(row + f"  (n={n})\n")
+        return 0
 
     for cls in (1, 0):
         print(f"── {NAMES[cls]} 分段召回 ─────────────────────────────")
