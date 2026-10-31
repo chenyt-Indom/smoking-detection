@@ -409,6 +409,10 @@ class Pipeline:
         notice 不进 `_fired`（否则正式告警永远升级不上来），但**不**去重的话，
         一团被模型切成 3 段的烟会吐出 3 条 notice —— 实测就是 4 条刷屏。
         所以它用自己的一套记录，和正式告警的冷却互不干扰。
+
+        ⚠️ 返回 True 时**由本函数自己记账**。以前是各调用点自己 append，结果
+        新加的分支忘了写，去重表永远是空的 = 等于没去重（实测一盏灯 8 段轨迹
+        推了 8 张卡片）。记账这事必须和判定绑在一起，不能交给调用方。
         """
         cd = self.cfg["cooldown_sec"]
         g = self.cfg["dedup_grow"]
@@ -428,6 +432,7 @@ class Pipeline:
             self._recent_notices = kept
             return False
         self._recent_notices = kept
+        self._recent_notices.append((ts, tuple(float(v) for v in box)))
         return True
 
     def _make_event(self, kind, level, tid, t, pkt, score, box, reasons) -> Event:
@@ -783,10 +788,16 @@ class Pipeline:
                     self.stats["static_light_blocked"] += 1
                     if t.tid not in self._static_noticed and t.tid not in self._fired:
                         self._static_noticed.add(t.tid)
-                        events.append(self._make_event(
-                            "fire", "notice", t.tid, t, pkt, conf, t.last_box,
-                            ["检出火焰但亮度恒定，疑似灯光/反光，已降级（**不是排除**），"
-                             "已送人工复核"] + list(fv.reasons[:1])))
+                        # 留痕也要按**区域**去重，不能按轨迹 ID。
+                        # 路灯一夜被切成几十段是常态（遮挡/失配/conf 抖都会换 ID），
+                        # 按 ID 记账就是几十张卡片 —— 用户原话"不要多次上报"。
+                        # `_can_notice` 命中同区域会续期，所以"这块地方一直亮着"
+                        # 只有一条；灯真灭了 30 秒之后才允许再提。
+                        if self._can_notice(pkt.ts, t.last_box):
+                            events.append(self._make_event(
+                                "fire", "notice", t.tid, t, pkt, conf, t.last_box,
+                                ["检出火焰但亮度恒定，疑似灯光/反光，已降级（**不是排除**），"
+                                 "已送人工复核"] + list(fv.reasons[:1])))
                         self._defer("fire", t.tid, t, pkt, conf, t.last_box,
                                     ["规则层疑为静态光源，请判断是火还是灯"])
                     continue
@@ -845,7 +856,6 @@ class Pipeline:
                 if (self._notice_streak[t.tid] >= cfg["fast_smoke_confirm"]
                         and t.tid not in self._noticed and self._can_notice(pkt.ts, t.last_box)):
                     self._noticed.add(t.tid)
-                    self._recent_notices.append((pkt.ts, tuple(float(v) for v in t.last_box)))
                     self.stats["notices"] += 1
                     events.append(self._make_event(
                         "smoke", "notice", t.tid, t, pkt, conf, t.last_box,
@@ -864,10 +874,12 @@ class Pipeline:
                 # 所以每条轨迹降级时推一条 notice 到前端，标注判据，让人自己看。
                 if t.tid not in self._steam_noticed and t.tid not in self._fired:
                     self._steam_noticed.add(t.tid)
-                    self.stats["steam_notices"] += 1
-                    events.append(self._make_event(
-                        "smoke", "notice", t.tid, t, pkt, v.score, t.last_box,
-                        ["规则层倾向判为蒸汽/水雾，已降级（不是排除）"] + list(v.reasons[:2])))
+                    # 同静态灯：一个蒸汽口一夜也被切成几十段，按轨迹记账就是刷屏。
+                    if self._can_notice(pkt.ts, t.last_box):
+                        self.stats["steam_notices"] += 1
+                        events.append(self._make_event(
+                            "smoke", "notice", t.tid, t, pkt, v.score, t.last_box,
+                            ["规则层倾向判为蒸汽/水雾，已降级（不是排除）"] + list(v.reasons[:2])))
                     self._defer("smoke", t.tid, t, pkt, v.score, t.last_box,
                                 ["规则层倾向蒸汽，请复核"])
                 continue
