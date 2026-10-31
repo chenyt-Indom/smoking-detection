@@ -57,6 +57,19 @@
   .kind{font-weight:600}
   .meta{color:var(--dim);font-size:12px}
   ul{margin:6px 0 0;padding-left:18px;color:#b8c2cc;font-size:12.5px}
+  /* 人工反馈：误报一键落成硬负样本，回流进训练集治"会闪的假火"
+     （电焊弧光、夕阳在玻璃上跳、红色霓虹 PWM 调光）——这类闪烁闸拦不住 */
+  .act{display:flex;align-items:center;gap:8px;margin-top:9px}
+  .fb{font:inherit;font-size:12px;padding:3px 12px;border-radius:99px;cursor:pointer;
+      background:transparent;border:1px solid var(--line);color:var(--dim);
+      transition:border-color .15s,color .15s}
+  .fb:hover{color:#e6edf3;border-color:#6e7681}
+  .fb.bad:hover{color:var(--alarm);border-color:rgba(248,81,73,.55)}
+  .fb.good:hover{color:var(--cleared);border-color:rgba(63,185,80,.55)}
+  .fb:disabled{cursor:default;opacity:.45}
+  .fb.on-bad{color:var(--alarm);border-color:rgba(248,81,73,.55);opacity:1}
+  .fb.on-good{color:var(--cleared);border-color:rgba(63,185,80,.55);opacity:1}
+  .fbst{color:var(--dim);font-size:11.5px}
   li{margin:2px 0}
   .llm{color:#79c0ff}
   .empty{color:var(--dim);text-align:center;padding:60px 0}
@@ -159,6 +172,11 @@ function render(rec){
         ${llm}
       </div>
       <ul>${reasons}</ul>
+      <div class="act">
+        <button class="fb bad"  data-ms="${esc(rec.wall_ms)}">误报</button>
+        <button class="fb good" data-ms="${esc(rec.wall_ms)}">属实</button>
+        <span class="fbst" id="fb_${esc(rec.wall_ms)}"></span>
+      </div>
     </div>`;
   list.prepend(card);
 
@@ -214,6 +232,36 @@ function redraw(){
   if(!cache.length){ list.innerHTML='<div class="empty">等待事件…</div>'; return; }
   cache.forEach(render);
 }
+
+// ── 人工反馈：误报 → 硬负样本（回流训练集）；属实 → 只记账
+// 为什么值得做：闪烁闸能拦恒亮光源，拦不住**会闪的假火**（电焊弧光、
+// 夕阳在玻璃上跳、红色霓虹 PWM 调光、电视里的火焰画面）。这类只有拿
+// 真实误报帧重训才治得住。点一下 = 一张带空标注的训练样本。
+list.addEventListener('click', async (e)=>{
+  const btn = e.target.closest('.fb');
+  if(!btn) return;
+  const ms  = btn.dataset.ms;
+  const bad = btn.classList.contains('bad');
+  const box = btn.parentElement;
+  const st  = box.querySelector('.fbst');
+  box.querySelectorAll('.fb').forEach(b=>b.disabled=true);
+  st.textContent='提交中…';
+  try{
+    const r = await fetch('/api/report', {
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({wall_ms:Number(ms), verdict: bad?'false_alarm':'true_alarm'}),
+    });
+    const j = await r.json();
+    if(!j.ok){ throw new Error(j.error||'提交失败'); }
+    btn.classList.add(bad?'on-bad':'on-good');
+    st.textContent = bad
+      ? '已记为误报，回流进训练集'
+      : '已确认属实';
+  }catch(err){
+    box.querySelectorAll('.fb').forEach(b=>b.disabled=false);
+    st.textContent = '提交失败：'+err.message;
+  }
+});
 
 // ── SSE：断线自动重连，重连后补发历史，不会漏事件
 // ?nosse=1 → 只拉一次历史不保持长连接（截图/调试用，否则无头浏览器永远等不到加载完成）

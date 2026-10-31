@@ -41,7 +41,8 @@ class Notifier:
     def __init__(self, out_dir: str | os.PathLike = "alerts", *,
                  host: str = "127.0.0.1", port: int = 5050,
                  webhook_url: str = "", max_history: int = 300,
-                 dashboard: str | os.PathLike | None = None):
+                 dashboard: str | os.PathLike | None = None,
+                 report_dir: str | os.PathLike | None = None):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.host, self.port = host, port
@@ -49,6 +50,9 @@ class Notifier:
         self.max_history = max_history
         self.dashboard = Path(dashboard) if dashboard else (
             Path(__file__).resolve().parent.parent / "web" / "dashboard.html")
+        # 人工标注的误报落在这里，等 scripts/merge_hard_negatives.py 回流进训练集
+        self.report_dir = Path(report_dir) if report_dir else (
+            self.out_dir.parent / "hard_negatives")
 
         self._clients: list[queue.Queue] = []
         self._history: list[dict] = []
@@ -113,6 +117,74 @@ class Notifier:
             requests.post(self.webhook_url, json=rec, timeout=5)
         except Exception:                            # noqa: BLE001
             self.stats["errors"] += 1
+
+    # ------------------------------------------------------------ 人工反馈
+    def report(self, body: dict) -> dict:
+        """看板上点「误报」/「属实」→ 落成一条**硬负样本**，等回流进训练集。
+
+        为什么这才是灯光误报的正解
+        --------------------------
+        闪烁闸（物理先验）能拦掉恒亮光源，但它拦不住"会闪的假火"：电焊弧光、
+        夕阳在玻璃上跳动、红色霓虹的 PWM 调光、电视里的火焰画面。这类东西只有
+        拿真实误报帧去训才治得住。灯是开放集合 —— 标完车位灯，下周加个招牌照样报。
+
+        为什么存成**空标注**的图
+        ------------------------
+        YOLO 里一个空 .txt 就是"这张图没有任何目标"，比任何负类标签都干净。
+        截图是检测框外扩 25% 的裁剪（见 snapshot_margin），和切片推理喂进网络的
+        那块区域尺度接近 —— 直接当负样本是合适的。
+
+        为什么要去重
+        ------------
+        同一条告警可能被反复点、或者前端重试。按 wall_ms 定名，重复提交只更新
+        reports.jsonl 里的一行，不会在训练集里塞 50 张一样的图。
+        """
+        verdict = str(body.get("verdict") or "")
+        if verdict not in ("false_alarm", "true_alarm"):
+            return {"ok": False, "error": "verdict 只能是 false_alarm / true_alarm"}
+
+        wid = body.get("wall_ms")
+        with self._lock:
+            rec = next((r for r in reversed(self._history)
+                        if r.get("wall_ms") == wid), None)
+        if rec is None:
+            return {"ok": False, "error": "找不到这条事件（可能已滚出历史，刷新页面重试）"}
+
+        row = {"wall_ms": wid, "wall": rec.get("wall"), "verdict": verdict,
+               "kind": rec.get("kind"), "level": rec.get("level"),
+               "cam": rec.get("cam"), "score": rec.get("score"),
+               "reasons": (rec.get("reasons") or [])[:2],
+               "note": str(body.get("note") or "")[:200],
+               "at": time.strftime("%Y-%m-%d %H:%M:%S")}
+        saved = None
+
+        if verdict == "false_alarm":
+            snap = rec.get("snapshot") or ""
+            src = self.out_dir / unquote(snap[len("/snapshots/"):]) \
+                if snap.startswith("/snapshots/") else None
+            if src is None or not src.is_file():
+                return {"ok": False, "error": "这条事件没有截图，存不了负样本"}
+            img_dir = self.report_dir / "images"
+            lbl_dir = self.report_dir / "labels"
+            img_dir.mkdir(parents=True, exist_ok=True)
+            lbl_dir.mkdir(parents=True, exist_ok=True)
+            stem = f"hn_{wid}_{rec.get('cam')}_{rec.get('kind')}"
+            # 去重：同一 wall_ms 已经存过就不覆盖（人工可能补点 note）
+            if not (img_dir / f"{stem}.jpg").exists():
+                (img_dir / f"{stem}.jpg").write_bytes(src.read_bytes())
+                (lbl_dir / f"{stem}.txt").write_text("", encoding="utf-8")
+            saved = str(img_dir / f"{stem}.jpg")
+            self.stats["hard_negatives"] = self.stats.get("hard_negatives", 0) + 1
+
+        # 反馈流水账：既做留证，也算"人工复核后确认率"
+        try:
+            self.report_dir.mkdir(parents=True, exist_ok=True)
+            row["saved"] = saved
+            with open(self.report_dir / "reports.jsonl", "a", encoding="utf-8") as f:
+                f.write(json.dumps(row, ensure_ascii=False) + "\n")
+        except OSError:
+            self.stats["errors"] += 1
+        return {"ok": True, "verdict": verdict, "saved": saved}
 
     # ------------------------------------------------------------ HTTP
     def start(self) -> str:
@@ -206,6 +278,25 @@ class Notifier:
                     return
 
                 self._send(404, "text/plain", b"not found")
+
+            def do_POST(self):                       # noqa: N802
+                path = urlparse(self.path).path
+                if path != "/api/report":
+                    self._send(404, "text/plain", b"not found")
+                    return
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    body = json.loads(self.rfile.read(n) or b"{}")
+                    if not isinstance(body, dict):
+                        raise ValueError
+                except (ValueError, OSError):
+                    self._send(400, "application/json; charset=utf-8",
+                               b'{"ok":false,"error":"bad json"}')
+                    return
+                res = notifier.report(body)
+                self._send(200 if res.get("ok") else 400,
+                           "application/json; charset=utf-8",
+                           json.dumps(res, ensure_ascii=False).encode())
 
         self._httpd = ThreadingHTTPServer((self.host, self.port), Handler)
         self._httpd.daemon_threads = True
