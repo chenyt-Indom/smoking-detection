@@ -36,9 +36,17 @@ COLORS = {
 # 语义：系统在画面里"注意到"了这块区域，但置信度还不够，不作任何主张。
 # 这样颜色只承担一件事 —— 红/橙才代表系统认为有风险，灰只是"我看到了"。
 # 早期候选也用黄色，结果满屏都是抢眼的黄框，等于没有优先级。
-CAND_COLOR = (150, 150, 150)       # 灰：未达阈值，只表示"看到了"
+# 未达阈值的"候选框"用**暗色版类别色**，而不是中性灰。
+#
+# 为什么不用纯灰：实测同一画面里，对准的打火机能拿到 0.75（红框），
+# 稍远一点的那次只有 0.26 —— 它确实是火，但纯灰框看起来像"系统完全没当回事"，
+# 连类别信息都丢了。降阈值又会把送审量顶上去（llm_min_conf 得跟着降）。
+# 用暗红/暗橙既弱化、又保留"这是火/烟"的语义，三级依然一目了然。
+CAND_COLORS = {
+    0: (60, 60, 160),      # 暗红：火的候选
+    1: (40, 110, 180),     # 暗橙：烟的候选
+}
 WARM_COLOR = (0, 210, 255)         # 黄：刚过阈值，疑似（还要 LLM 复核）
-CAND_COLORS = {0: CAND_COLOR, 1: CAND_COLOR}
 WARM_COLORS = {0: WARM_COLOR, 1: WARM_COLOR}
 DEFAULT_COLOR = (190, 190, 190)
 
@@ -93,6 +101,9 @@ class LiveView:
             ok, buf = cv2.imencode(".jpg", drawn,
                                    [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
             if not ok:
+                if not getattr(self, "_err_logged", False):
+                    self._err_logged = True
+                    print("[liveview] jpeg 编码失败", flush=True)
                 return False
             if len(buf) > self.max_bytes:
                 ok2, buf2 = cv2.imencode(
@@ -101,7 +112,10 @@ class LiveView:
                 if ok2 and len(buf2) < len(buf):
                     buf = buf2
             jpeg = buf.tobytes()
-        except Exception:                      # noqa: BLE001  画框失败绝不能拖垮检测
+        except Exception as exc:               # noqa: BLE001  画框失败绝不能拖垮检测
+            if not getattr(self, "_err_logged", False):
+                self._err_logged = True
+                print(f"[liveview] publish 异常: {type(exc).__name__}: {exc}", flush=True)
             return False
 
         counts: dict[str, int] = {}
@@ -162,7 +176,7 @@ class LiveView:
             elif conf >= alarm_thr:
                 color, thick, suffix = WARM_COLORS.get(cid, WARM_COLOR), 2, " ?"
             else:
-                color, thick, suffix = CAND_COLORS.get(cid, CAND_COLOR), 1, " ?"
+                color, thick, suffix = CAND_COLORS.get(cid, DEFAULT_COLOR), 1, " ?"
             cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
 
             name = str(getattr(d, "cls_name", "obj")).upper()
@@ -183,9 +197,10 @@ class LiveView:
 
             cv2.rectangle(img, (x1, ly), (x1 + tw + 6, ly + bh), color, -1)
             # 告警框用白字压在彩色底上；候选框用深字压在灰底上，进一步弱化
-            dark_text = conf < alarm_thr         # 灰底用深字，彩底用白字
+            # 暗色候选底上用浅灰字，彩色告警底上用白字
+            txt = (215, 215, 215) if conf < alarm_thr else (255, 255, 255)
             cv2.putText(img, label, (x1 + 3, ly + th + 1), FONT, 0.5,
-                        (30, 30, 30) if dark_text else (255, 255, 255), 1, cv2.LINE_AA)
+                        txt, 1, cv2.LINE_AA)
 
         # 左上角信息条：帧号 / 检测数 / 时间
         bar = f"f{frame_idx if frame_idx is not None else '-'}  det {len(dets)}  " \

@@ -56,7 +56,10 @@ from .tracker import IoUTracker, Track
 DEFAULTS = {
     # ── 检测门限：按类别分别设 ──────────────────────────────
     "det_conf": 0.20,          # 送进检测器的总门限（压很低，保召回）
-    "fire_conf": 0.45,         # 火：告警阈值（画框另有更低的 det_conf，见 liveview）
+    # 火告警阈值。0.45 偏高：真火在视频里（距离远、被遮挡、单帧模糊）
+    # 常只拿到 0.3~0.4，会掉进灰色候选档，看起来像"没发现"。
+    # 0.35 是折中：既让真火进黄色档，又不至于把所有反光都拉进来。
+    "fire_conf": 0.35,
     "smoke_conf": 0.50,        # 烟：告警阈值
 
     # ── 事件确认 ────────────────────────────────────────────
@@ -117,7 +120,7 @@ DEFAULTS = {
     # 两头都省，只留中间那段真正需要判断的。
     # 送审下限必须**低于**报警阈值，否则会出现"不够格送审、却够格报警"的漏洞：
     # 实测 conf 0.47 撞上 fire_conf 0.45，跳过裁判直接报了火情。
-    "llm_min_conf": 0.35,
+    "llm_min_conf": 0.30,
     # 免裁线：达到这个置信度才允许不送审直接定性。
     # 设太高浪费钱，设太低会让检测器单方面定性 —— 实测 0.85 时一张人脸被
     # 直接推成「火情」，裁判根本没参与。0.92 是"基本只可能是真火"的量级。
@@ -150,7 +153,10 @@ DEFAULTS = {
     "light_memory_iou": 0.45,        # 归一化 IoU 超过这个就当同一处
     "light_memory_area_tol": 0.6,    # 面积变化 >60% 认为"已不是原来那东西"，记忆作废
     "light_memory_ttl": 604800.0,    # 7 天不出现就忘掉（场景可能已经改了）
-    "light_memory_notice_sec": 3600.0,   # 命中记忆时给前端留痕的最小间隔（默认一小时一条）
+    "light_memory_notice_sec": 3600.0,
+    # 命中区域记忆时是否推"待确认"卡片。默认关：记忆仍在生效（省调用），
+    # 只是不占事件流。要排查记忆是否正常工作时再打开。
+    "light_memory_notice": False,   # 命中记忆时给前端留痕的最小间隔（默认一小时一条）
 
     # 同区域送审静音：键是**区域**不是轨迹 ID。哪怕记忆还没建立
     # （第一次见到这盏灯），也只在同一块地方问一次。
@@ -878,12 +884,17 @@ class Pipeline:
                 box_n, area_n = self._norm_box(t.last_box, h, w)
                 mem = self._memory_check(pkt, t, box_n, area_n,
                                          fv.label if fv is not None else None)
-                if mem == "silent":
-                    continue
                 if mem:
-                    events.append(self._make_event(
-                        "fire", "notice", t.tid, t, pkt, conf, t.last_box,
-                        [mem, "不是排除：外形一旦变化（变大/开始抖动）会自动恢复复核"]))
+                    # 记忆命中一律静默跳过，不再推"待确认"卡片。
+                    # 区域记忆本身继续生效（省 LLM 调用），只是不占事件流 ——
+                    # 用户已确认过这块地方是灯，反复提醒只是噪音。
+                    # 外形一旦变化（面积变 >60% 或开始抖动），_memory_check 会返回
+                    # None，走完整复核流程，不会漏。
+                    if self.cfg.get("light_memory_notice", False):
+                        if mem != "silent":
+                            events.append(self._make_event(
+                                "fire", "notice", t.tid, t, pkt, conf, t.last_box,
+                                [mem]))
                     continue
 
                 if fv is not None and fv.label == "static":
