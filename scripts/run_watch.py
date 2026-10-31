@@ -99,6 +99,8 @@ def main() -> int:
     ap.add_argument("--sliced", type=int, default=1)
     ap.add_argument("--detect", default="auto", choices=["auto", "slice", "full"],
                     help="auto=粗筛没东西就不切片（空白帧 45.9fps / 切片只有 16.3）")
+    ap.add_argument("--forget-lights", type=int, default=0,
+                    help="1=清空「已确认不是火」的区域记忆（现场布置变了就用它）")
     ap.add_argument("--llm", default="auto", choices=["auto", "off", "dry"],
                     help="auto=按 config/arbiter.yaml；dry=不发请求只验证接线")
     ap.add_argument("--n-mul", type=float, default=1.0)
@@ -138,6 +140,19 @@ def main() -> int:
     print(f"\n看板已启动：{url}")
     print(f"模型 {WEIGHTS.name}  imgsz={args.imgsz}  every={args.every}  "
           f"detect={args.detect}  fast_smoke={bool(args.fast)}  LLM={args.llm}")
+
+    # ── 「已确认不是火」的区域记忆：同一盏灯不再反复花钱问 LLM ──
+    lights = getattr(pipe, "lights", None)
+    if args.forget_lights:
+        if lights is not None:
+            n = lights.clear()
+            lights.save()
+            print(f"已清空区域记忆 {n} 处（{lights.path}）")
+        else:
+            print("区域记忆是关着的（cfg.light_memory=False）")
+    if lights is not None:
+        print(f"区域记忆 {len(lights)} 处（{lights.path}）"
+              f" —— 命中则跳过 LLM，外形一变自动作废")
     print("按 Ctrl+C 停止\n" + "-" * 68)
 
     def on_event(ev, res):

@@ -46,6 +46,7 @@ import cv2
 import numpy as np
 
 from .infer import Detection, Detector, iou
+from .light_memory import LightMemory
 from .sources.base import CameraSource, FramePacket
 from .temporal import (Verdict, TrackletSample, extract_features, judge,
                        judge_fire)
@@ -122,6 +123,20 @@ DEFAULTS = {
     # 检测策略。auto = 先粗筛、有东西才切片（空白帧 4.8 倍提速）；
     # slice = 每帧固定切片（最稳）；full = 不切片（小目标召回掉 13 点，仅排障用）。
     "detect_mode": "auto",
+
+    # ── 已知非火灾区域的记忆（省钱层）────────────────────────────
+    # 一盏路灯整夜亮着，YOLO 会把它切成一条条新轨迹，而送审键原来是
+    # `机位:轨迹ID` —— 每换一条就重新问一次 LLM。实测这套记忆能把
+    # 同一盏灯的 LLM 调用从"每次重连都问"压到"确认一次就够"。
+    "light_memory": True,
+    "light_memory_path": "data/light_memory.json",
+    "light_memory_iou": 0.45,        # 归一化 IoU 超过这个就当同一处
+    "light_memory_area_tol": 0.6,    # 面积变化 >60% 认为"已不是原来那东西"，记忆作废
+    "light_memory_ttl": 604800.0,    # 7 天不出现就忘掉（场景可能已经改了）
+
+    # 同区域送审静音：键是**区域**不是轨迹 ID。哪怕记忆还没建立
+    # （第一次见到这盏灯），也只在同一块地方问一次。
+    "llm_region_mute_sec": 180.0,
 
     # ── 杂项 ────────────────────────────────────────────────
     "min_box_pct": 0.0002,     # 面积小于画面 0.02% 的框当噪点丢掉
@@ -240,6 +255,10 @@ class _Pending:
     reasons: list[str]
     hits: int
     n_samples: int
+    # 归一化坐标（0~1）+ 归一化面积。裁判判"不是火"时要靠它们记住这块地方，
+    # 存像素坐标的话换分辨率整份记忆就废了。
+    box_n: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
+    area_n: float = 0.0
 
 
 # ------------------------------------------------------------------ 主类
@@ -287,6 +306,7 @@ class Pipeline:
         self._cleared: set[int] = set()      # notice 已被撤销的轨迹（防止反复发/撤）
         self._steam_noticed: set[int] = set()  # 已推过"降级为蒸汽"提示的轨迹
         self._static_noticed: set[int] = set() # 已推过"疑似灯光"提示的轨迹
+        self._mem_noticed: set[int] = set()    # 已推过"该位置已知非火"提示的轨迹
         self._recheck_done: set[int] = set()   # 已对被判降级却久不消散的目标叫过人
         self._fired: set[int] = set()        # 已报过的轨迹（同一条火只报一次）
         self._recent_alarms: list[tuple[float, str, tuple, int]] = []   # (t, kind, box, tid)
@@ -305,8 +325,24 @@ class Pipeline:
             "recheck_notices": 0,        # 降级后久不消散、把人叫回来的次数
             "static_light_blocked": 0,   # 被闪烁闸拦下的疑似灯光（真火保留 = 真阳性）
             "llm_reviews": 0, "llm_alarms": 0, "llm_dismissed": 0,   # LLM 裁判
+            "llm_saved": 0,              # 因为"这块地方判过"而省掉的 LLM 调用（按轨迹计一次）
+            "memory_hits": 0,            # 命中区域记忆（已知非火）的帧数
+            "memory_reopened": 0,        # 记忆因外形突变而作废的次数
             "frozen_frames": 0, "cooldown_blocked": 0,
         }
+
+        # 已确认"不是火"的区域记忆（落盘，跨重启有效）。这是省钱层：
+        # 判定走它就不再调 LLM，一盏灯一晚一次就够。
+        self.lights: LightMemory | None = None
+        if self.cfg["light_memory"]:
+            self.lights = LightMemory(
+                self.cfg["light_memory_path"],
+                iou_thr=float(self.cfg["light_memory_iou"]),
+                area_tol=float(self.cfg["light_memory_area_tol"]),
+                ttl=float(self.cfg["light_memory_ttl"]))
+        self._region_judged: list[tuple[str, tuple, float]] = []   # (cam, box_n, ts)
+        self._saved_tids: set[int] = set()   # 已计过"省一次调用"的轨迹，别按帧重复计
+        self._mem_saved_ts = 0.0
 
     # ------------------------------------------------------------ 内部
     @staticmethod
@@ -422,11 +458,92 @@ class Pipeline:
         self._cleared &= live
         self._steam_noticed &= live
         self._static_noticed &= live
+        self._mem_noticed &= live
+        self._saved_tids &= live
         self._recheck_done &= live
         for k in [k for k in self._arbiter_done if k.rsplit(":", 1)[-1].isdigit()
                   and int(k.rsplit(":", 1)[-1]) not in live]:
             self._arbiter_done.pop(k, None)
             self._dismissed.pop(k, None)
+        # 区域记忆定期落盘（每 60 秒一次），别每帧写盘
+        if self.lights is not None:
+            now = time.time()
+            if now - self._mem_saved_ts > 60.0:
+                self._mem_saved_ts = now
+                self.lights.save()
+
+    # ------------------------------------------------------------ 区域记忆
+    @staticmethod
+    def _norm_box(box, h: int, w: int) -> tuple[tuple, float]:
+        """像素框 → 归一化框 + 归一化面积。"""
+        if h <= 0 or w <= 0:
+            return (0.0, 0.0, 0.0, 0.0), 0.0
+        x1, y1, x2, y2 = [float(v) for v in box]
+        nb = (x1 / w, y1 / h, x2 / w, y2 / h)
+        return nb, max(0.0, (nb[2] - nb[0]) * (nb[3] - nb[1]))
+
+    def _region_muted(self, cam: str, box_n, ts: float) -> bool:
+        """同一块地方刚被裁判判过吗？
+
+        键必须是**区域**而不是轨迹 ID：路灯会被遮挡/失配切成一段段新轨迹，
+        按 ID 去重等于没去重 —— 每段都重新问一次 LLM，一夜几十次。
+        """
+        mute = float(self.cfg["llm_region_mute_sec"])
+        if mute <= 0:
+            return False
+        keep = []
+        hit = False
+        for c, b, t in self._region_judged:
+            if ts - t > mute:
+                continue                     # 过期，顺手清掉
+            keep.append((c, b, t))
+            if not hit and c == cam and iou(b, box_n) >= 0.5:
+                hit = True
+        self._region_judged = keep
+        return hit
+
+    def _count_saved(self, tid: int) -> None:
+        """记一次"少问一嘴"。按轨迹只计一次 —— 按帧计会把 300 帧说成 300 次省单，
+        那是自欺欺人：同一帧不省也不会去调。"""
+        if tid not in self._saved_tids:
+            self._saved_tids.add(tid)
+            self.stats["llm_saved"] += 1
+
+    def _memory_check(self, pkt: FramePacket, t: Track, box_n, area_n: float,
+                      flicker_label: str | None) -> str | None:
+        """这块地方是不是「已确认不是火」？是则返回理由（调用方别再送审/报警）。
+
+        安全阀（很重要，别删）：外形变了就不认记忆。
+          · 面积变化超 `light_memory_area_tol` → 不是原来那东西了
+            （路灯被点着、火烧大了、相机被转了）
+          · 闪烁升到 fire 档 → 灯不会抖，抖了就说明情况变了
+        命中这两条就把记忆**作废**，恢复完整流程（该问 LLM 就问，该报就报）。
+        记忆只配省"确认过的旧情况"的钱，不能替一个正在变化的目标下结论。
+        """
+        if self.lights is None:
+            return None
+        spot = self.lights.match(pkt.cam_id, box_n)
+        if spot is None:
+            return None
+
+        changed = not self.lights.still_same(spot, box_n, area_n)
+        if flicker_label == "fire":
+            changed = True
+        if changed:
+            n = self.lights.forget(pkt.cam_id, box_n)
+            self.stats["memory_reopened"] += n
+            return None
+
+        self.lights.touch(spot)
+        self.stats["memory_hits"] += 1
+        # 只统计"这条轨迹一次都没问过 LLM、全靠记忆挡下来的"
+        if f"{pkt.cam_id}:{t.tid}" not in self._arbiter_done:
+            self._count_saved(t.tid)
+        if t.tid in self._mem_noticed:
+            return "silent"                   # 已提示过，本帧不出事件
+        self._mem_noticed.add(t.tid)
+        return (f"该位置此前已确认是{spot.label}（累计 {spot.hits} 次），"
+                f"外形未变，本次不再送 LLM 复核")
 
     # ------------------------------------------------------------ LLM 裁判
     def _defer(self, kind, tid, t, pkt, score, box, reasons) -> bool:
@@ -445,6 +562,14 @@ class Pipeline:
         done = self._arbiter_done.get(key)
         if done is not None and (pkt.ts - done) < self.cfg["llm_mute_sec"]:
             return True                       # 裁判已判过，规则层闭嘴
+        # 同一块地方刚判过就别再花钱 —— 键按区域，不按轨迹 ID。
+        # 这条比上面那条更重要：路灯被切成新轨迹时，`done` 查不到（键变了），
+        # 只有区域匹配才拦得住。
+        h, w = pkt.image.shape[:2]
+        box_n, area_n = self._norm_box(box, h, w)
+        if self._region_muted(pkt.cam_id, box_n, pkt.ts):
+            self._count_saved(tid)
+            return True
         ok, _why = self.arbiter.submit(
             key, pkt.image, box, rule_label=kind, rule_score=score,
             context=f"{kind}，检测 conf {t.samples[-1].conf:.2f}，轨迹已命中 {t.hits} 帧",
@@ -457,7 +582,8 @@ class Pipeline:
             snapshot=crop_box(pkt.image, box, self.cfg["snapshot_margin"],
                               self.cfg["snapshot_max_side"]),
             score=float(score), reasons=list(reasons),
-            hits=t.hits, n_samples=len(t.samples))
+            hits=t.hits, n_samples=len(t.samples),
+            box_n=box_n, area_n=area_n)
         return True
 
     def _stale_recheck(self, t, pkt) -> bool:
@@ -494,6 +620,14 @@ class Pipeline:
             return None
         self.stats["llm_reviews"] += 1
         self._arbiter_done[key] = info.ts     # 这个目标从此由裁判说了算
+        # 记住"这块地方刚判过"（区域键，跨轨迹有效）
+        self._region_judged.append((info.cam_id, info.box_n, info.ts))
+        if len(self._region_judged) > 200:
+            self._region_judged = self._region_judged[-200:]
+        # 判"不是火/烟"的，落盘记住这块地方：下次同位置的轨迹直接跳过 LLM
+        if self.lights is not None and res.is_dismiss:
+            self.lights.remember(info.cam_id, info.box_n, info.area_n, res.label)
+            self.lights.save()
         reasons = ([f"LLM 判为 {res.label}（risk={res.risk}，conf={res.confidence:.2f}）："
                     f"{res.reason}"] + info.reasons[:2])
 
@@ -629,6 +763,20 @@ class Pipeline:
                 fv = (judge_fire(extract_features(t.samples),
                                  area_px=t.samples[-1].area, thr=self.temporal_thr)
                       if cfg["flicker_gate"] else None)
+
+                # 这块地方以前被确认过"不是火"吗（路灯/招牌/反光）？
+                # 是 → 不再花钱问 LLM，一条轨迹只留一条提示。
+                box_n, area_n = self._norm_box(t.last_box, h, w)
+                mem = self._memory_check(pkt, t, box_n, area_n,
+                                         fv.label if fv is not None else None)
+                if mem == "silent":
+                    continue
+                if mem:
+                    events.append(self._make_event(
+                        "fire", "notice", t.tid, t, pkt, conf, t.last_box,
+                        [mem, "不是排除：外形一旦变化（变大/开始抖动）会自动恢复复核"]))
+                    continue
+
                 if fv is not None and fv.label == "static":
                     # ⚠️ 这里不能 continue 了事。灯也会烧到短路、火也可能烧得很稳，
                     # 判错一次就是漏报。所以降级留痕 + 送 LLM 复核，双保险。
@@ -674,6 +822,20 @@ class Pipeline:
 
             verdicts[t.tid] = v
             nearby_map[t.tid] = nearby
+
+            # 这块地方以前判过"不是火灾风险"（蒸汽源/反光）？是就不再送审。
+            # 放在时序判别之后：烟的记忆只在"规则层也不认为是烟"时才敢省，
+            # 否则等于用旧结论捂住一个正在长大的羽流。
+            if v.label != "smoke":
+                box_n, area_n = self._norm_box(t.last_box, h, w)
+                mem = self._memory_check(pkt, t, box_n, area_n, None)
+                if mem == "silent":
+                    continue
+                if mem:
+                    events.append(self._make_event(
+                        "smoke", "notice", t.tid, t, pkt, v.score, t.last_box,
+                        [mem, "不是排除：外形一旦变化会自动恢复复核"]))
+                    continue
 
             # ── 极快模式的第一级：先发 notice，不等时序 ──────────
             # 之后**不 continue**，继续往下走正规判别：
@@ -779,6 +941,8 @@ class Pipeline:
                 break
 
         elapsed = max(1e-6, time.time() - t0)
+        if self.lights is not None:
+            self.lights.save()          # 收尾必落盘：断电就白记了
         return {
             "frames": n, "processed": self.stats["frames"],
             "elapsed_s": round(elapsed, 1),

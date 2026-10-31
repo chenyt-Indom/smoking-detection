@@ -586,7 +586,11 @@ def run_scene(name: str, det: Detector, args) -> dict:
     # 显示成"测试失败"。真实火能不能过闸，由 scripts/verify_flicker_gate.py
     # 在 506 张**逐帧连续**的真火视频帧上单独验证。
     gate = name not in ("fire", "fire_smoke")
-    pcfg = {"fast_smoke": bool(args.fast), "flicker_gate": gate}
+    # 区域记忆在合成场景里关掉：它是**跨重启**的省钱机制，开着会让测试
+    # 跑第一次和第二次结果不同（第二次直接命中记忆、闪烁闸都不会被调用）。
+    # 这套机制单独由 scripts/test_light_memory.py 验证。
+    pcfg = {"fast_smoke": bool(args.fast), "flicker_gate": gate,
+            "light_memory": False}
     if args.detect:
         pcfg["detect_mode"] = args.detect
     pipe = Pipeline(stub or det, sliced=bool(args.sliced) and stub is None, tile_grid=2,
