@@ -29,8 +29,15 @@ import numpy as np
 
 # 类别 → 框颜色（BGR）。0=fire 1=smoke，与 dataset.yaml 一致
 COLORS = {
-    0: (48, 48, 235),      # 红：火
-    1: (40, 165, 255),     # 橙：烟
+    0: (48, 48, 235),      # 红：火（达到告警阈值）
+    1: (40, 165, 255),     # 橙：烟（达到告警阈值）
+}
+# 未达告警阈值的候选框用黄色细线。
+# 目的是把"看见了"和"要报警"在视觉上也分开 —— 用户能看到系统注意到那块区域了，
+# 只是置信度还不足以惊动人。之前两者共用一个阈值，调高就再也看不见真火。
+CAND_COLORS = {
+    0: (0, 210, 255),
+    1: (60, 230, 255),
 }
 DEFAULT_COLOR = (190, 190, 190)
 
@@ -52,6 +59,8 @@ class LiveView:
         # 超过上限就降一档质量重编，体积能砍一半，代价才 0.3ms。
         self.max_bytes = int(max_bytes)
         self.fallback_quality = int(fallback_quality)
+        # 各类别的告警阈值：低于它的框画成黄色"候选"，高于它才是红色"告警"
+        self.alarm_confs: dict[int, float] = {0: 0.55, 1: 0.60}
 
         self._cond = threading.Condition(threading.Lock())
         self._jpeg: bytes | None = None
@@ -138,12 +147,13 @@ class LiveView:
                 continue
 
             cid = int(getattr(d, "cls_id", -1))
-            color = COLORS.get(cid, DEFAULT_COLOR)
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2)
+            conf = float(getattr(d, "conf", 0.0))
+            is_alarm = conf >= self.alarm_confs.get(cid, 0.55)
+            color = (COLORS if is_alarm else CAND_COLORS).get(cid, DEFAULT_COLOR)
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2 if is_alarm else 1)
 
             name = str(getattr(d, "cls_name", "obj")).upper()
-            conf = float(getattr(d, "conf", 0.0))
-            label = f"{name} {conf:.2f}"
+            label = f"{name} {conf:.2f}" if is_alarm else f"{name} {conf:.2f} ?"
             (tw, th), base = cv2.getTextSize(label, FONT, 0.5, 1)
             bh = th + base + 4
 
