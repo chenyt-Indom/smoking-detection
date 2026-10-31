@@ -341,7 +341,8 @@ def run_scene(name: str, det: Detector, args) -> dict:
 
     info = CameraInfo(cam_id=f"sim_{name}", kind="fixed", fps=FPS)
     src = FixedCameraSource(info, frames=frames, warmup=WARMUP_FRAMES)
-    pipe = Pipeline(stub or det, sliced=bool(args.sliced) and stub is None, tile_grid=2)
+    pipe = Pipeline(stub or det, sliced=bool(args.sliced) and stub is None, tile_grid=2,
+                    cfg={"fast_smoke": bool(args.fast)})
 
     events: list = []
     trace: list = []
@@ -365,18 +366,23 @@ def run_scene(name: str, det: Detector, args) -> dict:
         for ev in events:
             Pipeline.save_event(ev, ROOT / "runs" / "pipeline_events")
 
-    got = {e.kind for e in events}
+    got = {e.kind for e in events if e.level in ("warning", "alarm")}
     checks = {"事件种类": got == expect if expect is not None else None}
     for k, v in (spec.get("need") or {}).items():
         checks[f"{k}≥{v}"] = stats.get(k, 0) >= v
     judged = [v for v in checks.values() if v is not None]
     ok = None if (expect is None and not (spec.get("need"))) else all(judged)
 
+    n_notice = sum(1 for e in events if e.level == "notice")
+    n_clear = sum(1 for e in events if e.level == "cleared")
+
     out = {
         "scene": name, "desc": spec["desc"], "frames": n,
         "elapsed_s": round(el, 1), "fps": round(n / el, 2),
         "sliced": bool(args.sliced) and stub is None, "stub_detector": stub is not None,
+        "fast_smoke": bool(args.fast),
         "events": [e.to_dict() for e in events], "n_events": len(events),
+        "n_notice": n_notice, "n_cleared": n_clear,
         "expect_kinds": sorted(expect) if expect is not None else "n/a(观测)",
         "got_kinds": sorted(got), "checks": checks, "ok": ok, "stats": stats,
         "t_appear": round(WARMUP_FRAMES / FPS, 2), "verdict_trace": trace[-40:],
@@ -390,6 +396,8 @@ def run_scene(name: str, det: Detector, args) -> dict:
             print(f"       · {r}")
     if not events:
         print("   （无告警）")
+    elif n_notice or n_clear:
+        print(f"   （另有 notice {n_notice} 条 / 自动撤销 {n_clear} 条）")
     for k, v in checks.items():
         print(f"   {k}: {'观测' if v is None else ('✅' if v else '❌')}")
     print(f"   统计：{stats}")
@@ -412,6 +420,7 @@ def main():
     ap.add_argument("--n-mul", type=float, default=1.0, help="序列长度倍数（拉长测长期行为）")
     ap.add_argument("--save", type=int, default=1, help="1 保存告警截图")
     ap.add_argument("--trace", type=int, default=1, help="1 打印时序判别演化")
+    ap.add_argument("--fast", type=int, default=0, help="1 开极快模式（烟跳过时序判别）")
     ap.add_argument("--out", default=str(ROOT / "runs" / "pipeline_test.json"))
     args = ap.parse_args()
 

@@ -61,6 +61,23 @@ DEFAULTS = {
     "fire_confirm": 3,         # 火：连续命中几帧才报（抗单帧闪烁）
     "smoke_confirm": 2,        # 烟：时序判为 smoke 后再连续几帧坐实
 
+    # ── 极快模式（烟跳过时序判别）──────────────────────────
+    # 白烟和蒸汽在**单帧**上同色同形，要分开必须观察一段时间 —— 这是物理事实，
+    # 不是代码能绕过的。所以"极快"和"能区分蒸汽"互斥，只能二选一。
+    #
+    # 适用：现场**没有蒸汽源** —— 机房、配电间、仓库、垃圾房、电池仓、档案室。
+    #       这些地方出现上升的白色羽流，几乎只能是烟，没必要等 25 秒。
+    # 不适用：厨房、锅炉房、洗浴间、有加湿器/冷却塔的车间 —— 开了就是误报机器。
+    # 打开后烟的确认时间从 25s 降到 3 帧（25fps 下约 0.12s）。
+    #
+    # 开了之后是**分级**的，不是一上来就喊狼来了：
+    #   notice  0.2s   极快模式命中 → 立刻推给值班员看画面（需人工确认）
+    #   alarm   1.8s+  时序层也确认是烟 → 升级为正式告警
+    #   cleared 5s+    时序层判成蒸汽 → 自动撤销刚才那条 notice
+    # 这样"反应快"和"不误报"各自拿到各自该有的级别，不必二选一。
+    "fast_smoke": False,
+    "fast_smoke_confirm": 3,   # 直通模式下烟连续命中几帧就报
+
     # ── 去重（按**区域**，不按类别）──────────────────────────
     # 为什么不能按类别全局冷却：画面另一头真的第二处起火会被压掉 30 秒，
     # 安防上这是漏报。所以只压"同一块地方"的重复告警 —— 它防的是轨迹断裂后
@@ -213,14 +230,20 @@ class Pipeline:
 
         self._fire_streak: dict[int, int] = {}
         self._smoke_streak: dict[int, int] = {}
+        self._notice_streak: dict[int, int] = {}
+        self._noticed: set[int] = set()      # 已发 notice 的轨迹（一条轨迹只发一次）
+        self._cleared: set[int] = set()      # notice 已被撤销的轨迹（防止反复发/撤）
         self._fired: set[int] = set()        # 已报过的轨迹（同一条火只报一次）
         self._recent_alarms: list[tuple[float, str, tuple, int]] = []   # (t, kind, box, tid)
+        self._recent_notices: list[tuple[float, tuple]] = []             # (t, box)
         self._recent: deque = deque(maxlen=8)   # 给 VLM 复核用的近几帧
 
         self.stats = {
             "frames": 0, "dets": 0, "tracks": 0,
             "fire_alarms": 0, "smoke_alarms": 0,
             "steam_suppressed": 0, "static_suppressed": 0,
+            "steam_ignored": 0,          # 极快模式下被忽略的蒸汽判定（用于事后校准）
+            "notices": 0, "notice_cleared": 0,   # 极快模式的临时提示 / 自动撤销数
             "frozen_frames": 0, "cooldown_blocked": 0,
         }
 
@@ -269,9 +292,29 @@ class Pipeline:
                 return False, f"冷却中（{ts - t0:.1f}s 前同一区域已报过）"
         return True, ""
 
+    def _can_notice(self, ts: float, box) -> bool:
+        """notice 也要按区域去重。
+
+        notice 不进 `_fired`（否则正式告警永远升级不上来），但**不**去重的话，
+        一团被模型切成 3 段的烟会吐出 3 条 notice —— 实测就是 4 条刷屏。
+        所以它用自己的一套记录，和正式告警的冷却互不干扰。
+        """
+        cd = self.cfg["cooldown_sec"]
+        self._recent_notices = [r for r in self._recent_notices if ts - r[0] < cd]
+        g = self.cfg["dedup_grow"]
+        for _, b0 in self._recent_notices:
+            if (iou(b0, box) > self.cfg["dedup_iou"]
+                    or self._dist(b0, box) < self.cfg["dedup_dist_px"]
+                    or iou(expand_box(b0, g), expand_box(box, g)) > 0):
+                return False
+        return True
+
     def _make_event(self, kind, level, tid, t, pkt, score, box, reasons) -> Event:
-        self._fired.add(tid)
-        self._recent_alarms.append((pkt.ts, kind, tuple(float(v) for v in box), tid))
+        # notice / cleared 是临时提示，**不占用正式告警的去重额度** ——
+        # 否则 notice 会把后面真正的 alarm 挡在冷却期外面，等于永远升级不了。
+        if level in ("warning", "alarm"):
+            self._fired.add(tid)
+            self._recent_alarms.append((pkt.ts, kind, tuple(float(v) for v in box), tid))
         snap = crop_box(pkt.image, box, self.cfg["snapshot_margin"],
                         self.cfg["snapshot_max_side"])
         ev = Event(kind=kind, level=level, cam_id=pkt.cam_id, track_id=tid,
@@ -279,16 +322,19 @@ class Pipeline:
                    score=float(score), box=tuple(float(v) for v in box),
                    reasons=list(reasons), snapshot=snap,
                    meta={"hits": t.hits, "n_samples": len(t.samples)})
-        self.stats[f"{kind}_alarms"] += 1
+        if level in ("warning", "alarm"):        # notice / cleared 不算告警，别污染统计
+            self.stats[f"{kind}_alarms"] += 1
         return ev
 
     def _prune(self) -> None:
         """轨迹结束就把连击计数一起清掉，否则长跑会一直攒内存。"""
         live = set(self.tracker.tracks)
-        for d in (self._fire_streak, self._smoke_streak):
+        for d in (self._fire_streak, self._smoke_streak, self._notice_streak):
             for tid in [k for k in d if k not in live]:
                 d.pop(tid, None)
         self._fired &= live
+        self._noticed &= live
+        self._cleared &= live
 
     # ------------------------------------------------------------ 单帧
     def process(self, pkt: FramePacket) -> FrameResult:
@@ -373,9 +419,33 @@ class Pipeline:
             verdicts[t.tid] = v
             nearby_map[t.tid] = nearby
 
+            # ── 极快模式的第一级：先发 notice，不等时序 ──────────
+            # 之后**不 continue**，继续往下走正规判别：
+            # 时序确认了 → 升级成 alarm；判成蒸汽 → 发 cleared 撤销这条 notice。
+            if cfg["fast_smoke"]:
+                self._notice_streak[t.tid] = self._notice_streak.get(t.tid, 0) + 1
+                if (self._notice_streak[t.tid] >= cfg["fast_smoke_confirm"]
+                        and t.tid not in self._noticed and self._can_notice(pkt.ts, t.last_box)):
+                    self._noticed.add(t.tid)
+                    self._recent_notices.append((pkt.ts, tuple(float(v) for v in t.last_box)))
+                    self.stats["notices"] += 1
+                    events.append(self._make_event(
+                        "smoke", "notice", t.tid, t, pkt, conf, t.last_box,
+                        [f"极快模式：连续 {self._notice_streak[t.tid]} 帧检出烟"
+                         f"（conf {conf:.2f}），尚未做蒸汽判别，需人工确认"]))
+
             if v.label == "steam":
                 self.stats["steam_suppressed"] += 1
                 self._smoke_streak[t.tid] = 0
+                # 注意：这里**不**把 tid 从 _noticed 里移除。
+                # 移了就会 notice→cleared→notice 反复抖（实测抖了 5 轮）。
+                # 一条轨迹的 notice 只发一次；真要继续烧，后面会直接升级成正式告警。
+                if t.tid in self._noticed and t.tid not in self._cleared:
+                    self._cleared.add(t.tid)
+                    self.stats["notice_cleared"] += 1
+                    events.append(self._make_event(
+                        "smoke", "cleared", t.tid, t, pkt, v.score, t.last_box,
+                        ["时序判别为蒸汽/水雾，撤销早前的临时提示"] + list(v.reasons[:2])))
                 continue
             if v.label != "smoke" or v.score < cfg["smoke_conf"]:
                 self._smoke_streak[t.tid] = 0
