@@ -71,6 +71,8 @@ SYSTEM = (
     "- 厨房灶台、焊接工位、排气口、水壶上方的白色羽流 → 水汽/工艺气，风险低\n"
     "- 天花板常亮光斑、灯具、反光 → 灯光，风险低\n"
     "- 有明火舌、根部明亮、火光映在墙面、焦黑痕迹 → fire，风险高\n"
+    "- 手机手电筒、补光灯、屏幕高光：圆形或方形的**均匀**亮斑，边缘锐利、"
+    "内部没有明暗梯度、色温偏白或偏蓝 → light，风险低\n"
     "- **打火机、蜡烛、酒精灯、火柴这类小型明火同样是 fire**，"
     "不要因为面积小、四周没有烟就判成 light；"
     "灯是没有轮廓的弥散光斑，火苗有明确的舌状轮廓和亮黄-橙色核心\n"
@@ -428,7 +430,7 @@ class LlmArbiter:
         if not uris:
             return self._fallback(rule_label, rule_score, "画面编码失败")
 
-        text = self._user_text(roi, frame, context, feat)
+        text = self._user_text(roi, frame, context, feat, box)
         content = [{"type": "text", "text": text}]
         for u in uris:
             content.append({"type": "image_url", "image_url": {"url": u}})
@@ -474,18 +476,30 @@ class LlmArbiter:
                                   f"{type(exc).__name__}", time.time() - t0)
 
     @staticmethod
-    def _user_text(roi, frame, context: str, feat) -> str:
+    def _user_text(roi, frame, context: str, feat, box=None) -> str:
         lines = []
         if roi is not None and frame is not None:
             fh, fw = frame.shape[:2]
             rh, rw = roi.shape[:2]
             lines.append(f"可疑区域占整幅画面约 {rw * rh / max(fw * fh, 1) * 100:.1f}%，"
-                         f"位置在画面{_pos_text(rh, rw, fh, fw)}")
+                         f"{_pos_text(rh, rw, fh, fw, box)}")
         if feat is not None:
-            lines.append(f"该目标已持续 {feat.duration:.1f}s，"
-                         f"面积对数增长率 {feat.area_growth:+.2f}/s，"
-                         f"亮度变化 {feat.gray_trend:+.1f}/s，"
-                         f"清晰度变化 {feat.edge_trend:+.3f}/s")
+            g = float(feat.area_growth)
+            if abs(g) < 0.10:
+                g_txt = "面积基本不变"
+            elif g > 0.25:
+                g_txt = "面积在快速扩散"
+            elif g > 0:
+                g_txt = "面积在缓慢扩大"
+            else:
+                g_txt = "面积在收缩"
+            jitter = abs(float(feat.gray_trend)) + abs(float(feat.edge_trend)) * 10
+            j_txt = "亮度与边缘都在抖动" if jitter > 2.0 else "亮度与边缘都很稳定"
+            lines.append(f"时序观测：已持续 {feat.duration:.1f}s，{g_txt}（{g:+.2f}/s），"
+                         f"{j_txt}（亮度 {feat.gray_trend:+.1f}/s，"
+                         f"清晰度 {feat.edge_trend:+.3f}/s）")
+            lines.append("参考：固定光源/反光通常面积与亮度都不变、边缘稳定；"
+                         "燃烧通常面积在涨、亮度或边缘有抖动。这只是参考，仍以画面为准。")
         lines.append(f"第一遍检测给出：{context or '疑似火/烟'}")
         lines.append("请判断是否有火灾风险。")
         return "\n".join(lines)
@@ -514,6 +528,18 @@ class LlmArbiter:
                              f"裁判不可用（{why}），按规则层结论处理", "rule", latency)
 
 
-def _pos_text(rh: int, rw: int, fh: int, fw: int) -> str:
-    """这里只能给出尺寸占比，位置在调用方已经通过框坐标表达，不重复算。"""
-    return f"{'偏大' if rw * rh / max(fw * fh, 1) > 0.15 else '中等'}"
+def _pos_text(rh: int, rw: int, fh: int, fw: int, box=None) -> str:
+    """给出可疑区域在画面中的**方位**。
+
+    原来只返回"偏大/中等"，那说的是尺寸不是位置 —— 模型拿到一张裁剪图和
+    "在画面中等"，依然不知道它拍的是天花板还是桌面。而"手电筒举在画面中央"
+    和"墙角起火"在判断上完全是两回事，方位是有效线索。
+    """
+    size = "占画面比例较大" if rw * rh / max(fw * fh, 1) > 0.15 else "占画面比例中等"
+    if not box:
+        return size
+    x1, y1, x2, y2 = box
+    cx, cy = (x1 + x2) / 2.0 / max(fw, 1), (y1 + y2) / 2.0 / max(fh, 1)
+    horiz = "左侧" if cx < 0.33 else ("右侧" if cx > 0.67 else "中部")
+    vert = "上方" if cy < 0.33 else ("下方" if cy > 0.67 else "中间高度")
+    return f"位于画面{horiz}{vert}，{size}"
