@@ -1,5 +1,8 @@
 # 时序判别的现场阈值（改这里，不要改代码）
 min_duration: 1.5
+# 亮度/清晰度走向需要足够长的观测窗口才可信（轨迹刚建立时框在长大，
+# 斜率由几何变化主导，实测 1.6s 能算出 -9.5/s 的假"变黑"）
+trend_min_duration: 5.0
 area_growth_steam: 0.55
 area_growth_smoke: 0.25
 edge_drop_steam: -0.35

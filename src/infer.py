@@ -83,7 +83,9 @@ class Detector:
     ----
     weights   : .pt 权重路径
     conf      : 置信度门限（部署建议 fire 0.30 / smoke 0.45，这里用统一值，可再按类过滤）
-    imgsz     : 单次前向的输入尺寸。**必须和训练时一致**，v3 实测推理改尺寸会掉点
+    imgsz     : 单次前向的输入尺寸。**不必等于训练尺寸** —— v5 实测（test 集）推理改 896
+                时 fire mAP50-95 从 0.4194 升到 0.4332，比按训练尺寸 960 推理更好。
+                原因：YOLO 推理可以做 letterbox 缩放，896 的框定位更贴边，960 反而摊薄了密度
     tile_grid : 切片数（2 表示 2x2）。1 = 不切片
     overlap   : 切片重叠比例，0.25 表示相邻切片重叠 25% 宽高（防目标正好落在切线）
     """
@@ -93,7 +95,7 @@ class Detector:
         weights: str,
         conf: float = 0.35,
         iou: float = 0.5,
-        imgsz: int = 640,
+        imgsz: int = 896,
         device: str | int = 0,
         classes: Sequence[int] | None = None,
     ) -> None:

@@ -136,6 +136,11 @@ def extract_features(samples: list[TrackletSample]) -> TemporalFeatures | None:
 # 建议调完写进 config/temporal.yaml，别改代码。
 DEFAULTS = {
     "min_duration": 1.5,        # 少于 1.5 秒不下结论（信息不够）
+    # 走向类特征（亮度/清晰度）的最小观测窗口。
+    # 为什么单列：轨迹刚建立时框还在长，框内均值被"框变大把背景吃进来"主导，
+    # 实测合成序列里 1.6s 就能算出 -9.5/s 的亮度斜率 —— 那是几何变化，不是烟在变黑。
+    # 不加这条，任何刚出现的烟都会在 2 秒内被判成 smoke，等于绕过时序判别。
+    "trend_min_duration": 5.0,
     "area_growth_steam": 0.55,  # 面积对数增长率 > 这个值，倾向蒸汽/水雾
     "area_growth_smoke": 0.25,  # 低于这个值更像烟（缓慢持续）
     "edge_drop_steam": -0.35,   # 清晰度快速下降 → 蒸汽
@@ -183,19 +188,24 @@ def judge(feat: TemporalFeatures | None, *, thr: dict | None = None,
         why.append(f"面积增长缓慢（{feat.area_growth:.2f}/s），符合持续供烟")
 
     # ② 清晰度变化：蒸汽越来越糊，烟纹理相对稳定
-    if feat.edge_trend <= t["edge_drop_steam"]:
-        steam += 0.25
-        why.append(f"边界快速变糊（{feat.edge_trend:.2f}/s），是水汽扩散的典型表现")
-    elif feat.edge_trend > 0:
-        smoke += 0.10
-
     # ③ 亮度走向：烟会由白转灰/黑，蒸汽只会变淡（亮度上升或平稳）
-    if feat.gray_trend <= t["gray_drop_smoke"]:
-        smoke += 0.35
-        why.append(f"整体变暗（{feat.gray_trend:.2f}/s），白烟转灰黑")
-    elif feat.gray_trend >= 0.5:
-        steam += 0.20
-        why.append(f"整体变亮（{feat.gray_trend:.2f}/s），更像水汽消散")
+    # 这两条都是"走向"，观测窗口不够时斜率不可信（见 trend_min_duration 的注释）
+    if feat.duration < t["trend_min_duration"]:
+        why.append(f"观测仅 {feat.duration:.1f}s，暂不看亮度/清晰度走向"
+                   f"（需 {t['trend_min_duration']:.0f}s）")
+    else:
+        if feat.edge_trend <= t["edge_drop_steam"]:
+            steam += 0.25
+            why.append(f"边界快速变糊（{feat.edge_trend:.2f}/s），是水汽扩散的典型表现")
+        elif feat.edge_trend > 0:
+            smoke += 0.10
+
+        if feat.gray_trend <= t["gray_drop_smoke"]:
+            smoke += 0.35
+            why.append(f"整体变暗（{feat.gray_trend:.2f}/s），白烟转灰黑")
+        elif feat.gray_trend >= 0.5:
+            steam += 0.20
+            why.append(f"整体变亮（{feat.gray_trend:.2f}/s），更像水汽消散")
 
     # ④ 存续时长：烟长、蒸汽短
     if feat.duration < t["short_life"]:

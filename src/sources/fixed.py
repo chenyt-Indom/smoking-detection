@@ -34,13 +34,19 @@ class BackgroundModel:
     """中值背景 + MOG2 的组合前景检测。"""
 
     def __init__(self, warmup: int = 30, history: int = 500,
-                 var_threshold: float = 16.0, min_area: int = 120):
+                 var_threshold: float = 16.0, min_area: int = 120,
+                 refresh_every: int = 30):
         self.warmup = warmup            # 前 N 帧只建背景，不报前景
         self.history = history
         self.var_threshold = var_threshold
         self.min_area = min_area
         self.frames: list[np.ndarray] = []
         self._bg_median: np.ndarray | None = None
+        # 中值背景**不能每帧重算**：500 帧 stack + median 在 960x540 上实测 ~0.7s/帧，
+        # 比 YOLO 推理还贵一个量级，整条流水线会被拖到 1fps。
+        # 背景本身是"长时中值"，20 秒窗口内变化极慢，每 refresh_every 帧刷一次足够。
+        self.refresh_every = max(1, refresh_every)
+        self._bg_age = 10 ** 9          # 首次必须立刻建
         self._mog2 = cv2.createBackgroundSubtractorMOG2(
             history=history, varThreshold=var_threshold, detectShadows=False
         ) if cv2 is not None else None
@@ -50,9 +56,11 @@ class BackgroundModel:
     def _median(self) -> np.ndarray | None:
         if not self.frames:
             return None
-        if self._bg_median is None or len(self.frames) >= self.warmup:
+        if self._bg_median is None or self._bg_age >= self.refresh_every:
             self._bg_median = np.median(np.stack(self.frames[-self.history:]), axis=0
                                         ).astype(np.uint8)
+            self._bg_age = 0
+        self._bg_age += 1
         return self._bg_median
 
     def lighting_jump(self, gray_mean: float) -> bool:
