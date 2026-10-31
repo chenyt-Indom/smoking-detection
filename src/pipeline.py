@@ -56,8 +56,8 @@ from .tracker import IoUTracker, Track
 DEFAULTS = {
     # ── 检测门限：按类别分别设 ──────────────────────────────
     "det_conf": 0.20,          # 送进检测器的总门限（压很低，保召回）
-    "fire_conf": 0.30,         # 火：框级门限
-    "smoke_conf": 0.45,        # 烟：框级门限（烟的单帧置信更虚，要提高）
+    "fire_conf": 0.45,         # 火：告警阈值（画框另有更低的 det_conf，见 liveview）
+    "smoke_conf": 0.50,        # 烟：告警阈值
 
     # ── 事件确认 ────────────────────────────────────────────
     # 火：连续命中几帧才报。从 3 提到 5 是为了让闪烁闸有足够样本：
@@ -115,8 +115,13 @@ DEFAULTS = {
     #   高于 llm_sure_conf → 规则层自己就能定，花钱问模型纯浪费
     #   低于 llm_min_conf  → 模型看了多半也是噪声，救了也是误报
     # 两头都省，只留中间那段真正需要判断的。
-    "llm_min_conf": 0.50,
-    "llm_sure_conf": 0.85,
+    # 送审下限必须**低于**报警阈值，否则会出现"不够格送审、却够格报警"的漏洞：
+    # 实测 conf 0.47 撞上 fire_conf 0.45，跳过裁判直接报了火情。
+    "llm_min_conf": 0.35,
+    # 免裁线：达到这个置信度才允许不送审直接定性。
+    # 设太高浪费钱，设太低会让检测器单方面定性 —— 实测 0.85 时一张人脸被
+    # 直接推成「火情」，裁判根本没参与。0.92 是"基本只可能是真火"的量级。
+    "llm_sure_conf": 0.92,
     # 规则层置信度高于此值时，LLM 判"非风险"也**只能降级为待确认，不能直接排除**。
     # 依据：实测出现过 YOLO 给 0.95、LLM 一句 "light" 就把它抹掉的情况，
     # 而画面里确实有火 —— 两个信号冲突时应该交给人看，不该由模型单方面裁决。
@@ -339,6 +344,19 @@ class Pipeline:
         if hasattr(self.detector, "conf"):
             self.detector.conf = self.cfg["det_conf"]
 
+        # 一致性校验：送审下限必须**低于**每一类的报警阈值。
+        # 否则会存在这样的目标 —— 够格报警(fire_conf)却不够格送审(llm_min_conf)，
+        # 于是规则层绕过裁判直接定性。实测就踩过：conf 0.47 撞上 0.45 报了火情，
+        # 而 0.47 < 0.50 的送审下限，裁判根本没看到它。
+        low = float(self.cfg.get("llm_min_conf", 0.35))
+        for key in ("fire_conf", "smoke_conf"):
+            if key in self.cfg and low > float(self.cfg[key]):
+                fixed = max(0.05, float(self.cfg[key]) - 0.05)
+                print(f"[warn] llm_min_conf({low}) 高于 {key}({self.cfg[key]})，"
+                      f"会漏送一部分告警目标；已自动下调到 {fixed:.2f}", flush=True)
+                self.cfg["llm_min_conf"] = fixed
+                low = fixed
+
         self._fire_streak: dict[int, int] = {}
         self._smoke_streak: dict[int, int] = {}
         self._notice_streak: dict[int, int] = {}
@@ -485,6 +503,17 @@ class Pipeline:
         if level in ("warning", "alarm"):
             self._fired.add(tid)
             self._recent_alarms.append((pkt.ts, kind, tuple(float(v) for v in box), tid))
+        # 规则层**不允许**单方面把目标定性成"火情"。
+        #
+        # 实测事故：人脸被强光打到 conf 0.47，因为低于 llm_min_conf 没送去裁判，
+        # 规则层就凭"连续 6 帧命中"直接推了「火情」——值班员看到的就是一条
+        # 明明白白的误报。YOLO 只能回答"这里像火"，不能回答"这就是火"，
+        # 定性必须由裁判做，或者置信度高到无需裁决。
+        if level == "alarm" and float(score) < float(self.cfg.get("llm_sure_conf", 0.85)):
+            self.stats["alarm_downgraded"] = self.stats.get("alarm_downgraded", 0) + 1
+            level = "notice"
+            reasons = [f"置信 {score:.2f} 不足以直接定性，待人工确认"] + list(reasons)[:1]
+
         snap = crop_box(pkt.image, box, self.cfg["snapshot_margin"],
                         self.cfg["snapshot_max_side"])
         # 同时留一张标了框的全景图：ROI 只能看"是什么"，全景才能看"在哪"
