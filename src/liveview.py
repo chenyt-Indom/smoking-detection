@@ -41,10 +41,17 @@ class LiveView:
     """最新帧的单一存放点：pipeline 写，HTTP 线程读。"""
 
     def __init__(self, *, max_width: int = 1280, jpeg_quality: int = 80,
-                 fps_limit: float = 12.0):
+                 fps_limit: float = 12.0, max_bytes: int = 90000,
+                 fallback_quality: int = 50):
         self.max_width = max_width
         self.jpeg_quality = int(jpeg_quality)
         self.min_interval = 1.0 / max(fps_limit, 1.0)
+        # 体积兜底：静止画面一帧约 26KB，但画面剧烈变化（开关灯、大幅移动）
+        # 时压缩率骤降，实测能到 143KB —— 编码本身只多花 0.4ms，可传输和
+        # 浏览器解码会明显变慢，前端串行拉取时表现为"画面一变就停一下"。
+        # 超过上限就降一档质量重编，体积能砍一半，代价才 0.3ms。
+        self.max_bytes = int(max_bytes)
+        self.fallback_quality = int(fallback_quality)
 
         self._cond = threading.Condition(threading.Lock())
         self._jpeg: bytes | None = None
@@ -71,6 +78,12 @@ class LiveView:
                                    [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
             if not ok:
                 return False
+            if len(buf) > self.max_bytes:
+                ok2, buf2 = cv2.imencode(
+                    ".jpg", drawn,
+                    [int(cv2.IMWRITE_JPEG_QUALITY), self.fallback_quality])
+                if ok2 and len(buf2) < len(buf):
+                    buf = buf2
             jpeg = buf.tobytes()
         except Exception:                      # noqa: BLE001  画框失败绝不能拖垮检测
             return False

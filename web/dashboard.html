@@ -215,30 +215,23 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
   // 后端没给充值地址时的兜底（天翼云控制台）
   let RECHARGE_URL = "https://www.ctyun.cn/";
 
-  // ── 1. 实时画面：逐帧拉取（比 MJPEG 兼容性好得多）─────────
+  // ── 1. 实时画面：预加载式逐帧拉取 ─────────────────────────
   //
-  // 早年用 /stream 的 MJPEG，接口有数据但浏览器/WebView/预览面板里就是黑屏。
-  // 改成串行拉 /api/frame.jpg：上一帧 onload 之后再拉下一帧，天然不会堆积请求，
-  // 帧率上限由后端发布速度决定（当前 20~25fps）。
+  // 为什么不用 img.src=... 直接换：浏览器遇到 Cache-Control: no-store 会重新
+  // 请求，而且换 src 会取消上一帧的加载 —— 画面剧烈变化时单帧变大，
+  // 正在下的那一帧被反复取消，看起来就是"画面一变就停住"。
+  // 改成 fetch 拿 blob、加载完再一次性换上，配 busy 标志避免堆积。
   const img = $("stream");
-  let frameN = 0, errStreak = 0, streamOk = false;
+  let frameN = 0, errStreak = 0, streamOk = false, busy = false;
+  let curUrl = null;
 
-  // 注意：这里**不能**判断 document.hidden 就停拉。
-  // 内嵌预览面板/WebView 里页面常被判定为 hidden，一加这个判断就永远不拉第一帧，
-  // 表现就是"一直是黑屏 + 等待画面"。监控页面本来就该持续拉取。
-  function pullFrame(){
-    img.src = "/api/frame.jpg?n=" + (++frameN);
-  }
-
-  img.addEventListener("load", () => {
+  function onFrameOk(){
     errStreak = 0; streamOk = true;
     $("nosignal").classList.add("hide");
     $("streamDot").className = "dot on";
     $("streamState").textContent = "在线";
-    setTimeout(pullFrame, 0);           // 上一帧画完立刻拉下一帧，不加人为延迟
-  });
-
-  img.addEventListener("error", () => {
+  }
+  function onFrameErr(){
     errStreak++;
     if (errStreak >= 3){
       streamOk = false;
@@ -248,9 +241,28 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
       $("nsTitle").textContent = "取不到画面";
       $("nsHint").textContent = "已连续失败 " + errStreak + " 次 · 检查主程序是否在跑";
     }
-    setTimeout(pullFrame, 300);
-  });
+  }
 
+  async function pullFrame(){
+    if (busy) return;               // 上一帧还没下完，这轮跳过（不取消、不排队）
+    busy = true;
+    try{
+      const r = await fetch("/api/frame.jpg?n=" + (++frameN), {cache:"no-store"});
+      if (!r.ok) throw new Error("HTTP " + r.status);
+      const blob = await r.blob();
+      const url = URL.createObjectURL(blob);
+      img.src = url;
+      if (curUrl) URL.revokeObjectURL(curUrl);   // 释放上一帧，防内存涨
+      curUrl = url;
+      onFrameOk();
+    }catch(e){
+      onFrameErr();
+    }finally{
+      busy = false;
+    }
+  }
+
+  setInterval(pullFrame, 30);        // 固定节奏尝试，实际帧率由后端决定
   pullFrame();
 
   // ── 2. 当前检测：轮询细节（框已经画在图上了）──────────────
