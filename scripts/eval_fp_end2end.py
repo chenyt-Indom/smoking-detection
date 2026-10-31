@@ -66,7 +66,8 @@ def frames_of(imgs, hold: int, rng):
             yield np.clip(noisy, 0, 255).astype(np.uint8)
 
 
-def run(imgs, hold: int, gate: bool, imgsz: int):
+def run(imgs, hold: int, gate: bool, imgsz: int,
+        fire_conf: float | None = None, smoke_conf: float | None = None):
     """一个场景一套干净的流水线状态。
 
     为什么不是所有场景塞进同一次 run：`_can_alarm`/`_can_notice` 的冷却按**区域**
@@ -79,12 +80,17 @@ def run(imgs, hold: int, gate: bool, imgsz: int):
     evs: list = []
     st_acc: dict = {}
     for i, im in enumerate(imgs):
-        pipe = Pipeline(det, cfg={
+        cfg = {
             "detect_mode": "auto",          # 和线上一致
             "flicker_gate": gate,
             "light_memory": False,          # 别读也别写现场那份记忆文件
             "fast_smoke": False,
-        }, arbiter=None)                    # 没有 LLM：最坏情况，全靠规则层
+        }
+        if fire_conf is not None:
+            cfg["fire_conf"] = fire_conf
+        if smoke_conf is not None:
+            cfg["smoke_conf"] = smoke_conf
+        pipe = Pipeline(det, cfg=cfg, arbiter=None)   # 没有 LLM：最坏情况，全靠规则层
         src = FixedCameraSource(CameraInfo(cam_id=f"fp_{i}", kind="fixed", fps=FPS),
                                 frames=frames_of([im], hold, rng), warmup=0)
         one: list = []
@@ -103,6 +109,12 @@ def main() -> int:
     ap.add_argument("--hold", type=int, default=100, help="每个场景连续多少帧")
     ap.add_argument("--imgsz", type=int, default=896)
     ap.add_argument("--bg-dir", default=str(BG))
+    ap.add_argument("--gate-only", action="store_true",
+                    help="只跑闸开那一种（对比阈值时省一半时间，闸关的结果上次已有）")
+    ap.add_argument("--fire-conf", type=float, default=None,
+                    help="覆盖流水线的 fire_conf（默认 0.30）")
+    ap.add_argument("--smoke-conf", type=float, default=None,
+                    help="覆盖流水线的 smoke_conf（默认 0.45）")
     ap.add_argument("--size", default="640x480",
                     help="只取这个尺寸的图（WxH）。**不要改成拉伸对齐** —— "
                          "拉伸会改目标尺度，评出来的不是同一件事")
@@ -127,8 +139,8 @@ def main() -> int:
     print(f"权重 {WEIGHTS.name}  imgsz={a.imgsz}  检测策略 auto\n")
 
     rows = []
-    for gate in (True, False):
-        evs, st = run(imgs, a.hold, gate, a.imgsz)
+    for gate in ((True,) if a.gate_only else (True, False)):
+        evs, st = run(imgs, a.hold, gate, a.imgsz, a.fire_conf, a.smoke_conf)
         formal = [e for e in evs if e.level in ("warning", "alarm")]
         notice = [e for e in evs if e.level == "notice"]
         # 每个场景一个独立 cam_id（fp_0、fp_1…），所以撞上误报的**场景数**直接可数
@@ -145,10 +157,15 @@ def main() -> int:
                   f"t={e.t_alarm:.1f}s score={e.score:.2f}")
         print()
 
-    on, off = rows[0], rows[1]
-    print("=" * 62)
-    print(f"闪烁闸把正式告警从 {len(off[1])} 条压到 {len(on[1])} 条"
-          f"（notice 从 {len(off[2])} 涨到 {len(on[2])} 条 —— 降级不是排除）")
+    on = rows[0]
+    if len(rows) > 1:
+        off = rows[1]
+        print("=" * 62)
+        print(f"闪烁闸把正式告警从 {len(off[1])} 条压到 {len(on[1])} 条"
+              f"（notice 从 {len(off[2])} 涨到 {len(on[2])} 条 —— 降级不是排除）")
+    else:
+        print("=" * 62)
+        print(f"闸开：正式告警 {len(on[1])} 条 / notice {len(on[2])} 条")
     print("注意：这里每张图都是不同场景，别把条数按小时外推。")
     return 0
 
