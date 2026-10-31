@@ -38,8 +38,22 @@ header{
 .dot.warn{background:var(--warn)}
 main{flex:1; display:grid; grid-template-columns:minmax(0,1fr) 380px; min-height:0}
 #left{display:flex; flex-direction:column; min-width:0; min-height:0; border-right:1px solid var(--line)}
-.viewport{position:relative; flex:1; min-height:320px; background:#05070a; display:flex;
-  align-items:center; justify-content:center; overflow:hidden}
+.viewport{position:relative; flex:1; min-height:320px; background:#05070a; display:grid;
+  gap:6px; padding:6px; overflow:hidden}
+.viewport.n1{grid-template-columns:1fr; grid-template-rows:1fr}
+.viewport.n2{grid-template-columns:1fr 1fr; grid-template-rows:1fr}
+.viewport.n3,.viewport.n4{grid-template-columns:1fr 1fr; grid-template-rows:1fr 1fr}
+.cam-cell{position:relative; min-width:0; min-height:0; background:#05070a;
+  border-radius:6px; overflow:hidden; display:flex; align-items:center; justify-content:center}
+.cam-cell img{max-width:100%; max-height:100%; display:block; min-height:1px}
+.cam-label{position:absolute; left:8px; top:6px; font-size:11px; color:#cfd6e0;
+  background:rgba(6,10,16,.72); padding:2px 8px; border-radius:4px;
+  font-variant-numeric:tabular-nums; pointer-events:none}
+.cam-label b{color:#fff; font-weight:600}
+.cam-dot{display:inline-block;width:6px;height:6px;border-radius:50%;
+  background:var(--dim); margin-right:5px; vertical-align:1px}
+.cam-dot.on{background:var(--ok);box-shadow:0 0 5px var(--ok)}
+.cam-dot.off{background:var(--err)}
 #stream{max-width:100%; max-height:100%; display:block; min-height:1px}
 #nosignal{
   position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
@@ -146,10 +160,7 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
 
 <main>
   <section id="left">
-    <div class="viewport">
-      <div class="corner c1"></div><div class="corner c2"></div>
-      <div class="corner c3"></div><div class="corner c4"></div>
-      <img id="stream" alt="实时画面">
+    <div class="viewport n1" id="cams">
       <div id="nosignal">
         <div class="ring"></div>
         <div id="nsTitle">等待画面…</div>
@@ -159,7 +170,7 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
     <div class="dets">
       <h3>当前检测 <span id="detCount" style="color:var(--dim)">0 个目标</span></h3>
       <table>
-        <thead><tr><th>类别</th><th>置信度</th><th>位置 (x1,y1,x2,y2)</th><th>面积</th></tr></thead>
+        <thead><tr><th>镜头</th><th>类别</th><th>置信度</th><th>位置 (x1,y1,x2,y2)</th><th>面积</th></tr></thead>
         <tbody id="detBody"><tr><td colspan="4" class="empty">画面中没有检测到目标</td></tr></tbody>
       </table>
     </div>
@@ -215,96 +226,109 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
   // 后端没给充值地址时的兜底（天翼云控制台）
   let RECHARGE_URL = "https://www.ctyun.cn/";
 
-  // ── 1. 实时画面：预加载式逐帧拉取 ─────────────────────────
+  // ── 1. 实时画面：多路网格，每路独立预加载 ─────────────────
   //
-  // 为什么不用 img.src=... 直接换：浏览器遇到 Cache-Control: no-store 会重新
-  // 请求，而且换 src 会取消上一帧的加载 —— 画面剧烈变化时单帧变大，
-  // 正在下的那一帧被反复取消，看起来就是"画面一变就停住"。
-  // 改成 fetch 拿 blob、加载完再一次性换上，配 busy 标志避免堆积。
-  const img = $("stream");
-  let frameN = 0, errStreak = 0, streamOk = false, busy = false;
-  let curUrl = null;
+  // 用 fetch+blob 而不是直接换 img.src：后者会取消上一帧的加载，
+  // 画面突变（帧变大）时正在下的那帧被反复取消，看起来就是"停住"。
+  const camCells = [];      // {id, img, dot, cnt, busy, err, curUrl, n}
 
-  function onFrameOk(){
-    errStreak = 0; streamOk = true;
-    $("nosignal").classList.add("hide");
-    $("streamDot").className = "dot on";
-    $("streamState").textContent = "在线";
-  }
-  function onFrameErr(){
-    errStreak++;
-    if (errStreak >= 3){
-      streamOk = false;
-      $("nosignal").classList.remove("hide");
-      $("streamDot").className = "dot off";
-      $("streamState").textContent = "断开";
-      $("nsTitle").textContent = "取不到画面";
-      $("nsHint").textContent = "已连续失败 " + errStreak + " 次 · 检查主程序是否在跑";
-    }
-  }
-
-  async function pullFrame(){
-    if (busy) return;               // 上一帧还没下完，这轮跳过（不取消、不排队）
-    busy = true;
+  async function initCams(){
+    let list = [];
     try{
-      const r = await fetch("/api/frame.jpg?n=" + (++frameN), {cache:"no-store"});
+      const r = await fetch("/api/cams", {cache:"no-store"});
+      list = await r.json();
+    }catch(e){ /* 后端没这个接口时走兜底 */ }
+    if (!Array.isArray(list) || !list.length) list = [{cam: "default"}];
+
+    const box = $("cams");
+    box.className = "viewport n" + Math.min(4, Math.max(1, list.length));
+    const anchor = $("nosignal");
+
+    for (const c of list){
+      const el = document.createElement("div");
+      el.className = "cam-cell";
+      el.innerHTML =
+        '<img alt="' + esc(c.cam) + '">' +
+        '<div class="cam-label"><span class="cam-dot" data-dot></span>' +
+        '<b>' + esc(c.cam) + '</b> <span data-cnt style="color:var(--dim)"></span></div>';
+      box.insertBefore(el, anchor);
+      camCells.push({
+        id: c.cam,
+        img: el.querySelector("img"),
+        dot: el.querySelector("[data-dot]"),
+        cnt: el.querySelector("[data-cnt]"),
+        busy: false, err: 0, curUrl: null, n: 0
+      });
+    }
+    anchor.classList.add("hide");
+    // 每路一个固定节奏的拉取循环（各路并行，互不等待）
+    camCells.forEach(c => setInterval(() => pullCam(c), 50));
+    camCells.forEach(c => pullCam(c));
+  }
+
+  async function pullCam(c){
+    if (c.busy) return;                 // 上一帧没下完就跳过，不取消、不堆积
+    c.busy = true;
+    try{
+      const r = await fetch("/api/frame.jpg?cam=" + encodeURIComponent(c.id) +
+                            "&n=" + (++c.n), {cache:"no-store"});
       if (!r.ok) throw new Error("HTTP " + r.status);
       const blob = await r.blob();
       const url = URL.createObjectURL(blob);
-      img.src = url;
-      if (curUrl) URL.revokeObjectURL(curUrl);   // 释放上一帧，防内存涨
-      curUrl = url;
-      onFrameOk();
+      c.img.src = url;
+      if (c.curUrl) URL.revokeObjectURL(c.curUrl);   // 释放上一帧，防内存涨
+      c.curUrl = url;
+      c.err = 0;
+      c.dot.className = "cam-dot on";
     }catch(e){
-      onFrameErr();
+      if (++c.err >= 3) c.dot.className = "cam-dot off";
     }finally{
-      busy = false;
+      c.busy = false;
     }
   }
 
-  setInterval(pullFrame, 50);        // 50ms 一次 = 20fps 上限，配合后端发布节奏够用，也少占连接
-  pullFrame();
-
-  // ── 2. 当前检测：轮询细节（框已经画在图上了）──────────────
-  let lastSeq = -1;
-  async function pollState(){
+  // ── 2. 检测详情：一次拿回所有路，合并成一张表 ─────────────
+  let lastSeq = "";
+  async function pollCams(){
     try{
-      const r = await fetch("/api/state", {cache:"no-store"});
-      const s = await r.json();
-      if (s && s.seq !== lastSeq){
-        lastSeq = s.seq;
-        renderDets(s);
+      const r = await fetch("/api/cams", {cache:"no-store"});
+      const list = await r.json();
+      if (!Array.isArray(list)) return;
+
+      let all = [], nf = 0, ns = 0, detFps = 0;
+      for (const s of list){
+        const cts = s.counts || {};
+        const f = cts.fire || 0, sm = cts.smoke || 0;
+        nf += f; ns += sm;
+        detFps = Math.max(detFps, s.fps || 0);
+        const cell = camCells.find(x => x.id === s.cam);
+        if (cell){
+          cell.cnt.textContent = (f || sm)
+            ? "火 " + f + " · 烟 " + sm : "";
+        }
+        const W = (s.size && s.size[0]) || 1, H = (s.size && s.size[1]) || 1;
+        for (const d of (s.dets || [])) all.push({ d, cam: s.cam, W, H });
       }
-      if (!streamOk){
-        $("streamDot").className = "dot on";
-        $("streamState").textContent = "在线";
-        $("nosignal").classList.add("hide");
-      }
-    }catch(e){
-      $("streamDot").className = "dot off";
-      $("streamState").textContent = "无响应";
-    }
+      $("nFire").textContent = nf;
+      $("nSmoke").textContent = ns;
+      $("detFps").textContent = detFps.toFixed(1);
+      renderDets(all);
+    }catch(e){ /* 下一轮再试 */ }
   }
 
-  function renderDets(s){
-    const dets = s.dets || [];
-    const c = s.counts || {};
-    $("nFire").textContent = c.fire || 0;
-    $("nSmoke").textContent = c.smoke || 0;
-    $("detFps").textContent = (s.fps || 0).toFixed(1);
-    $("detCount").textContent = dets.length + " 个目标";
-
+  function renderDets(all){
+    $("detCount").textContent = all.length + " 个目标";
     const body = $("detBody");
-    if (!dets.length){
-      body.innerHTML = '<tr><td colspan="4" class="empty">画面中没有检测到目标</td></tr>';
+    if (!all.length){
+      body.innerHTML = '<tr><td colspan="5" class="empty">画面中没有检测到目标</td></tr>';
       return;
     }
-    const W = (s.size && s.size[0]) || 1, H = (s.size && s.size[1]) || 1;
-    body.innerHTML = dets.map(d => {
+    body.innerHTML = all.map(({ d, cam, W, H }) => {
       const b = d.xyxy || [0,0,0,0];
       const area = (((b[2]-b[0])*(b[3]-b[1])) / (W*H) * 100).toFixed(2);
       const cls = (d.name || "").toLowerCase();
       return '<tr>'
+        + '<td style="color:var(--dim)" class="mono">' + esc(cam) + '</td>'
         + '<td class="cls ' + cls + '">' + (NAME_CN[cls] || d.name) + '</td>'
         + '<td>' + (d.conf*100).toFixed(1) + '%</td>'
         + '<td class="mono" style="color:var(--muted)">'
@@ -313,7 +337,7 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
         + '</tr>';
     }).join("");
   }
-  setInterval(pollState, 300);
+  setInterval(pollCams, 400);
 
   // ── 3. 事件流：SSE + 人工反馈 ────────────────────────────
   const eventsEl = $("events");
@@ -517,6 +541,8 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
   $("btnTopUp").addEventListener("click", topUp);
   $("btnTopUp2").addEventListener("click", topUp);
 
+  initCams();
+  pollCams();
   pollLlm();
 })();
 </script>

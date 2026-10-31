@@ -111,6 +111,12 @@ DEFAULTS = {
     # 规则路径就接手把这个目标重新报成 ALARM —— 等于裁判白判，还多花了一次钱。
     # 静默时长和裁判自己的去重窗口对齐，过了这个时间才允许重新送审。
     "llm_mute_sec": 180.0,
+    # 置信度闸门：LLM 只在"规则拿不准"的区间里用。
+    #   高于 llm_sure_conf → 规则层自己就能定，花钱问模型纯浪费
+    #   低于 llm_min_conf  → 模型看了多半也是噪声，救了也是误报
+    # 两头都省，只留中间那段真正需要判断的。
+    "llm_min_conf": 0.50,
+    "llm_sure_conf": 0.85,
     # 被判为非风险的目标，判完之后又活了这么久 → 把人叫回来复核。
     # 真蒸汽几秒最多十几秒就散，撑过 30 秒本身就说明裁判可能看错了。
     # 这也是漏报的兜底：不给这条，一次误判就是一个完全静默的窗口。
@@ -580,6 +586,14 @@ class Pipeline:
         if self._region_muted(pkt.cam_id, box_n, pkt.ts):
             self._count_saved(tid)
             return True
+
+        # 置信度闸门（省钱的核心）：只在规则拿不准的区间才花钱
+        sure = float(self.cfg.get("llm_sure_conf", 0.85))
+        low = float(self.cfg.get("llm_min_conf", 0.50))
+        if score >= sure or score < low:
+            self.stats["llm_gated"] = self.stats.get("llm_gated", 0) + 1
+            return False          # 交回规则层，一次 API 都不花
+
         ok, _why = self.arbiter.submit(
             key, pkt.image, box, rule_label=kind, rule_score=score,
             context=f"{kind}，检测 conf {t.samples[-1].conf:.2f}，轨迹已命中 {t.hits} 帧",

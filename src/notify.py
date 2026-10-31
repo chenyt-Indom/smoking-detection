@@ -27,7 +27,7 @@ import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 import cv2
 
@@ -43,15 +43,45 @@ class Notifier:
                  webhook_url: str = "", max_history: int = 300,
                  dashboard: str | os.PathLike | None = None,
                  report_dir: str | os.PathLike | None = None,
-                 live=None):
+                 live=None, lives=None):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.host, self.port = host, port
         self.webhook_url = webhook_url
         self.max_history = max_history
-        # 实时画面（src/liveview.py）。为 None 时 /stream 返回 503，
-        # 其余功能（事件流、反馈）照常工作。
-        self.live = live
+        # 实时画面：支持多路。key 是 cam_id，前端用 ?cam=xxx 指定。
+        # 传单个 live 时自动归到 "default"，保持旧调用方式可用。
+        if lives is not None:
+            self.lives: dict[str, object] = dict(lives)
+        elif live is not None:
+            self.lives = {"default": live}
+        else:
+            self.lives = {}
+
+        self._clients: list[queue.Queue] = []
+        self._history: list[dict] = []
+        self._lock = threading.Lock()
+        self._httpd: ThreadingHTTPServer | None = None
+        self._thread: threading.Thread | None = None
+        # 事件落盘队列：把磁盘 IO 从检测主循环里彻底摘出去
+        self._wq: queue.Queue = queue.Queue(maxsize=2000)
+        self._wthread = threading.Thread(target=self._writer_loop, name="event-writer",
+                                         daemon=True)
+        self._wthread.start()
+        self.stats = {"pushed": 0, "clients": 0, "errors": 0}
+
+    def _pick_live(self, cam: str | None):
+        """按 cam 参数挑一路。没给就返回第一路（单摄像头时的常规用法）。"""
+        if not self.lives:
+            return None
+        if cam and cam in self.lives:
+            return self.lives[cam]
+        return next(iter(self.lives.values()))
+
+    @property
+    def live(self):
+        """兼容旧代码：返回第一路。"""
+        return next(iter(self.lives.values())) if self.lives else None
         self.dashboard = Path(dashboard) if dashboard else (
             Path(__file__).resolve().parent.parent / "web" / "dashboard.html")
         # 人工标注的误报落在这里，等 scripts/merge_hard_negatives.py 回流进训练集
@@ -299,7 +329,9 @@ class Notifier:
                 self.wfile.write(body)
 
             def do_GET(self):                        # noqa: N802
-                path = urlparse(self.path).path
+                parsed = urlparse(self.path)
+                path = parsed.path
+                cam = (parse_qs(parsed.query).get("cam") or [None])[0]
 
                 if path in ("/", "/index.html"):
                     if not notifier.dashboard.exists():
@@ -318,7 +350,8 @@ class Notifier:
 
                 if path == "/stream":
                     # MJPEG：每一帧都是一个独立 JPEG 分片，浏览器 <img> 直接能放
-                    if notifier.live is None:
+                    view = notifier._pick_live(cam)
+                    if view is None:
                         self._send(503, "text/plain; charset=utf-8",
                                    "实时画面未启用（主程序没接 LiveView）".encode())
                         return
@@ -330,7 +363,7 @@ class Notifier:
                     self.send_header("X-Accel-Buffering", "no")
                     self.end_headers()
                     try:
-                        for chunk in notifier.live.mjpeg_iter():
+                        for chunk in view.mjpeg_iter():
                             self.wfile.write(chunk)
                             self.wfile.flush()
                     except (BrokenPipeError, ConnectionResetError, OSError):
@@ -338,8 +371,8 @@ class Notifier:
                     return
 
                 if path == "/api/frame.jpg":
-                    jpeg = (notifier.live.frame_bytes()
-                            if notifier.live is not None else None)
+                    view = notifier._pick_live(cam)
+                    jpeg = view.frame_bytes() if view is not None else None
                     if jpeg is None:
                         self._send(503, "text/plain; charset=utf-8", b"no frame yet")
                     else:
@@ -347,13 +380,22 @@ class Notifier:
                     return
 
                 if path == "/api/state":
-                    st = notifier.live.state() if notifier.live is not None else {}
+                    view = notifier._pick_live(cam)
+                    st = view.state() if view is not None else {}
                     self._send(200, "application/json; charset=utf-8",
                                json.dumps(st, ensure_ascii=False).encode())
                     return
 
+                if path == "/api/cams":
+                    # 一次拿回所有路的概要，前端不用逐路轮询
+                    out = [{"cam": k, **v.state()} for k, v in notifier.lives.items()]
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps(out, ensure_ascii=False).encode())
+                    return
+
                 if path == "/api/llm":
-                    st = (notifier.live.llm_state() if notifier.live is not None
+                    view = notifier._pick_live(cam)
+                    st = (view.llm_state() if view is not None
                           else {"configured": False, "reason": "实时视图未启用"})
                     self._send(200, "application/json; charset=utf-8",
                                json.dumps(st, ensure_ascii=False).encode())
@@ -412,7 +454,9 @@ class Notifier:
                 self._send(404, "text/plain", b"not found")
 
             def do_POST(self):                       # noqa: N802
-                path = urlparse(self.path).path
+                parsed = urlparse(self.path)
+                path = parsed.path
+                cam = (parse_qs(parsed.query).get("cam") or [None])[0]
 
                 if path == "/api/llm/test":
                     llm = getattr(notifier.live, "llm", None) if notifier.live else None
