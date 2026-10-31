@@ -34,6 +34,9 @@ from .temporal import TrackletSample
 MATCH_IOU = 0.30        # 关联门限；烟框逐帧抖动大，不能设高
 MAX_MISS_SEC = 0.8      # 连续这么久没匹配上就判轨迹结束
 MAX_SAMPLES = 150       # 单条轨迹最多留这么多时间点，防止长跑内存爆
+# 灰度差多少才算"这一像素在变"。8 级足够滤掉压缩噪声和传感器噪声，
+# 又远小于火焰跳动的幅度（实测火焰区域 65%~92% 的像素每帧都超过这个值）。
+FLICKER_PIXEL_DELTA = 8
 
 
 @dataclass
@@ -55,6 +58,14 @@ class Track:
     # 所以一条静止的烟过 20 秒后 fg_ratio_ema 会趋 0 —— 而墙上本来就有的白斑
     # 是**从出生起**就不在前景里。只看 ema 分不出这两者，会把阴燃误杀。
     fg_ratio_first: float = 0.0
+    # ── 闪烁检测用的**固定绝对坐标窗口** ──────────────────────────
+    # 为什么不跟着检测框每帧变：YOLO 的框每帧宽高都不同，直接拿框内区域做
+    # 逐像素差分会因为尺寸不一致而永远跳过（实测 flicker 恒为 0）。而且框在动，
+    # 逐像素差分测到的就是"框在动"而不是"火在抖"。目标第一次出现时把窗口钉死，
+    # 之后只在明显跑偏（中心偏移超过窗口尺寸）时才重钉 —— 测的始终是同一块空间。
+    roi: "tuple[int, int, int, int] | None" = None
+    prev_gray: "np.ndarray | None" = None
+    prev_gray_global: float = 0.0
 
     @property
     def box(self):
@@ -80,6 +91,24 @@ def box_stats(image: np.ndarray, box) -> tuple[float, float, float]:
     return float(gray.mean()), float(sat.mean()), float((edges > 0).mean())
 
 
+def _lock_window(box, h: int, w: int, lo: int = 24, hi: int = 320):
+    """按首次检测框钉下一块固定尺寸的窗口（绝对坐标）。"""
+    x1, y1, x2, y2 = [int(round(v)) for v in box]
+    bw = min(hi, max(lo, x2 - x1))
+    bh = min(hi, max(lo, y2 - y1))
+    cx, cy = (x1 + x2) // 2, (y1 + y2) // 2
+    nx1 = max(0, min(w - bw, cx - bw // 2))
+    ny1 = max(0, min(h - bh, cy - bh // 2))
+    return nx1, ny1, min(w, nx1 + bw), min(h, ny1 + bh)
+
+
+def _window_drifted(roi, box, ratio: float = 1.0) -> bool:
+    """目标中心偏离窗口中心超过窗口尺寸的 ratio 倍 → 该重钉了。"""
+    rx, ry = (roi[0] + roi[2]) / 2, (roi[1] + roi[3]) / 2
+    bx, by = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
+    return abs(bx - rx) > (roi[2] - roi[0]) * ratio or abs(by - ry) > (roi[3] - roi[1]) * ratio
+
+
 def fg_overlap(box, fg_mask: np.ndarray | None) -> float:
     """框面积中落在前景掩码内的比例。无掩码时返回 1.0（不过滤）。"""
     if fg_mask is None:
@@ -103,10 +132,12 @@ class IoUTracker:
         self.max_miss_sec = max_miss_sec
         self.tracks: dict[int, Track] = {}
         self._next_id = 1
+        self._prev_gray_full: "np.ndarray | None" = None
 
     def reset(self) -> None:
         self.tracks.clear()
         self._next_id = 1
+        self._prev_gray_full = None
 
     def update(
         self,
@@ -120,6 +151,18 @@ class IoUTracker:
         if moving:
             # 云台转动：冻结，不动任何轨迹
             return [t for t in self.tracks.values() if t.misses * 0.04 <= self.max_miss_sec]
+
+        # 整幅灰度图一帧只算一次：既要它的均值（曝光基准），也要拿它算
+        # 「整幅有多大比例的像素在变」—— 相机晃动/云影/自动曝光会让整幅一起变，
+        # ROI 的变化量减掉这个基准，剩下的才是目标自己在动。
+        # 实测 854x480 上 absdiff+计数 < 1ms，比逐框重算便宜得多。
+        gray_full = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        g_global = float(gray_full.mean())
+        frac_global = 0.0
+        if self._prev_gray_full is not None and self._prev_gray_full.shape == gray_full.shape:
+            frac_global = float(
+                (cv2.absdiff(gray_full, self._prev_gray_full) > FLICKER_PIXEL_DELTA).mean())
+        self._prev_gray_full = gray_full
 
         unmatched = {tid: t for tid, t in self.tracks.items()}
         used: set[int] = set()
@@ -142,7 +185,14 @@ class IoUTracker:
                 continue
             t = self.tracks[tid]
             d = dets[di]
-            t.samples.append(self._sample(image, d, ts))
+            smp, crop, roi = self._sample(image, d, ts, gray_full, g_global,
+                                          frac_global, t.prev_gray, t.roi)
+            t.samples.append(smp)
+            # 目标跑出原来那块空间就重钉窗口（否则测的是"它走了"，不是"它在抖"）
+            if t.roi is None or _window_drifted(t.roi, d.xyxy):
+                t.roi, crop = roi, None
+            t.prev_gray = crop
+            t.prev_gray_global = g_global
             t.last_box = d.xyxy
             t.last_t = ts
             t.hits += 1
@@ -172,14 +222,41 @@ class IoUTracker:
                       last_box=d.xyxy, last_t=ts, first_t=ts, hits=1,
                       fg_ratio_ema=fg_overlap(d.xyxy, fg_mask))
             t.fg_ratio_first = t.fg_ratio_ema
-            t.samples.append(self._sample(image, d, ts))
+            smp, crop, roi = self._sample(image, d, ts, gray_full, g_global,
+                                          frac_global, None, None)
+            t.samples.append(smp)
+            t.roi = roi
+            t.prev_gray = crop
+            t.prev_gray_global = g_global
             self.tracks[tid] = t
 
         return list(self.tracks.values())
 
     @staticmethod
-    def _sample(image: np.ndarray, d: Detection, ts: float) -> TrackletSample:
+    def _sample(image: np.ndarray, d: Detection, ts: float,
+                gray_full: np.ndarray | None = None,
+                g_global: float = 0.0, frac_global: float = 0.0,
+                prev_gray: np.ndarray | None = None,
+                prev_roi: "tuple[int, int, int, int] | None" = None,
+                ) -> tuple[TrackletSample, "np.ndarray | None",
+                           "tuple[int, int, int, int] | None"]:
+        """采一个时间点。顺带返回框内灰度小图，供下一帧算闪烁。"""
         g, s, e = box_stats(image, d.xyxy)
         cx, cy = d.center()
+
+        flicker, crop, roi = 0.0, None, None
+        if gray_full is not None:
+            h, w = gray_full.shape[:2]
+            roi = _lock_window(d.xyxy, h, w) if prev_roi is None else prev_roi
+            x1, y1, x2, y2 = roi
+            crop = gray_full[y1:y2, x1:x2].copy()
+            if (prev_gray is not None and crop.size and prev_gray.shape == crop.shape):
+                d_px = cv2.absdiff(crop, prev_gray)
+                frac_roi = float((d_px > FLICKER_PIXEL_DELTA).mean())
+                # 扣掉整幅的同步变化：相机被风吹得轻微晃动、云影飘过、自动曝光调整，
+                # 都会让整幅一起变。不减掉这个基准，稳定的灯会被判成火 —— 正好搞反。
+                flicker = max(0.0, frac_roi - frac_global)
+
         return TrackletSample(t=ts, area=d.area, cx=cx, cy=cy,
-                              gray_mean=g, sat_mean=s, edge_density=e, conf=d.conf)
+                              gray_mean=g, sat_mean=s, edge_density=e, conf=d.conf,
+                              gray_global=g_global, flicker=flicker), crop, roi

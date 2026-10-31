@@ -49,6 +49,10 @@ class TrackletSample:
     sat_mean: float              # 框内平均饱和度 0~255（烟/蒸汽都低，用于排除彩色干扰）
     edge_density: float          # 边缘密度 0~1（清晰度，蒸汽会快速下降）
     conf: float = 1.0            # 检测置信度
+    gray_global: float = 0.0     # 整幅平均亮度，用来给"闪烁"扣掉相机整体曝光漂移
+    # 本帧框内"变化像素占比"，已扣掉整幅同步变化。逐帧算好存下来，
+    # 不存图像 —— 内存只多一个 float，长跑才不会爆。
+    flicker: float = 0.0
 
 
 @dataclass
@@ -65,6 +69,8 @@ class TemporalFeatures:
     edge_trend: float            # 清晰度趋势（负=越来越糊，蒸汽常见）
     n: int                       # 样本数
     span_ratio: float            # 有效时长占理论时长的比例（轨迹连续性）
+    flicker: float = 0.0         # 框内变化像素占比的均值，火必抖、灯不抖
+    n_diff: int = 0              # 算 flicker 用了几个帧间差分（样本数-1）
 
 
 def _slope(ts: np.ndarray, ys: np.ndarray) -> float:
@@ -117,6 +123,8 @@ def extract_features(samples: list[TrackletSample]) -> TemporalFeatures | None:
         if med > 0:
             span_ratio = min(1.0, float(len(ts) * med / max(duration, 1e-6)))
 
+    flicker, n_diff = _flicker(samples)
+
     return TemporalFeatures(
         duration=duration,
         area_growth=area_growth,
@@ -128,7 +136,36 @@ def extract_features(samples: list[TrackletSample]) -> TemporalFeatures | None:
         edge_trend=_slope(ts, edge),
         n=len(samples),
         span_ratio=span_ratio,
+        flicker=flicker,
+        n_diff=n_diff,
     )
+
+
+def _flicker(samples: list[TrackletSample]) -> tuple[float, int]:
+    """聚合每条轨迹的「逐像素变化强度」，作为「火 or 灯」的判据。
+
+    为什么用这个判「是火还是灯」
+    ----------------------------
+    火焰是湍流燃烧，亮度天然带 3~10Hz 的抖动；车灯/路灯/LED 是稳流驱动，亮度恒定。
+    这不是统计巧合，是物理。实测真火连续帧里 20%~60% 的像素每帧都在跳
+    （灰度差 > 8），而恒定光源接近 0 —— 差一个数量级，比再训一个分类器稳得多。
+
+    为什么不用"框内平均亮度差"
+    --------------------------
+    第一版就是这么写的，结果同一段视频里 flicker 从 0.012 到 0.22 差 18 倍：
+    火焰内部有增有减，一平均就互相抵消，框里再混进静止背景就更稀。
+    改成逐像素统计后动态范围缩到 1.4 倍，这才是一个能定阈值的指标。
+
+    为什么取均值而不是中位数
+    ------------------------
+    火刚起的那几帧抖动还没起来，中位数会被早期样本拉低；均值更接近这条轨迹
+    整体的燃烧状态。而且 `judge_fire` 的门限本来就设得很低，不需要再稳一手。
+    """
+    n_diff = max(0, len(samples) - 1)
+    vals = [s.flicker for s in samples if s.flicker > 0.0]
+    if not vals:
+        return 0.0, n_diff
+    return float(np.mean(vals)), n_diff
 
 
 # ---------------------------------------------------------------- 判别
@@ -149,6 +186,19 @@ DEFAULTS = {
     "long_life": 25.0,          # 存续 > 25 秒几乎是烟/火
     "conf_smoke": 0.55,         # 判定为烟的置信度门限
     "conf_steam": 0.55,         # 判定为蒸汽的门限
+
+    # ── 火焰闪烁闸（区分真火 / 恒定光源）────────────────────────
+    # 指标 = 框内"变化像素占比"（灰度差 > 8），已扣掉整幅同步变化。
+    # 标定数据：960x540 逐帧连续真火视频 113 帧 / 664 条轨迹
+    #   真火  min 0.200 · P10 0.212 · 中位 0.335 · max 0.599
+    #   车位灯 中位 0.000（test_pipeline.py --scene lamp 实测）
+    # ⚠️ 刻意做宽松：这是"降级理由"不是"排除理由"。放过几盏灯无非多花一次
+    # LLM 调用；把一次真火拦下来就是漏报，代价完全不同量级。
+    # 0.05 = 真火最弱一条下方留 4 倍余量，同时仍能拦掉恒亮光源。
+    "flicker_static": 0.05,     # 低于这个值判为恒定光源（灯/反光/贴纸）
+    "flicker_fire": 0.25,       # 高于这个值很有把握是真火（P10 之上）
+    "flicker_min_diff": 4,      # 至少 4 个帧间差分才敢下结论（=5 帧样本）
+    "flicker_min_px": 300,      # ROI 小于 300 像素时统计不可靠，放行
 }
 
 
@@ -244,6 +294,58 @@ def judge(feat: TemporalFeatures | None, *, thr: dict | None = None,
         why.append(f"双方接近（烟 {smoke:.2f} / 汽 {steam:.2f}），不硬判")
 
     return Verdict(label, round(score, 3), why, feat)
+
+
+def judge_fire(feat: TemporalFeatures | None, area_px: float = 0.0,
+               thr: dict | None = None) -> Verdict:
+    """火的时序判别：真火 vs 恒定光源（车位灯、路灯、招牌、玻璃反光）。
+
+    和 `judge()` 的分工
+    -------------------
+    `judge()` 解决"是烟还是蒸汽"，两者都是**白色羽流**，靠面积/亮度走向分。
+    `judge_fire()` 解决"是火还是灯"，两者都是**亮斑**，只靠一个东西分：抖不抖。
+    火是湍流燃烧，亮度天然抖；灯是稳流驱动，亮度恒定。不做形状、不做颜色 ——
+    这两样灯和火都像，唯一不一样的是动态。
+
+    三档判定，刻意偏向放行
+    ----------------------
+    "fire"      抖动 ≥ 0.25，很有把握（真火 P10 正好压在这条线上）
+    "static"    抖动 < 0.05，判为恒定光源 → 降级成 notice 交人看（**不是丢弃**）
+    "uncertain" 中间灰区 → 放行，正常报警
+
+    为什么灰区放行而不是拦：放过几盏灯无非多花一次 LLM 调用，把一次真火拦下来
+    就是漏报，两者代价不同量级。所以闸口只开在"确定不动"那一侧。
+
+    另外两种情形也一律放行：
+      · 帧数不够（刚出现）—— 灯也要 5 帧才露馅，这时候不能拦
+      · ROI 太小 —— 几十个像素的抖动统计就是噪声，用它拦火等于瞎猜
+    """
+    t = {**DEFAULTS, **(thr or {})}
+    if feat is None:
+        return Verdict("uncertain", 0.0, ["样本不足，暂不判闪烁"])
+
+    if area_px and area_px < t["flicker_min_px"]:
+        return Verdict("uncertain", 0.0,
+                       [f"目标仅 {area_px:.0f} 像素，抖动统计不可靠，放行"], feat)
+
+    if feat.n_diff < t["flicker_min_diff"]:
+        return Verdict("uncertain", 0.0,
+                       [f"只有 {feat.n_diff} 个帧间差分（需 {t['flicker_min_diff']}），"
+                        f"再看几帧"], feat)
+
+    f = feat.flicker
+    if f >= t["flicker_fire"]:
+        return Verdict("fire", min(1.0, f / max(t["flicker_fire"], 1e-6)),
+                       [f"框内 {f:.0%} 的像素在逐帧跳动（阈值 {t['flicker_fire']:.0%}），"
+                        f"符合湍流燃烧的闪烁"], feat)
+    if f < t["flicker_static"]:
+        return Verdict("static", min(1.0, 1.0 - f / max(t["flicker_static"], 1e-6)),
+                       [f"框内仅 {f:.1%} 的像素在变化（阈值 {t['flicker_static']:.0%}），"
+                        f"亮度恒定 —— 灯/反光，不是燃烧"], feat)
+    return Verdict("uncertain", 0.0,
+                   [f"变化像素占比 {f:.0%} 处在灰区"
+                    f"（{t['flicker_static']:.0%}~{t['flicker_fire']:.0%}），拿不准，放行"],
+                   feat)
 
 
 def judge_batch(seqs: Iterable[list[TrackletSample]], **kw) -> list[Verdict]:

@@ -47,7 +47,8 @@ import numpy as np
 
 from .infer import Detection, Detector, iou
 from .sources.base import CameraSource, FramePacket
-from .temporal import Verdict, TrackletSample, extract_features, judge
+from .temporal import (Verdict, TrackletSample, extract_features, judge,
+                       judge_fire)
 from .tracker import IoUTracker, Track
 
 # 阈值集中在这里。现场要调，改这里不用翻代码。
@@ -58,7 +59,10 @@ DEFAULTS = {
     "smoke_conf": 0.45,        # 烟：框级门限（烟的单帧置信更虚，要提高）
 
     # ── 事件确认 ────────────────────────────────────────────
-    "fire_confirm": 3,         # 火：连续命中几帧才报（抗单帧闪烁）
+    # 火：连续命中几帧才报。从 3 提到 5 是为了让闪烁闸有足够样本：
+    # 判"抖不抖"至少需要 4 个帧间差分（=5 帧）。3 帧时算不出，闸等于不存在。
+    # 代价是 0.12s → 0.20s（25fps），对火灾尺度无关紧要。
+    "fire_confirm": 5,
     "smoke_confirm": 2,        # 烟：时序判为 smoke 后再连续几帧坐实
 
     # ── 极快模式（烟跳过时序判别）──────────────────────────
@@ -110,6 +114,10 @@ DEFAULTS = {
     # 真蒸汽几秒最多十几秒就散，撑过 30 秒本身就说明裁判可能看错了。
     # 这也是漏报的兜底：不给这条，一次误判就是一个完全静默的窗口。
     "dismiss_recheck_sec": 30.0,
+
+    # 闪烁闸总开关。默认开。合成测试场景里要关掉 —— 贴图火是静止的，
+    # 判它 static 是物理正确的，开着只会把"合成数据不真实"变成"测试失败"。
+    "flicker_gate": True,
 
     # ── 杂项 ────────────────────────────────────────────────
     "min_box_pct": 0.0002,     # 面积小于画面 0.02% 的框当噪点丢掉
@@ -269,6 +277,7 @@ class Pipeline:
         self._noticed: set[int] = set()      # 已发 notice 的轨迹（一条轨迹只发一次）
         self._cleared: set[int] = set()      # notice 已被撤销的轨迹（防止反复发/撤）
         self._steam_noticed: set[int] = set()  # 已推过"降级为蒸汽"提示的轨迹
+        self._static_noticed: set[int] = set() # 已推过"疑似灯光"提示的轨迹
         self._recheck_done: set[int] = set()   # 已对被判降级却久不消散的目标叫过人
         self._fired: set[int] = set()        # 已报过的轨迹（同一条火只报一次）
         self._recent_alarms: list[tuple[float, str, tuple, int]] = []   # (t, kind, box, tid)
@@ -285,6 +294,7 @@ class Pipeline:
             "steam_ignored": 0,          # 极快模式下被忽略的蒸汽判定（用于事后校准）
             "notices": 0, "notice_cleared": 0, "steam_notices": 0,  # 提示 / 撤销 / 降级告知
             "recheck_notices": 0,        # 降级后久不消散、把人叫回来的次数
+            "static_light_blocked": 0,   # 被闪烁闸拦下的疑似灯光（真火保留 = 真阳性）
             "llm_reviews": 0, "llm_alarms": 0, "llm_dismissed": 0,   # LLM 裁判
             "frozen_frames": 0, "cooldown_blocked": 0,
         }
@@ -402,6 +412,7 @@ class Pipeline:
         self._noticed &= live
         self._cleared &= live
         self._steam_noticed &= live
+        self._static_noticed &= live
         self._recheck_done &= live
         for k in [k for k in self._arbiter_done if k.rsplit(":", 1)[-1].isdigit()
                   and int(k.rsplit(":", 1)[-1]) not in live]:
@@ -572,7 +583,12 @@ class Pipeline:
             kind = self._kind_of(t.cls_name, t.cls_id)
             conf = t.samples[-1].conf
 
-            # ── 火：快路径，三帧命中就报，不等时序 ──────────────
+            # ── 火：快路径，但必过一道「闪烁闸」────────────────
+            # 为什么火也要过闸：车位灯、路灯、招牌、玻璃反光在单帧上和火一模一样
+            # （高亮、暖色、局部过曝），YOLO 必给高 conf。原来只看"连续 3 帧命中"，
+            # 而灯是恒亮的 —— 3 帧稳过，等于没有任何拦截。实测过：合成的一块橙色
+            # 亮斑能拿到 conf=0.87，比真火还高。
+            # 火和灯唯一稳定的差别是**抖不抖**，所以这道闸只看帧间亮度抖动。
             if kind == "fire":
                 if conf < cfg["fire_conf"]:
                     self._fire_streak[t.tid] = 0
@@ -586,10 +602,30 @@ class Pipeline:
                         self.stats["cooldown_blocked"] += 1
                     continue
                 fire_reasons = [f"连续 {self._fire_streak[t.tid]} 帧检出火焰（conf {conf:.2f}）"]
+
+                fv = (judge_fire(extract_features(t.samples),
+                                 area_px=t.samples[-1].area, thr=self.temporal_thr)
+                      if cfg["flicker_gate"] else None)
+                if fv is not None and fv.label == "static":
+                    # ⚠️ 这里不能 continue 了事。灯也会烧到短路、火也可能烧得很稳，
+                    # 判错一次就是漏报。所以降级留痕 + 送 LLM 复核，双保险。
+                    self.stats["static_light_blocked"] += 1
+                    if t.tid not in self._static_noticed and t.tid not in self._fired:
+                        self._static_noticed.add(t.tid)
+                        events.append(self._make_event(
+                            "fire", "notice", t.tid, t, pkt, conf, t.last_box,
+                            ["检出火焰但亮度恒定，疑似灯光/反光，已降级（**不是排除**），"
+                             "已送人工复核"] + list(fv.reasons[:1])))
+                        self._defer("fire", t.tid, t, pkt, conf, t.last_box,
+                                    ["规则层疑为静态光源，请判断是火还是灯"])
+                    continue
+
                 if self._defer("fire", t.tid, t, pkt, conf, t.last_box, fire_reasons):
                     continue          # 已送审，等 LLM 裁决再定级
                 events.append(self._make_event(
-                    "fire", "alarm", t.tid, t, pkt, conf, t.last_box, fire_reasons))
+                    "fire", "alarm", t.tid, t, pkt, conf, t.last_box,
+                    fire_reasons + ([] if (fv is None or fv.label != "fire")
+                                    else list(fv.reasons[:1]))))
                 continue
 
             # ── 烟：慢路径，必须先过时序判别 ────────────────────

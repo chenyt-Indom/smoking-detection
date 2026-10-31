@@ -37,6 +37,7 @@ import random
 import sys
 import time
 from pathlib import Path
+from typing import NamedTuple
 
 import cv2
 import numpy as np
@@ -120,6 +121,8 @@ SCENES = {
     "smoke_only": dict(desc="只有烟无火（对照）", expect=None),
     "steam": dict(desc="蒸汽（负样本，应 0 告警）", expect=set(),
                   need={"steam_suppressed": 1}),
+    "lamp": dict(desc="车位灯（恒定亮斑，应 0 正式告警）", expect=set(),
+                 need={"static_light_blocked": 1}),
 }
 
 
@@ -136,19 +139,47 @@ def _parse_labels(path: Path) -> list[tuple[int, float, float, float, float]]:
     return out
 
 
+class Sprite(NamedTuple):
+    """一块合成素材：图像 + **目标物体在素材里的位置** + 来源标注名。
+
+    为什么要把物体位置一路带下来：素材是带上下文裁的（`_crop` 的 margin 让边长
+    变 3 倍）。贴的时候若按"整块素材"定尺寸，标称 1.2% 的火会实打实占掉 11%
+    画面 —— 尺度全错，合成场景就不再是它声称的那个场景。
+    """
+    img: np.ndarray
+    obj: tuple
+    name: str
+
+
+# 复验点：素材必须**在它真正会被贴到的位置上**仍然被认成对的那一类。
+# 原先只有一个固定复验点（seed 7 的墙、画面下方），结果挑出来的烟素材贴到
+# seed 11 的墙、画面上部之后，检测器把它判成了 **fire** —— 整个 fire_smoke
+# 场景只剩火、烟一条轨迹都没有。素材"在原图里是烟"不等于"贴上去还是烟"。
+PROBE_SPOTS = {
+    0: [(7, 0.30, 0.62), (11, 0.36, 0.55)],    # 火：fire 场景 / fire_smoke 场景
+    1: [(11, 0.36, 0.36), (23, 0.48, 0.44)],   # 烟：fire_smoke·smoke_only / 蒸汽
+}
+
+
 def pick_patch(det: Detector, cls_id: int, target_pct: float, other_cls: int,
-               margin: float = 1.0) -> tuple[np.ndarray, tuple, str]:
+               margin: float = 0.25) -> Sprite:
     """从 test 集里挑一块**检测器确实认得出**的真火/真烟，当合成素材。
 
     不直接信标注：标注可能偏，也可能框太糊。所以候选按面积接近度排序后，
     真的拿检测器跑一遍整图，conf 够高才采用 —— 否则测试的前提就是假的。
+
+    `margin` 是四周各外扩多少个框宽。原来取 1.0（边长变 3 倍），那时粘贴按
+    "整块素材"缩放到原尺寸，多出来的上下文看不出问题。改成按物体定尺度之后，
+    上下文也跟着放大 —— 火素材的实际着色范围比火本身宽一倍，把上方的烟盖掉了：
+    同一个烟素材从 smoke 0.93 掉到 0.22，烟永久确认不了。
     """
     CACHE.mkdir(parents=True, exist_ok=True)
-    tag = f"cls{cls_id}_pct{target_pct}"
-    npz = CACHE / f"patch_{tag}.npz"
+    tag = f"cls{cls_id}_pct{target_pct}_m{margin}"
+    # 缓存随裁剪参数走：margin 变了素材就变了，沿用旧缓存会拿到旧尺度的图
+    npz = CACHE / f"patch_v4_{tag}.npz"
     if npz.exists():
         z = np.load(npz, allow_pickle=True)
-        return z["patch"], tuple(z["box"].tolist()), str(z["name"])
+        return Sprite(z["patch"], tuple(z["obj"].tolist()), str(z["name"]))
 
     img_dir, lbl_dir = DATA / "images", DATA / "labels"
     cands = []
@@ -174,25 +205,63 @@ def pick_patch(det: Detector, cls_id: int, target_pct: float, other_cls: int,
         hit = [d for d in dets if d.cls_id == cls_id and d.conf >= 0.5]
         if not hit:
             continue
+        # 素材里不能同时冒出另一类：拿"火+烟"的整团裁下来当火，烟会跟着贴进场景，
+        # 让 fire 场景凭空多一条 smoke 告警（实测过），测出来的东西就没意义了。
+        if any(d.cls_id == other_cls and d.conf > 0.35 for d in dets):
+            continue
         d = max(hit, key=lambda x: x.conf)
-        patch = _crop(img, d.xyxy, margin)
+        patch, rect = _crop(img, d.xyxy, margin)
         if patch is None or min(patch.shape[:2]) < 40:
             continue
-        np.savez_compressed(npz, patch=patch, box=np.array(d.xyxy), name=lf)
-        print(f"  素材 cls={cls_id} ← {lf}  conf={d.conf:.2f}  框={tuple(round(v) for v in d.xyxy)}")
-        return patch, d.xyxy, lf
+        # 物体在素材里的坐标（裁剪时整体平移了 rect[0]/rect[1]），再夹进素材边界
+        ph, pw = patch.shape[:2]
+        obj = (max(0.0, d.xyxy[0] - rect[0]), max(0.0, d.xyxy[1] - rect[1]),
+               min(float(pw), d.xyxy[2] - rect[0]), min(float(ph), d.xyxy[3] - rect[1]))
+        if obj[2] - obj[0] < 8 or obj[3] - obj[1] < 8:
+            continue
+        # 素材本身得"亮得起来"。第一版没这道筛选，挑到一块平均亮度只有 11.9 的
+        # 夜间火（黑背景占 95%），贴到画面上就是一条黑带 + 几个火点 ——
+        # 既不像火，闪烁闸也测不出东西（噪声根本没地方加）。
+        if float(cv2.cvtColor(patch, cv2.COLOR_BGR2GRAY).mean()) < 45:
+            continue
+        # 最后一道：**按最终尺度、贴到它真正会去的位置上再验一次**。
+        # 原图里干净不等于贴上去也干净 —— 换了背景之后检测器可能把火焰边缘
+        # 认成烟，也可能把烟认成火（实测过，后者的后果更隐蔽：fire_smoke
+        # 场景里烟一条轨迹都没有，测试却"跑通了"）。
+        ok = True
+        for seed, fx, fy in PROBE_SPOTS[cls_id]:
+            probe = make_scene(random.Random(seed))
+            paste_obj(probe, patch, obj, SCENE_W * fx, SCENE_H * fy, target_pct)
+            vd = det.detect(probe, sliced=False)
+            if any(d.cls_id == other_cls and d.conf > 0.35 for d in vd):
+                ok = False
+                break
+            if not any(d.cls_id == cls_id and d.conf >= 0.45 for d in vd):
+                ok = False
+                break
+        if not ok:
+            continue
+        np.savez_compressed(npz, patch=patch, obj=np.array(obj), name=lf)
+        print(f"  素材 cls={cls_id} ← {lf}  conf={d.conf:.2f}  "
+              f"素材 {pw}x{ph}  物体 {obj[2]-obj[0]:.0f}x{obj[3]-obj[1]:.0f}")
+        return Sprite(patch, obj, lf)
     raise RuntimeError(f"没找到可用的 cls={cls_id} 素材")
 
 
 def _crop(img, box, margin):
+    """按框裁一块带上下文的素材。返回 (素材, 裁剪矩形)。
+
+    裁剪矩形要一起返回 —— 后面要用它把"物体在素材里的位置"算出来，
+    否则没法按物体（而不是整块素材）定粘贴尺寸。
+    """
     h, w = img.shape[:2]
     x1, y1, x2, y2 = box
     bw, bh = x2 - x1, y2 - y1
-    x1 = int(max(0, x1 - margin * bw)); x2 = int(min(w, x2 + margin * bw))
-    y1 = int(max(0, y1 - margin * bh)); y2 = int(min(h, y2 + margin * bh))
-    if x2 <= x1 or y2 <= y1:
-        return None
-    return img[y1:y2, x1:x2].copy()
+    cx1 = int(max(0, x1 - margin * bw)); cx2 = int(min(w, x2 + margin * bw))
+    cy1 = int(max(0, y1 - margin * bh)); cy2 = int(min(h, y2 + margin * bh))
+    if cx2 <= cx1 or cy2 <= cy1:
+        return None, None
+    return img[cy1:cy2, cx1:cx2].copy(), (cx1, cy1, cx2, cy2)
 
 
 # ---------------------------------------------------------------- 合成
@@ -252,7 +321,46 @@ def paste(canvas: np.ndarray, patch: np.ndarray, cx: float, cy: float,
     return (x1, y1, x1 + nw, y1 + nh)
 
 
-def gen_fire(fire_patch, n: int):
+def obj_scale(patch: np.ndarray, obj: tuple, target_pct: float) -> float:
+    """算出"让物体占画面 target_pct"所需的粘贴缩放比。"""
+    x1, y1, x2, y2 = obj
+    ow, oh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+    scale = (target_pct * SCENE_W * SCENE_H / (ow * oh)) ** 0.5
+    ph, pw = patch.shape[:2]
+    # 整块素材不能超出画布，否则 paste() 会因为 roi 尺寸对不上直接放弃
+    return max(0.05, min(scale, SCENE_W * 0.95 / pw, SCENE_H * 0.95 / ph))
+
+
+def paste_obj(canvas: np.ndarray, patch: np.ndarray, obj: tuple,
+              cx: float, cy: float, target_pct: float, blur: float = 0.0):
+    """把素材贴到画布上，并让**目标物体本身**占到画面的 target_pct。
+
+    为什么不直接 `paste(patch, scale=1.0)`：素材是带上下文裁出来的，`_crop` 的
+    margin 让边长变成 3 倍。标称 1.2% 的火贴上去实际占 11%；烟更夸张 —— 挑中的
+    检测框几乎盖满原图，整块贴出来有 27% 画面，把旁边的火整个盖住了。
+    `fire_smoke` 场景因此一次都没检出火、0 告警，根因就在这。
+
+    返回**物体**在画布上的矩形（不是整块素材的），合成时要用它对位。
+    """
+    x1, y1, x2, y2 = obj
+    ow, oh = max(1.0, x2 - x1), max(1.0, y2 - y1)
+    scale = obj_scale(patch, obj, target_pct)
+    ph, pw = patch.shape[:2]
+    # paste() 是按**素材中心**对齐的，而物体不在素材正中，所以补一个偏移，
+    # 让物体中心（而不是素材中心）落在 (cx, cy)
+    rect = paste(canvas, patch,
+                 cx + (pw / 2 - (x1 + x2) / 2) * scale,
+                 cy + (ph / 2 - (y1 + y2) / 2) * scale,
+                 scale, blur)
+    if rect is None:
+        return None
+    # rect 是**素材**的左上角 → 物体左上角 = 素材左上角 + 物体在素材内的偏移×scale
+    ox = rect[0] + x1 * scale
+    oy = rect[1] + y1 * scale
+    return (ox, oy, ox + ow * scale, oy + oh * scale)
+
+
+def gen_fire(fire: Sprite, n: int):
     """场景1：先空场，第 WARMUP 帧起一小簇火固定在那儿（模拟垃圾桶起火）。"""
     rng = random.Random(7)
     scene = make_scene(rng)
@@ -260,16 +368,21 @@ def gen_fire(fire_patch, n: int):
         img = scene.copy()
         img = cv2.convertScaleAbs(img, alpha=1.0, beta=1.2 * np.sin(i / 60.0))  # 光照慢漂
         if i >= WARMUP_FRAMES:
-            jitter = 0.03 * np.sin(i / 3.0)          # 火在跳，尺寸微抖
-            paste(img, fire_patch, SCENE_W * 0.30, SCENE_H * 0.62, 1.0 + jitter)
+            jitter = 1.0 + 0.03 * np.sin(i / 3.0)          # 火在跳，尺寸微抖
+            paste_obj(img, fire.img, fire.obj,
+                      SCENE_W * 0.30, SCENE_H * 0.62, 0.012 * jitter)
         yield img
 
 
-def gen_smoke(fire_patch, smoke_patch, n: int, with_fire: bool):
+def gen_smoke(fire: Sprite | None, smoke: Sprite, n: int, with_fire: bool):
     """场景2/3：烟（可带火）。背景与随机种子完全一致，只有"有没有火"这一个变量。
 
     两组的差值，就是「旁边有火」这个先验的真实贡献 —— 这是本项目最核心的接线：
     白烟和蒸汽同色同形，单帧分不开，能靠的先验就剩"旁边有没有明火"。
+
+    粘贴顺序有讲究：**先烟后火**。反过来的话烟柱会把底部的火盖掉
+    （烟素材带了很多上下文，尺寸不小），火一次都检不出来，
+    这个场景就测不出"火+烟"了。物理上也该是火在前、烟在火上方升起。
     """
     rng = random.Random(11)
     scene = make_scene(rng)
@@ -278,9 +391,22 @@ def gen_smoke(fire_patch, smoke_patch, n: int, with_fire: bool):
         img = cv2.convertScaleAbs(img, alpha=1.0, beta=1.2 * np.sin(i / 60.0))
         if i >= WARMUP_FRAMES:
             grow = 1.0 + 0.10 * min(1.0, (i - WARMUP_FRAMES) / 100.0)   # 缓慢铺开
+            srect = paste_obj(img, smoke.img, smoke.obj,
+                              SCENE_W * 0.36, SCENE_H * 0.36, 0.02 * grow)
             if with_fire:
-                paste(img, fire_patch, SCENE_W * 0.30, SCENE_H * 0.70, 1.0)
-            paste(img, smoke_patch, SCENE_W * 0.36, SCENE_H * 0.34, 0.85 * grow)
+                # 火摆在烟柱**正下方并留一道缝**。放进去（哪怕只压住一点）都会
+                # 把烟下半截吃掉：实测火盖上去之后，同一个烟素材从 smoke 0.93
+                # 变成 fire 0.88，整条烟轨迹消失。
+                # 位置仍落在「火源先验」的外扩范围里（fire_nearby_grow=0.6，
+                # 烟框往下再多算 60% 高，够宽松）。
+                if srect is None:
+                    fx, fy = SCENE_W * 0.36, SCENE_H * 0.62
+                else:
+                    fs = obj_scale(fire.img, fire.obj, 0.012)
+                    fh = (fire.obj[3] - fire.obj[1]) * fs
+                    fx = (srect[0] + srect[2]) / 2
+                    fy = srect[3] + 0.10 * (srect[3] - srect[1]) + fh / 2
+                paste_obj(img, fire.img, fire.obj, fx, fy, 0.012)
         yield img
 
 
@@ -291,16 +417,21 @@ STEAM_SCALE = (0.25, 1.20)      # 面积比 (1.2/0.25)²≈23 倍 → 对数增�
 class StubDetector:
     """受控假检测器。只用于确定性地打判定层，不参与任何精度评估。"""
 
-    def __init__(self, box_fn):
+    def __init__(self, box_fn, cls_id: int = 1, conf: float = 0.80):
         self.box_fn = box_fn
         self.names = {0: "fire", 1: "smoke"}
         self.conf = 0.20
+        self.cls_id = cls_id
+        self.fixed_conf = conf
         self.i = 0
 
     def detect(self, image, sliced=False, **kw) -> list[Detection]:
         b = self.box_fn(self.i)
         self.i += 1
-        return [] if b is None else [Detection(1, "smoke", 0.80, b)]
+        if b is None:
+            return []
+        name = self.names[self.cls_id]
+        return [Detection(self.cls_id, name, self.fixed_conf, b)]
 
 
 def steam_scale(i: int, n: int) -> float:
@@ -332,6 +463,36 @@ def steam_box(i: int, n: int, patch_wh: tuple[int, int]):
     cx, cy = SCENE_W * 0.48, SCENE_H * 0.44
     half_w, half_h = pw * s / 2, ph * s / 2
     return (cx - half_w, cy - half_h, cx + half_w, cy + half_h)
+
+
+# ── 灯光：图像是真的，检测框给定，光斑恒定不闪 ──────────────────
+def gen_lamp(n: int):
+    """夜间停车场：一块恒定的亮斑（车位灯 / 路灯 / 招牌反光）。
+
+    YOLO 在单帧上确实会把这种亮斑认成 fire（实测合成橙色亮斑拿到 conf 0.87，
+    比真火还高），所以这里直接用受控检测器给框，专测「闪烁闸」这一层。
+
+    关键：光斑**完全不闪**。真火实测框内 65%~92% 的像素逐帧在跳，
+    这里应该是 0 —— 这就是闸要拦的东西。
+    """
+    rng = random.Random(31)
+    scene = make_scene(rng)
+    scene = np.clip(scene.astype(np.float32) * 0.35, 0, 255).astype(np.uint8)   # 夜间
+    for i in range(n):
+        img = scene.copy()
+        # 只留极轻的整幅漂移（自动曝光），光斑本身恒定
+        img = cv2.convertScaleAbs(img, alpha=1.0, beta=0.8 * np.sin(i / 90.0))
+        if i >= WARMUP_FRAMES:
+            cv2.ellipse(img, (int(SCENE_W * 0.42), int(SCENE_H * 0.46)),
+                        (48, 34), 0, 0, 360, (238, 242, 248), -1)
+        yield img
+
+
+def lamp_box(i: int):
+    if i < WARMUP_FRAMES:
+        return None
+    cx, cy = SCENE_W * 0.42, SCENE_H * 0.46
+    return (cx - 48, cy - 34, cx + 48, cy + 34)
 
 
 # ---------------------------------------------------------------- 先验自检
@@ -370,39 +531,52 @@ def run_scene(name: str, det: Detector, args) -> dict:
         expect = set()          # 判蒸汽 → 压掉；拿不准 → 只发 notice（不算告警）
 
     if name == "fire":
-        patch, _, _ = pick_patch(det, cls_id=0, target_pct=0.012, other_cls=1)
-        n, frames = 150, gen_fire(patch, 150)
+        fire = pick_patch(det, cls_id=0, target_pct=0.012, other_cls=1)
+        n, frames = 150, gen_fire(fire, 150)
     elif name == "fire_smoke":
-        fp, _, _ = pick_patch(det, cls_id=0, target_pct=0.012, other_cls=1)
-        sp, _, _ = pick_patch(det, cls_id=1, target_pct=0.02, other_cls=0)
-        frames = gen_smoke(fp, sp, n, with_fire=True)
+        fire = pick_patch(det, cls_id=0, target_pct=0.012, other_cls=1)
+        smoke = pick_patch(det, cls_id=1, target_pct=0.02, other_cls=0)
+        frames = gen_smoke(fire, smoke, n, with_fire=True)
     elif name == "smoke_only":
-        sp, _, _ = pick_patch(det, cls_id=1, target_pct=0.02, other_cls=0)
-        frames = gen_smoke(None, sp, n, with_fire=False)
+        smoke = pick_patch(det, cls_id=1, target_pct=0.02, other_cls=0)
+        frames = gen_smoke(None, smoke, n, with_fire=False)
     else:
-        sp, _, _ = pick_patch(det, cls_id=1, target_pct=0.02, other_cls=0)
+        smoke = pick_patch(det, cls_id=1, target_pct=0.02, other_cls=0)
         n = 160
-        pwh = (sp.shape[1], sp.shape[0])
-        frames = gen_steam(sp, n)
-        stub = StubDetector(lambda i: steam_box(i, n, pwh))
+        pwh = (smoke.img.shape[1], smoke.img.shape[0])
+        if name == "steam":
+            frames = gen_steam(smoke.img, n)
+            stub = StubDetector(lambda i: steam_box(i, n, pwh))
+        else:                                       # lamp：光斑恒定，给定检测框
+            frames = gen_lamp(n)
+            stub = StubDetector(lamp_box, cls_id=0, conf=0.82)
 
     n = int(n * args.n_mul)
     if args.n_mul != 1.0:                     # 拉长时重新生成，保持时间轴一致
         if name == "smoke_only":
-            frames = gen_smoke(None, sp, n, with_fire=False)
+            frames = gen_smoke(None, smoke, n, with_fire=False)
         elif name == "fire_smoke":
-            frames = gen_smoke(fp, sp, n, with_fire=True)
+            frames = gen_smoke(fire, smoke, n, with_fire=True)
         elif name == "steam":
-            frames = gen_steam(sp, n)
+            frames = gen_steam(smoke.img, n)
             stub = StubDetector(lambda i: steam_box(i, n, pwh))
+        elif name == "lamp":
+            frames = gen_lamp(n)
+            stub = StubDetector(lamp_box, cls_id=0, conf=0.82)
+
         else:
-            frames = gen_fire(patch, n)
+            frames = gen_fire(fire, n)
 
     info = CameraInfo(cam_id=f"sim_{name}", kind="fixed", fps=FPS)
     src = FixedCameraSource(info, frames=frames, warmup=WARMUP_FRAMES)
     arb = make_arbiter(args.llm)
+    # 闪烁闸在合成场景里关掉：贴上去的"火"是一张静止贴图（物理上就不该闪），
+    # 闸判它 static 完全正确，开着测不出任何东西，只会把"合成数据不真实"
+    # 显示成"测试失败"。真实火能不能过闸，由 scripts/verify_flicker_gate.py
+    # 在 506 张**逐帧连续**的真火视频帧上单独验证。
+    gate = name not in ("fire", "fire_smoke")
     pipe = Pipeline(stub or det, sliced=bool(args.sliced) and stub is None, tile_grid=2,
-                    cfg={"fast_smoke": bool(args.fast)}, arbiter=arb)
+                    cfg={"fast_smoke": bool(args.fast), "flicker_gate": gate}, arbiter=arb)
 
     events: list = []
     trace: list = []
