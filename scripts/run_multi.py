@@ -262,7 +262,10 @@ def main() -> int:
         # LLM 置信度闸门：只在规则拿不准的区间才花钱
         "llm_min_conf": float(llm_cfg.get("min_conf", 0.50)),
         "llm_sure_conf": float(llm_cfg.get("sure_conf", 0.85)),
-        "llm_mute_sec": float(llm_cfg.get("dedup_seconds", 900)),
+        "llm_mute_sec": float(llm_cfg.get("dedup_seconds", 300)),
+        # 高置信目标无视静音 / 无视 LLM 否定，防止真火被这两条省钱的闸误伤
+        "llm_mute_bypass_conf": float(llm_cfg.get("mute_bypass_conf", 0.80)),
+        "llm_override_conf": float(llm_cfg.get("override_conf", 0.85)),
     }
 
     workers: list[Worker] = []

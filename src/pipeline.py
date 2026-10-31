@@ -117,6 +117,12 @@ DEFAULTS = {
     # 两头都省，只留中间那段真正需要判断的。
     "llm_min_conf": 0.50,
     "llm_sure_conf": 0.85,
+    # 规则层置信度高于此值时，LLM 判"非风险"也**只能降级为待确认，不能直接排除**。
+    # 依据：实测出现过 YOLO 给 0.95、LLM 一句 "light" 就把它抹掉的情况，
+    # 而画面里确实有火 —— 两个信号冲突时应该交给人看，不该由模型单方面裁决。
+    "llm_override_conf": 0.85,
+    # 置信度高于此值时，即使该区域刚被判过"非火"也重新送审（防区域静音误伤真火）
+    "llm_mute_bypass_conf": 0.80,
     # 被判为非风险的目标，判完之后又活了这么久 → 把人叫回来复核。
     # 真蒸汽几秒最多十几秒就散，撑过 30 秒本身就说明裁判可能看错了。
     # 这也是漏报的兜底：不给这条，一次误判就是一个完全静默的窗口。
@@ -612,7 +618,11 @@ class Pipeline:
         # 只有区域匹配才拦得住。
         h, w = pkt.image.shape[:2]
         box_n, area_n = self._norm_box(box, h, w)
-        if self._region_muted(pkt.cam_id, box_n, pkt.ts):
+        # 高置信目标无视区域静音：静音键是"区域"而不是"目标"，
+        # 同一块地方刚才可能只是在墙上反光被判过 light，随后真火出现在同一位置
+        # 就会被一起静音 —— 那是实打实的漏报。置信度够高就重新问一次。
+        high_bypass = float(self.cfg.get("llm_mute_bypass_conf", 0.80))
+        if score < high_bypass and self._region_muted(pkt.cam_id, box_n, pkt.ts):
             self._count_saved(tid)
             return True
 
@@ -690,6 +700,23 @@ class Pipeline:
             # 所以降级也要推一条，让前端留下痕迹、让人可以自己复核。
             self.stats["llm_dismissed"] += 1
             self._dismissed[key] = info.ts         # 记下降级时刻，供兜底复核计时
+            # 规则层非常肯定（>= llm_override_conf）而 LLM 说不是 → 两个模型打架。
+            # 这时候不能听 LLM 的把它直接抹掉，降成"待确认"让人扫一眼。
+            if float(info.score) >= float(self.cfg.get("llm_override_conf", 0.85)):
+                self.stats["llm_overridden"] = self.stats.get("llm_overridden", 0) + 1
+                return Event(kind=info.kind, level="notice", cam_id=info.cam_id,
+                             track_id=info.tid, frame_idx=info.frame_idx,
+                             t_first=info.t_first,
+                             t_alarm=pkt.ts if pkt is not None else info.ts,
+                             score=float(info.score), box=info.box,
+                             reasons=[f"LLM 判为{res.label}，但检测置信 {info.score:.2f} 很高，"
+                                      f"冲突未决，请人工确认"] + info.reasons[:1],
+                             snapshot=info.snapshot,
+                             meta={"hits": info.hits, "n_samples": info.n_samples,
+                                   "llm_label": res.label, "llm_risk": res.risk,
+                                   "llm_source": res.source,
+                                   "llm_latency": round(res.latency_s, 2),
+                                   "overridden": True})
             return Event(kind=info.kind, level="cleared", cam_id=info.cam_id,
                          track_id=info.tid, frame_idx=info.frame_idx,
                          t_first=info.t_first,
