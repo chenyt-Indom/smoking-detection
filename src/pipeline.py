@@ -106,6 +106,10 @@ DEFAULTS = {
     # 规则路径就接手把这个目标重新报成 ALARM —— 等于裁判白判，还多花了一次钱。
     # 静默时长和裁判自己的去重窗口对齐，过了这个时间才允许重新送审。
     "llm_mute_sec": 180.0,
+    # 被判为非风险的目标，判完之后又活了这么久 → 把人叫回来复核。
+    # 真蒸汽几秒最多十几秒就散，撑过 30 秒本身就说明裁判可能看错了。
+    # 这也是漏报的兜底：不给这条，一次误判就是一个完全静默的窗口。
+    "dismiss_recheck_sec": 30.0,
 
     # ── 杂项 ────────────────────────────────────────────────
     "min_box_pct": 0.0002,     # 面积小于画面 0.02% 的框当噪点丢掉
@@ -265,11 +269,13 @@ class Pipeline:
         self._noticed: set[int] = set()      # 已发 notice 的轨迹（一条轨迹只发一次）
         self._cleared: set[int] = set()      # notice 已被撤销的轨迹（防止反复发/撤）
         self._steam_noticed: set[int] = set()  # 已推过"降级为蒸汽"提示的轨迹
+        self._recheck_done: set[int] = set()   # 已对被判降级却久不消散的目标叫过人
         self._fired: set[int] = set()        # 已报过的轨迹（同一条火只报一次）
         self._recent_alarms: list[tuple[float, str, tuple, int]] = []   # (t, kind, box, tid)
         self._recent_notices: list[tuple[float, tuple]] = []             # (t, box)
         self._pending: dict[str, _Pending] = {}    # key=cam:tid → 等裁决的目标
         self._arbiter_done: dict[str, float] = {}  # key → 裁判给出结论的流内时刻
+        self._dismissed: dict[str, float] = {}     # key → 被判"非风险"的时刻（只这些才复核）
         self._recent: deque = deque(maxlen=8)   # 给 VLM 复核用的近几帧
 
         self.stats = {
@@ -278,6 +284,7 @@ class Pipeline:
             "steam_suppressed": 0, "static_suppressed": 0,
             "steam_ignored": 0,          # 极快模式下被忽略的蒸汽判定（用于事后校准）
             "notices": 0, "notice_cleared": 0, "steam_notices": 0,  # 提示 / 撤销 / 降级告知
+            "recheck_notices": 0,        # 降级后久不消散、把人叫回来的次数
             "llm_reviews": 0, "llm_alarms": 0, "llm_dismissed": 0,   # LLM 裁判
             "frozen_frames": 0, "cooldown_blocked": 0,
         }
@@ -395,9 +402,11 @@ class Pipeline:
         self._noticed &= live
         self._cleared &= live
         self._steam_noticed &= live
+        self._recheck_done &= live
         for k in [k for k in self._arbiter_done if k.rsplit(":", 1)[-1].isdigit()
                   and int(k.rsplit(":", 1)[-1]) not in live]:
             self._arbiter_done.pop(k, None)
+            self._dismissed.pop(k, None)
 
     # ------------------------------------------------------------ LLM 裁判
     def _defer(self, kind, tid, t, pkt, score, box, reasons) -> bool:
@@ -431,6 +440,33 @@ class Pipeline:
             hits=t.hits, n_samples=len(t.samples))
         return True
 
+    def _stale_recheck(self, t, pkt) -> bool:
+        """被判为非风险的目标还在，就说明裁判可能错了 —— 把人叫回来。
+
+        裁判说"这是蒸汽"只是**一次判决**，不是永久豁免。这一点必须写进代码里，
+        否则一次误判就是一段盲区：`llm_mute_sec` 期间规则层完全闭嘴，真烟在烧
+        也没人知道。
+
+        判据取"**判降级之后又撑过了多久**"，不是目标总寿命：总寿命会把
+        "刚判完立刻复核"也算成命中，两张卡片同一秒落地，等于没复核。
+        真蒸汽几秒最多十几秒就散，撑过 30 秒本身就是证据。
+
+        只对**判降级**的目标生效（`_dismissed`），不是所有裁判结论：
+        "拿不准"推的是 notice，本来就等人看，不需要再复核一遍。
+
+        这里**不重新调 LLM**：同一个问题问第二遍，答案大概率还是同一个，
+        白花配额还多等 1.5 秒。该做的是把证据直接摆到人面前。
+        """
+        done = self._dismissed.get(f"{pkt.cam_id}:{t.tid}")
+        if done is None:                       # 裁判没判降级，走正常路径
+            return False
+        if t.tid in self._recheck_done:        # 已叫过一次，别刷屏
+            return False
+        if pkt.ts - done < self.cfg["dismiss_recheck_sec"]:
+            return False
+        self._recheck_done.add(t.tid)
+        return True
+
     def _resolve(self, key: str, res, pkt: FramePacket | None) -> Event | None:
         """把裁决结果变成事件（在下一帧开头收割，不在送审当帧）。"""
         info = self._pending.pop(key, None)
@@ -446,6 +482,7 @@ class Pipeline:
             # 规则层或 LLM 只要错一次，管理员屏幕上什么都没有，事故就发生在静默里。
             # 所以降级也要推一条，让前端留下痕迹、让人可以自己复核。
             self.stats["llm_dismissed"] += 1
+            self._dismissed[key] = info.ts         # 记下降级时刻，供兜底复核计时
             return Event(kind=info.kind, level="cleared", cam_id=info.cam_id,
                          track_id=info.tid, frame_idx=info.frame_idx,
                          t_first=info.t_first,
@@ -629,6 +666,16 @@ class Pipeline:
 
             level = "alarm" if nearby else "warning"
             reasons = list(near_why) + list(v.reasons)
+            # 兜底复核：裁判判过"蒸汽"的东西还赖着不走 —— 那就不是蒸汽。
+            # 不再问 LLM，直接推 notice 让值班员看一眼。
+            if self._stale_recheck(t, pkt):
+                self.stats["recheck_notices"] += 1
+                held = pkt.ts - self._dismissed[f"{pkt.cam_id}:{t.tid}"]
+                events.append(self._make_event(
+                    "smoke", "notice", t.tid, t, pkt, v.score, t.last_box,
+                    [f"判为非火灾风险后仍持续 {held:.0f}s 未消散（共 {pkt.ts - t.first_t:.0f}s），"
+                     f"请人工确认是否误判"] + list(v.reasons[:2])))
+                continue
             if self._defer("smoke", t.tid, t, pkt, v.score, t.last_box, reasons):
                 continue                  # 已送审，等 LLM 裁决再定级
             events.append(self._make_event("smoke", level, t.tid, t, pkt,
