@@ -262,7 +262,7 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
     }
   }
 
-  setInterval(pullFrame, 30);        // 固定节奏尝试，实际帧率由后端决定
+  setInterval(pullFrame, 50);        // 50ms 一次 = 20fps 上限，配合后端发布节奏够用，也少占连接
   pullFrame();
 
   // ── 2. 当前检测：轮询细节（框已经画在图上了）──────────────

@@ -35,17 +35,21 @@ class BackgroundModel:
 
     def __init__(self, warmup: int = 30, history: int = 500,
                  var_threshold: float = 16.0, min_area: int = 120,
-                 refresh_every: int = 30):
+                 refresh_every: int = 30, median_scale: int = 3):
         self.warmup = warmup            # 前 N 帧只建背景，不报前景
         self.history = history
         self.var_threshold = var_threshold
         self.min_area = min_area
         self.frames: list[np.ndarray] = []
         self._bg_median: np.ndarray | None = None
-        # 中值背景**不能每帧重算**：500 帧 stack + median 在 960x540 上实测 ~0.7s/帧，
-        # 比 YOLO 推理还贵一个量级，整条流水线会被拖到 1fps。
-        # 背景本身是"长时中值"，20 秒窗口内变化极慢，每 refresh_every 帧刷一次足够。
+        # 中值背景**绝不能在高分辨率上重算**。
+        # 原来在 1280x720 上堆 500 帧做 median，单次要 0.7~2 秒，每 30 帧触发一次，
+        # 而且光那 500 张灰度图就占 460MB。表现就是画面每隔一两秒整个进程停住
+        # （连摄像头读取都一起停，因为 GIL 被这个大运算占着）。
+        # 现在：① 帧存 1/median_scale 尺寸（面积降 9 倍）② 刷新间隔放大 ③ history 收敛。
+        # 背景本身是"长时中值"，十几秒内变化极慢，降采样 + 降频完全不影响效果。
         self.refresh_every = max(1, refresh_every)
+        self.median_scale = max(1, int(median_scale))
         self._bg_age = 10 ** 9          # 首次必须立刻建
         self._mog2 = cv2.createBackgroundSubtractorMOG2(
             history=history, varThreshold=var_threshold, detectShadows=False
@@ -76,8 +80,17 @@ class BackgroundModel:
         gray = img if img.ndim == 2 else None
         if gray is None:
             gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY) if cv2 is not None else img.mean(axis=2)
+        h, w = gray.shape[:2]
 
-        self.frames.append(gray.copy() if gray.ndim == 2 else gray)
+        # 只在缩小图上存帧和中值，面积降 median_scale² 倍
+        s = self.median_scale
+        if s > 1 and cv2 is not None:
+            gray_s = cv2.resize(gray, (max(1, w // s), max(1, h // s)),
+                                interpolation=cv2.INTER_AREA)
+        else:
+            gray_s = gray
+
+        self.frames.append(gray_s if gray_s is not gray else gray.copy())
         if len(self.frames) > max(self.history, self.warmup) * 2:
             self.frames = self.frames[-self.history:]
             self._bg_median = None
@@ -86,13 +99,16 @@ class BackgroundModel:
         if warming:
             if self._mog2 is not None:
                 self._mog2.apply(img)
-            return np.zeros_like(gray, dtype=np.uint8), True
+            return np.zeros((h, w), dtype=np.uint8), True
 
-        mask = np.zeros_like(gray, dtype=np.uint8)
+        mask = np.zeros((h, w), dtype=np.uint8)
 
         # ① 中值背景差分（对缓慢铺开的烟最灵）
-        bg = self._median()
-        if bg is not None:
+        bg_s = self._median()
+        if bg_s is not None:
+            bg = bg_s
+            if bg.shape[:2] != (h, w) and cv2 is not None:
+                bg = cv2.resize(bg_s, (w, h), interpolation=cv2.INTER_NEAREST)
             diff = cv2.absdiff(gray, bg) if cv2 is not None else np.abs(gray.astype(int) - bg.astype(int)).astype(np.uint8)
             _, m1 = cv2.threshold(diff, 18, 255, cv2.THRESH_BINARY) if cv2 is not None else (None, (diff > 18).astype(np.uint8) * 255)
             mask = cv2.bitwise_or(mask, m1) if cv2 is not None else np.maximum(mask, m1)
@@ -127,7 +143,7 @@ class FixedCameraSource(CameraSource):
     def __init__(self, info: CameraInfo, frames=None, warmup: int = 30):
         super().__init__(info)
         self._frames = iter(frames) if frames is not None else None
-        self.bg = BackgroundModel(warmup=warmup)
+        self.bg = BackgroundModel(warmup=warmup, history=150, refresh_every=90, median_scale=3)
         self._idx = 0
 
     @classmethod

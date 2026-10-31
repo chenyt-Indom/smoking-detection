@@ -964,7 +964,13 @@ class Pipeline:
             last_idx = pkt.idx
 
             if n % every == 0:
+                _tp = time.time()
                 res = self.process(pkt)
+                _dt_proc = (time.time() - _tp) * 1000
+                # 单帧检测耗时探针：正常约 100~130ms，一旦超过 300ms 说明
+                # 这一帧把主线程（也就是 GIL）占住了，画面线程必然跟着卡
+                if _dt_proc > 300:
+                    print(f"[slow] 检测耗时 {_dt_proc:.0f}ms  frame={pkt.idx}", flush=True)
                 last_res = res
                 self._last_dets = res.dets      # 给画面线程叠加用
                 self._det_ts.append(time.time())

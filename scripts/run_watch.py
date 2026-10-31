@@ -58,33 +58,44 @@ def acquire_single_instance_lock():
     为什么必须加这把锁
     ------------------
     Windows 允许多个进程同时打开同一个摄像头，但它们会互相踩数据 ——
-    表现是画面花屏：上半截蓝白条纹、下半截纯绿色块，看起来像解码错误，
-    实际上是几路读取交错的结果。这个坑排查起来很费时间，所以直接在入口拦住。
+    表现是画面花屏（蓝白条纹 + 绿色块）和严重卡顿，看起来像解码错误。
+    这个坑排查起来极费时间，所以直接在入口拦住。
 
-    用文件锁而不是端口检测：端口要等模型加载完才绑定，那之前进程已经在读摄像头了，
-    挡不住第二个实例。文件锁在进程一启动就拿到。
+    ⚠️ 不能用 msvcrt 文件锁：锁文件是 0 字节时，两个进程都能成功锁上第 1 个字节
+    （实测确认，结果就是两个实例一起抢摄像头）。改用内核互斥量 —— 它是进程级的，
+    进程退出操作系统自动释放，既不会残留也不会被绕过。
     """
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.WinDLL("kernel32", use_last_error=True)
+            k32.CreateMutexW.restype = wintypes.HANDLE
+            k32.CreateMutexW.argtypes = [wintypes.LPCVOID, wintypes.BOOL,
+                                         wintypes.LPCWSTR]
+            handle = k32.CreateMutexW(None, True, "Local\\FireSmokeMonitor_Single")
+            if ctypes.get_last_error() == 183:      # ERROR_ALREADY_EXISTS
+                return None
+            return handle          # 保持引用；进程结束由内核自动释放
+        except Exception:          # noqa: BLE001  拿不到互斥量就别挡着启动
+            return True
+
+    # 非 Windows：退回文件锁
     lock_path = ROOT / "data" / "monitor.lock"
     try:
         lock_path.parent.mkdir(parents=True, exist_ok=True)
         fh = open(lock_path, "w")
+        fh.write("0")
+        fh.flush()
     except OSError:
-        return None           # 连锁文件都建不了，就不管了，别挡着启动
-
+        return True
     try:
-        if sys.platform == "win32":
-            import msvcrt
-            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
-        else:
-            import fcntl
-            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        import fcntl
+        fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
     except OSError:
         fh.close()
-        print("[x] 已经有一个监控进程在运行（data/monitor.lock 被占用）。")
-        print("    多个进程同时打开摄像头会导致画面花屏。")
-        print("    请先关掉旧窗口，再启动这个。")
         return None
-    return fh                 # 必须保持引用，进程退出时才会释放锁
+    return fh
 
 
 def build_source(args):
@@ -119,19 +130,40 @@ def build_source(args):
             print(f"[x] 摄像头 {args.camera} 打不开。换一个索引试试（--camera 1），"
                   f"或确认没有被其他程序占用", flush=True)
             raise SystemExit(3)
-        # 分辨率取摄像头**真能跑满**的那一档。
-        # 实测该 Rapoo 外接：1280x720 → 10fps，800x600 → 20fps，640x480 → 25fps。
-        # 检测端 imgsz=896 会自己缩放，640x480 对烟火这种大目标足够；
-        # 想更清晰就改 config/launcher.json 的 width/height，但帧率会掉。
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
+        # 分辨率按摄像头**实际能力**选，不是越高越好。
+        # 实测两台设备差异巨大：
+        #   Rapoo 外接  ：720p 只有 10fps，640x480 才 16.7fps（YUY2 顶满 USB 带宽）
+        #   Integrated  ：1280x720 能跑 29fps，天然支持压缩格式
+        # 默认给 1280x720，用 --width/--height 可覆盖。
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, args.width)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, args.height)
         cap.set(cv2.CAP_PROP_FPS, 30)
 
         def _frames():
+            """持续读帧。
+
+            ⚠️ 关键：read() 偶发失败**不能**直接 break。
+            摄像头在自动曝光/白平衡重新收敛的那几百毫秒里会返回 (False, None)，
+            早先这里一失败就结束生成器，采集线程随之永久退出 —— 画面从此定格，
+            而且不会自愈。表现就是"画风突变后停帧"。
+            现在改成连续失败到阈值才认输。
+            """
+            fails = 0
             while True:
                 ok, img = cap.read()
                 if not ok:
-                    break
+                    fails += 1
+                    if fails % 30 == 1:
+                        print(f"[cam] 读帧失败 {fails} 次（相机可能在调曝光，稍等）",
+                              flush=True)
+                    if fails > 300:          # 连续约 3 秒拿不到才判定设备掉线
+                        print("[cam] 连续读帧失败，判定摄像头掉线，退出采集", flush=True)
+                        break
+                    time.sleep(0.01)
+                    continue
+                if fails:
+                    print(f"[cam] 已恢复（此前连续失败 {fails} 次）", flush=True)
+                    fails = 0
                 yield img
             cap.release()
 
@@ -146,6 +178,8 @@ def main() -> int:
     ap.add_argument("--camera", type=int, default=None, help="摄像头编号")
     ap.add_argument("--video", default=None, help="视频文件")
     ap.add_argument("--fps", type=float, default=25.0)
+    ap.add_argument("--width", type=int, default=1280, help="采集宽度，默认 1280")
+    ap.add_argument("--height", type=int, default=720, help="采集高度，默认 720")
     ap.add_argument("--imgsz", type=int, default=896)
     ap.add_argument("--every", type=int, default=2, help="抽帧间隔")
     ap.add_argument("--fast", type=int, default=1, help="1=开极快模式")
@@ -170,6 +204,9 @@ def main() -> int:
 
     lock = acquire_single_instance_lock()
     if lock is None:
+        print("[x] 已经有一个监控进程在运行。")
+        print("    多个进程同时打开摄像头会导致画面花屏 + 严重卡顿。")
+        print("    请先关掉旧的（任务管理器结束 python.exe / FireMonitor.exe），再启动这个。")
         return 4
 
     load_dotenv()
@@ -240,11 +277,16 @@ def main() -> int:
         last_seq, last_pub = -1, 0.0
         n, t0 = 0, time.time()
         while not stop_pub.is_set():
+            ta = time.time()
             pkt, seq = src.snapshot()
-            now = time.time()
+            tb = time.time()
+            now = tb
             if pkt is not None and seq != last_seq and (now - last_pub) >= PUB_INTERVAL:
+                gap = (now - last_pub) * 1000 if last_pub else 0
+                prev_seq = last_seq
                 last_seq, last_pub = seq, now
                 n += 1
+                t1 = time.time()
                 try:
                     # fps 传的是**检测帧率**，pub_fps 由 LiveView 自己算画面帧率，
                     # 两个指标分开才能看出到底是哪个环节慢
@@ -253,6 +295,13 @@ def main() -> int:
                                  fps=getattr(pipe, "det_fps", 0.0))
                 except Exception:        # noqa: BLE001
                     pass
+                cost = (time.time() - t1) * 1000
+                # 卡顿归因：间隔长要分清是"取帧被锁"还是"画框编码慢"还是"线程没被调度"
+                if gap > 200:
+                    print(f"[slow] gap={gap:.0f}ms seq={last_seq}(+{last_seq-prev_seq}) 取帧={1000*(tb-ta):.1f}ms "
+                          f"发布={cost:.1f}ms", flush=True)
+                elif cost > 80:
+                    print(f"[slow] 发布耗时 {cost:.0f}ms（画框+编码）", flush=True)
             time.sleep(0.004)              # 4ms 轮询，兼顾延迟与 CPU
 
     pub_th = threading.Thread(target=publish_loop, name="publish", daemon=True)
@@ -266,6 +315,18 @@ def main() -> int:
         gc.collect()
         gc.freeze()
         gc.set_threshold(2000, 50, 50)
+    except Exception:                    # noqa: BLE001
+        pass
+
+    # 关键：把 GIL 切换间隔从默认 5ms 压到 1ms。
+    #
+    # 探针实测：画面线程取帧 0.0ms、发布 2.4ms，两次发布却相隔 2700ms ——
+    # 说明线程根本没被调度，不是它自己慢，是抢不到 GIL。
+    # 主线程每帧要做 numpy/opencv 的密集运算（letterbox、NMS 后处理、画框），
+    # 这些是 C 代码但不释放 GIL；默认 5ms 的切换粒度下，画面线程一次只能挤进
+    # 一个很窄的窗口，攒够一次发布要等好几帧。
+    try:
+        sys.setswitchinterval(0.001)
     except Exception:                    # noqa: BLE001
         pass
 

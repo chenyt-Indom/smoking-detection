@@ -63,7 +63,28 @@ class Notifier:
         self._lock = threading.Lock()
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        # 事件落盘队列：把磁盘 IO 从检测主循环里彻底摘出去
+        self._wq: queue.Queue = queue.Queue(maxsize=2000)
+        self._wthread = threading.Thread(target=self._writer_loop, name="event-writer",
+                                         daemon=True)
+        self._wthread.start()
         self.stats = {"pushed": 0, "clients": 0, "errors": 0}
+
+    def _writer_loop(self) -> None:
+        """后台串行写 jsonl。串行是为了保持事件顺序。"""
+        path = self.out_dir / "events.jsonl"
+        while True:
+            rec = self._wq.get()
+            if rec is None:
+                self._wq.task_done()
+                break
+            try:
+                with open(path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+            except OSError:
+                self.stats["errors"] += 1
+            finally:
+                self._wq.task_done()
 
     # ------------------------------------------------------------ 推送
     def push(self, ev, extra: dict | None = None) -> dict:
@@ -78,20 +99,24 @@ class Notifier:
             ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
             name = f"{rec['wall_ms']}_{ev.cam_id}_{ev.kind}_{ev.level}.jpg"
             p = self.out_dir / name
-            try:
-                cv2.imwrite(str(p), ev.snapshot)     # 先落盘，再广播
-                snap_url = f"/snapshots/{name}"
-            except Exception:                        # noqa: BLE001
-                self.stats["errors"] += 1
+            # 落盘必须异步：1280x720 的 JPEG 写盘本身只要几毫秒，但
+            # Windows Defender 实时扫描会把它拖到几百毫秒甚至更久，
+            # 而 push() 是在检测主循环里同步调用的 —— 一卡就是整条链路卡。
+            # 先写临时文件再原子 rename，前端不会读到写了一半的图。
+            snap_url = f"/snapshots/{name}"
+            threading.Thread(target=self._write_snapshot, args=(p, ev.snapshot),
+                             daemon=True).start()
         rec["snapshot"] = snap_url
         if extra:
             rec.update(extra)
 
-        # jsonl 追加（长期留证）
+        # jsonl 追加改成后台队列。
+        # 实测卡顿特征：画面和采集"同时"停 1~2 秒，而编码只要 2ms —— 是整个进程被
+        # 挡住了。同步写 jsonl 时，磁盘 IO + Windows Defender 实时扫描能拖几百毫秒，
+        # 而 push() 在检测主循环里调用，一卡全线停。写盘不该挡推送。
         try:
-            with open(self.out_dir / "events.jsonl", "a", encoding="utf-8") as f:
-                f.write(json.dumps(rec, ensure_ascii=False) + "\n")
-        except OSError:
+            self._wq.put_nowait(rec)
+        except queue.Full:
             self.stats["errors"] += 1
 
         self._broadcast(rec)
@@ -99,6 +124,23 @@ class Notifier:
             threading.Thread(target=self._post_webhook, args=(rec,), daemon=True).start()
         self.stats["pushed"] += 1
         return rec
+
+    def _write_snapshot(self, path: Path, img) -> None:
+        """后台线程写截图。先写 .tmp 再 replace，保证读到的一定是完整文件。"""
+        tmp = path.with_name(path.name + ".tmp")
+        ts = time.time()
+        try:
+            cv2.imwrite(str(tmp), img)
+            os.replace(tmp, path)
+            cost = (time.time() - ts) * 1000
+            if cost > 200:
+                print(f"[slow] 截图落盘 {cost:.0f}ms（后台线程，已不阻塞检测）", flush=True)
+        except Exception:                        # noqa: BLE001
+            self.stats["errors"] += 1
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
     def _broadcast(self, rec: dict) -> None:
         with self._lock:
@@ -199,6 +241,12 @@ class Notifier:
 
         class Handler(BaseHTTPRequestHandler):
             protocol_version = "HTTP/1.1"
+            # 空闲连接必须尽快回收。
+            # ThreadingHTTPServer 是"一个连接一个线程"，而看板每 30ms 拉一帧、
+            # 每帧 URL 都带不同的 ?n= 参数，keep-alive 下连接会一直挂着。
+            # 实测累积到 300+ 个 ESTABLISHED 线程，几百个线程哄抢 GIL，
+            # 采集线程和发布线程一起被饿死 —— 表现就是画面每隔一两秒停一次。
+            timeout = 5
 
             def log_message(self, *a):               # 静音，别把控制台刷爆
                 pass
