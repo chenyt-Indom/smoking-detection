@@ -119,12 +119,12 @@ def build_source(args):
             print(f"[x] 摄像头 {args.camera} 打不开。换一个索引试试（--camera 1），"
                   f"或确认没有被其他程序占用", flush=True)
             raise SystemExit(3)
-        # 分辨率要按摄像头的**实际能力**选，不是越高越好。
-        # 实测 Rapoo 外接：1280x720 只出 10fps，800x600 能出 25fps —— USB 带宽不够。
-        # 检测端 imgsz=896 时 800x600 已够用，帧率翻 2.5 倍更划算。
-        # 想要更高分辨率就改 config/launcher.json 里的 width/height（帧率会掉）。
-        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
-        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
+        # 分辨率取摄像头**真能跑满**的那一档。
+        # 实测该 Rapoo 外接：1280x720 → 10fps，800x600 → 20fps，640x480 → 25fps。
+        # 检测端 imgsz=896 会自己缩放，640x480 对烟火这种大目标足够；
+        # 想更清晰就改 config/launcher.json 的 width/height，但帧率会掉。
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 640)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 480)
         cap.set(cv2.CAP_PROP_FPS, 30)
 
         def _frames():
@@ -189,7 +189,7 @@ def main() -> int:
 
     # ── 实时画面：后端画框后压成 JPEG，前端逐帧拉取 ──
     # fps_limit 要跟上源帧率，否则画面会明显卡顿；20~25 是 CPU 编码和流畅度的平衡点
-    live = LiveView(max_width=1280, jpeg_quality=75, fps_limit=25.0)
+    live = LiveView(max_width=1280, jpeg_quality=72, fps_limit=30.0)
     live.llm = arb                       # /api/llm 读它的 snapshot()
 
     # ── 前端推送 ──
@@ -227,28 +227,47 @@ def main() -> int:
               f"tid={ev.track_id} t={ev.t_alarm:.1f}s 延迟={ev.latency:.1f}s "
               f"score={ev.score:.2f} | {ev.reasons[0][:44] if ev.reasons else ''}")
 
-    # 实时画面：独立线程，只取最新帧 + 最近一次检测框。
-    # 这样画面帧率跟着摄像头走，不受检测速度限制（检测慢就少刷几个框而已）。
+    # 实时画面：独立线程，固定节奏取最新帧 + 最近一次检测框。
+    #
+    # 不用「等新帧通知」那种写法：采集线程的 notify 会被检测线程的 GIL 占压，
+    # 等收到通知时往往已过几百毫秒，画面就是一顿一顿的。
+    # 这里每秒按固定间隔去取"此刻最新的一帧"，有新的就发，没有就跳过，
+    # 峰值延迟由 sleep 粒度决定（约 5ms），不会积累。
     stop_pub = threading.Event()
+    PUB_INTERVAL = 1.0 / 30.0          # 目标 30fps，实际受摄像头上限约束
 
     def publish_loop():
-        last, n, t0 = -1, 0, time.time()
+        last_seq, last_pub = -1, 0.0
+        n, t0 = 0, time.time()
         while not stop_pub.is_set():
-            pkt, seq = src.read_new(last, timeout=0.5)
-            if pkt is None or seq == last:
-                continue
-            last = seq
-            n += 1
-            fps = n / max(1e-6, time.time() - t0)
-            try:
-                live.publish(pkt.image, getattr(pipe, "_last_dets", None) or [],
-                             frame_idx=pkt.idx, cam_id=getattr(pkt, "cam_id", ""),
-                             fps=fps)
-            except Exception:                # noqa: BLE001
-                pass
+            pkt, seq = src.snapshot()
+            now = time.time()
+            if pkt is not None and seq != last_seq and (now - last_pub) >= PUB_INTERVAL:
+                last_seq, last_pub = seq, now
+                n += 1
+                try:
+                    # fps 传的是**检测帧率**，pub_fps 由 LiveView 自己算画面帧率，
+                    # 两个指标分开才能看出到底是哪个环节慢
+                    live.publish(pkt.image, getattr(pipe, "_last_dets", None) or [],
+                                 frame_idx=pkt.idx, cam_id=getattr(pkt, "cam_id", ""),
+                                 fps=getattr(pipe, "det_fps", 0.0))
+                except Exception:        # noqa: BLE001
+                    pass
+            time.sleep(0.004)              # 4ms 轮询，兼顾延迟与 CPU
 
     pub_th = threading.Thread(target=publish_loop, name="publish", daemon=True)
     pub_th.start()
+
+    # 压掉 GC 带来的偶发卡顿：模型和检测器都加载完了，对象图基本稳定，
+    # 把已有对象冻结出扫描范围，再放宽阈值，避免每几百毫秒就来一次回收停顿。
+    # 之前实测出现过 480ms 的单帧间隔，多半就是 GC + 编码撞在一起。
+    try:
+        import gc
+        gc.collect()
+        gc.freeze()
+        gc.set_threshold(2000, 50, 50)
+    except Exception:                    # noqa: BLE001
+        pass
 
     try:
         out = pipe.run(src, on_event=on_event, every=args.every,

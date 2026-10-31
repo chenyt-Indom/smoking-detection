@@ -62,6 +62,16 @@ class LatestFrameSource:
         with self._cond:
             return self._pkt
 
+    def snapshot(self):
+        """画面端用：非阻塞地拿 (帧, 序号)。序号没变说明还没新帧。
+
+        画面发布**不能**用阻塞等待（read_new）：采集线程的 notify 会被检测线程
+        的 GIL 占压，等到通知时已经过去几百毫秒，表现就是画面一顿一顿。
+        改成自己按固定节奏取，拿到的永远是此刻最新的一帧，宁可重复也不卡。
+        """
+        with self._cond:
+            return self._pkt, self._seq
+
     def read_new(self, last_seq: int, timeout: float = 0.5):
         """画面端用：等一帧新的。返回 (pkt, seq)，超时则返回同一帧同上 seq。"""
         with self._cond:

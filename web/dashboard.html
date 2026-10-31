@@ -235,7 +235,7 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
     $("nosignal").classList.add("hide");
     $("streamDot").className = "dot on";
     $("streamState").textContent = "在线";
-    setTimeout(pullFrame, 20);          // 上一帧画完再拉下一帧，不会堆积
+    setTimeout(pullFrame, 0);           // 上一帧画完立刻拉下一帧，不加人为延迟
   });
 
   img.addEventListener("error", () => {

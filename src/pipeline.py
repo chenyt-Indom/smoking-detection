@@ -316,6 +316,11 @@ class Pipeline:
         self._dismissed: dict[str, float] = {}     # key → 被判"非风险"的时刻（只这些才复核）
         self._recent: deque = deque(maxlen=8)   # 给 VLM 复核用的近几帧
 
+        # 实时检测帧率（滑动窗口）。和画面帧率是两个完全不同的量：
+        # 画面跟摄像头走，检测跟算力走，之前混用同一个字段导致看不出瓶颈。
+        self.det_fps = 0.0
+        self._det_ts: deque = deque(maxlen=24)
+
         self.stats = {
             "frames": 0, "dets": 0, "tracks": 0,
             "fire_alarms": 0, "smoke_alarms": 0,
@@ -934,23 +939,39 @@ class Pipeline:
         n = 0
         empty = 0
         last_res = None          # 最近一次检测结果，给跳过的帧复用
+        last_idx = -1            # 上一帧的序号，用来识别"重复帧"
 
         while not source.closed:
-            # 采集若被放到独立线程（LatestFrameSource），用它带等待的读取，
-            # 避免检测比采集快时空转把 CPU 拉满
-            pkt = (source.read_blocking() if hasattr(source, "read_blocking")
-                   else source.read())
+            # 非阻塞取帧 + 主动让出 CPU。
+            # 早先用带条件等待的 read_blocking，会和画面发布线程抢同一把
+            # Condition 锁：采集每来一帧都 notify_all，两个等待方同时被唤醒、
+            # 同时抢锁，锁竞争把吞吐压到 15fps 上不去（降检测开销也没用）。
+            # 这里改成纯轮询，锁只做一次极短的读，竞争基本消失。
+            pkt = source.read()
             if pkt is None:
                 empty += 1
                 if empty > 1000:        # 源活着但一直没帧 → 别死等
                     break
+                time.sleep(0.002)
                 continue
             empty = 0
+
+            # 重复帧直接跳过，不计数（独立采集线程在没新帧时会返回上一帧，
+            # 让重复帧参与 every 计数会让抽帧形同虚设）
+            if pkt.idx == last_idx:
+                time.sleep(0.002)
+                continue
+            last_idx = pkt.idx
 
             if n % every == 0:
                 res = self.process(pkt)
                 last_res = res
                 self._last_dets = res.dets      # 给画面线程叠加用
+                self._det_ts.append(time.time())
+                if len(self._det_ts) >= 4:
+                    span = self._det_ts[-1] - self._det_ts[0]
+                    if span > 0:
+                        self.det_fps = (len(self._det_ts) - 1) / span
                 for ev in res.events:
                     all_events.append(ev)
                     if not quiet:
