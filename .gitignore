@@ -45,3 +45,6 @@ dist_app/
 
 # ---- 桌面启动器生成的锁 ----
 data/monitor.lock
+
+# ---- 未完成的下载残留 ----
+*.part
