@@ -99,13 +99,12 @@ class Notifier:
             ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
             name = f"{rec['wall_ms']}_{ev.cam_id}_{ev.kind}_{ev.level}.jpg"
             p = self.out_dir / name
-            # 落盘必须异步：1280x720 的 JPEG 写盘本身只要几毫秒，但
-            # Windows Defender 实时扫描会把它拖到几百毫秒甚至更久，
-            # 而 push() 是在检测主循环里同步调用的 —— 一卡就是整条链路卡。
-            # 先写临时文件再原子 rename，前端不会读到写了一半的图。
-            snap_url = f"/snapshots/{name}"
-            threading.Thread(target=self._write_snapshot, args=(p, ev.snapshot),
-                             daemon=True).start()
+            # 同步写，不再放后台线程。
+            # 实测 imencode + write_bytes 一个 250KB 的截图只要 5.5ms（最慢 6ms），
+            # 完全够快；异步反而出过问题 —— 前端拿到事件后立刻请求图片时文件还没写完，
+            # 表现为"截图点不开"、"点误报提示没有截图"。
+            self._write_snapshot(p, ev.snapshot)
+            snap_url = f"/snapshots/{name}" if p.is_file() else None
         rec["snapshot"] = snap_url
         if extra:
             rec.update(extra)
@@ -126,17 +125,29 @@ class Notifier:
         return rec
 
     def _write_snapshot(self, path: Path, img) -> None:
-        """后台线程写截图。先写 .tmp 再 replace，保证读到的一定是完整文件。"""
+        """后台线程写截图。先写 .tmp 再 replace，保证读到的一定是完整文件。
+
+        用 imencode + write_bytes 而不是 cv2.imwrite：
+        imwrite 失败时只返回 False、不抛异常，而它的路径处理在 Windows 中文路径下
+        还有已知问题。显式编码后由 Python 写文件，成功与否一目了然。
+        """
         tmp = path.with_name(path.name + ".tmp")
         ts = time.time()
         try:
-            cv2.imwrite(str(tmp), img)
+            ok, buf = cv2.imencode(".jpg", img, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
+            if not ok:
+                self.stats["errors"] += 1
+                print(f"[notify] 截图编码失败: {path.name}", flush=True)
+                return
+            tmp.write_bytes(buf.tobytes())
             os.replace(tmp, path)
             cost = (time.time() - ts) * 1000
             if cost > 200:
                 print(f"[slow] 截图落盘 {cost:.0f}ms（后台线程，已不阻塞检测）", flush=True)
-        except Exception:                        # noqa: BLE001
+        except Exception as exc:                 # noqa: BLE001
             self.stats["errors"] += 1
+            print(f"[notify] 截图写入失败 {path.name}: {type(exc).__name__} {exc}",
+                  flush=True)
             try:
                 tmp.unlink(missing_ok=True)
             except OSError:
@@ -203,34 +214,45 @@ class Notifier:
                "note": str(body.get("note") or "")[:200],
                "at": time.strftime("%Y-%m-%d %H:%M:%S")}
         saved = None
+        note_extra = ""
 
         if verdict == "false_alarm":
             snap = rec.get("snapshot") or ""
             src = self.out_dir / unquote(snap[len("/snapshots/"):]) \
                 if snap.startswith("/snapshots/") else None
             if src is None or not src.is_file():
-                return {"ok": False, "error": "这条事件没有截图，存不了负样本"}
-            img_dir = self.report_dir / "images"
-            lbl_dir = self.report_dir / "labels"
-            img_dir.mkdir(parents=True, exist_ok=True)
-            lbl_dir.mkdir(parents=True, exist_ok=True)
-            stem = f"hn_{wid}_{rec.get('cam')}_{rec.get('kind')}"
-            # 去重：同一 wall_ms 已经存过就不覆盖（人工可能补点 note）
-            if not (img_dir / f"{stem}.jpg").exists():
-                (img_dir / f"{stem}.jpg").write_bytes(src.read_bytes())
-                (lbl_dir / f"{stem}.txt").write_text("", encoding="utf-8")
-            saved = str(img_dir / f"{stem}.jpg")
-            self.stats["hard_negatives"] = self.stats.get("hard_negatives", 0) + 1
+                # 截图缺失时不阻断反馈。
+                # 反馈本身（哪条告警被判成误报）对统计误报率有价值，
+                # 硬负样本图只是它的附加产物 —— 缺图就跳过存图这一步。
+                note_extra = " [截图缺失，未生成负样本]"
+                self.stats["missing_snapshot"] = self.stats.get("missing_snapshot", 0) + 1
+            else:
+                img_dir = self.report_dir / "images"
+                lbl_dir = self.report_dir / "labels"
+                img_dir.mkdir(parents=True, exist_ok=True)
+                lbl_dir.mkdir(parents=True, exist_ok=True)
+                stem = f"hn_{wid}_{rec.get('cam')}_{rec.get('kind')}"
+                # 去重：同一 wall_ms 已经存过就不覆盖（人工可能补点 note）
+                if not (img_dir / f"{stem}.jpg").exists():
+                    (img_dir / f"{stem}.jpg").write_bytes(src.read_bytes())
+                    (lbl_dir / f"{stem}.txt").write_text("", encoding="utf-8")
+                saved = str(img_dir / f"{stem}.jpg")
+                self.stats["hard_negatives"] = self.stats.get("hard_negatives", 0) + 1
 
         # 反馈流水账：既做留证，也算"人工复核后确认率"
         try:
             self.report_dir.mkdir(parents=True, exist_ok=True)
             row["saved"] = saved
+            if note_extra:
+                row["note"] = (row["note"] + note_extra).strip()
             with open(self.report_dir / "reports.jsonl", "a", encoding="utf-8") as f:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         except OSError:
             self.stats["errors"] += 1
-        return {"ok": True, "verdict": verdict, "saved": saved}
+        res = {"ok": True, "verdict": verdict, "saved": saved}
+        if note_extra:
+            res["warning"] = "截图缺失，已记录反馈但未生成负样本"
+        return res
 
     # ------------------------------------------------------------ HTTP
     def start(self) -> str:

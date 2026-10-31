@@ -384,6 +384,17 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
     });
 
     eventsEl.prepend(div);
+    // 截图加载失败时别留一块空白，明确告诉用户是取图失败而不是没截图
+    const im = div.querySelector("img");
+    if (im) {
+      im.addEventListener("error", () => {
+        const ph = document.createElement("div");
+        ph.style.cssText = "margin-top:7px;padding:10px;border-radius:4px;" +
+          "background:var(--panel);color:var(--dim);font-size:11px;text-align:center";
+        ph.textContent = "截图加载失败（文件可能已被清理）";
+        im.replaceWith(ph);
+      });
+    }
     while (eventsEl.children.length > 120) eventsEl.lastChild.remove();
   }
 
