@@ -167,7 +167,7 @@ class Detector:
         tile_grid: int = 2,
         overlap: float = 0.25,
         keep_full_frame: bool = True,
-        batched: bool = True,
+        batched: bool = False,
     ) -> list[Detection]:
         """检测一帧。
 
@@ -176,9 +176,11 @@ class Detector:
           · 再跑 grid×grid 个重叠切片，各自放大到 imgsz 后检测
           · 所有框映射回原图坐标后统一 NMS
 
-        batched=True 时把上面这些图**一次性**送进网络。逐张跑 5 次前向和
-        批量跑 5 张，结果完全一样（同样输入、同样权重），但 GPU 只在一次
-        kernel launch 里算完，实测 54.8ms → 28ms 左右。这个提速不拿召回换。
+        batched=False（默认）逐张跑。**不要随手改成 True**：批量前向时
+        ultralytics 只在单图用最省 padding 的 `auto=True`，批量统一补成方形，
+        输入几何略有不同，检测结果会漂（实测 fire 召回 68.5% → 67.8%，
+        fire 场景还会偶发多出一条烟告警）。而批量只省 1.08 倍（56.8→52.6ms），
+        不值。真正需要批量的是 detect_auto 的慢路径，那里是显式传参的。
         """
         h, w = image.shape[:2]
 

@@ -175,8 +175,9 @@ def pick_patch(det: Detector, cls_id: int, target_pct: float, other_cls: int,
     """
     CACHE.mkdir(parents=True, exist_ok=True)
     tag = f"cls{cls_id}_pct{target_pct}_m{margin}"
-    # 缓存随裁剪参数走：margin 变了素材就变了，沿用旧缓存会拿到旧尺度的图
-    npz = CACHE / f"patch_v4_{tag}.npz"
+    # 缓存随裁剪参数走：margin 变了素材就变了，沿用旧缓存会拿到旧尺度的图。
+    # v5：另一类的复验门限从 0.35 收紧到 0.20，会筛掉一批旧素材。
+    npz = CACHE / f"patch_v5_{tag}.npz"
     if npz.exists():
         z = np.load(npz, allow_pickle=True)
         return Sprite(z["patch"], tuple(z["obj"].tolist()), str(z["name"]))
@@ -233,7 +234,10 @@ def pick_patch(det: Detector, cls_id: int, target_pct: float, other_cls: int,
             probe = make_scene(random.Random(seed))
             paste_obj(probe, patch, obj, SCENE_W * fx, SCENE_H * fy, target_pct)
             vd = det.detect(probe, sliced=False)
-            if any(d.cls_id == other_cls and d.conf > 0.35 for d in vd):
+            # 对"另一类"卡到 0.20 而不是 0.35：火素材边缘的光晕会偶发被认成烟，
+            # 单帧 0.36 的烟框配上时序层就成了一条 smoke 告警（fire 场景实测偶发）。
+            # 这类素材不能要 —— 它会让场景同时冒出两类目标，测出来的东西没意义。
+            if any(d.cls_id == other_cls and d.conf > 0.20 for d in vd):
                 ok = False
                 break
             if not any(d.cls_id == cls_id and d.conf >= 0.45 for d in vd):
@@ -276,7 +280,14 @@ PALETTE_BGR = [
 
 
 def make_scene(rng: random.Random) -> np.ndarray:
-    """一面"墙"：渐变 + 几块矩形（门窗/柜子）+ 噪声。有结构才能让切片有意义。"""
+    """一面"墙"：渐变 + 几块矩形（门窗/柜子）+ 噪声。有结构才能让切片有意义。
+
+    ⚠️ 噪声必须由**传进来的种子**派生，不能用 `np.random.normal`（全局状态）。
+    第一版就是用了全局状态，结果同一份代码每轮生成不同的墙面纹理，火贴上去
+    偶尔被读成烟 → fire 场景大约 6 次里有 1 次凭空多出一条 smoke 告警，
+    测试"时好时坏"，查了半天。合成场景的前提就是**可复现**。
+    """
+    nrng = np.random.default_rng(rng.randint(0, 2 ** 31 - 1))
     yy, xx = np.mgrid[0:SCENE_H, 0:SCENE_W].astype(np.float32)
     base = 96 + 44 * (xx / SCENE_W)[..., None] + np.array([8, 6, 4], np.float32)
     base = np.clip(base + 0 * yy[..., None], 0, 255).astype(np.float32)
@@ -287,7 +298,7 @@ def make_scene(rng: random.Random) -> np.ndarray:
         col = np.array(rng.choice(PALETTE_BGR), np.float32)
         base[y:y + h, x:x + w] = base[y:y + h, x:x + w] * 0.35 + col * 0.65
 
-    base += np.random.normal(0, 3.0, base.shape).astype(np.float32)
+    base += nrng.normal(0, 3.0, base.shape).astype(np.float32)
     return np.clip(base, 0, 255).astype(np.uint8)
 
 
