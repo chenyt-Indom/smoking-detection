@@ -32,13 +32,14 @@ COLORS = {
     0: (48, 48, 235),      # 红：火（达到告警阈值）
     1: (40, 165, 255),     # 橙：烟（达到告警阈值）
 }
-# 未达告警阈值的候选框用黄色细线。
-# 目的是把"看见了"和"要报警"在视觉上也分开 —— 用户能看到系统注意到那块区域了，
-# 只是置信度还不足以惊动人。之前两者共用一个阈值，调高就再也看不见真火。
-CAND_COLORS = {
-    0: (0, 210, 255),
-    1: (60, 230, 255),
-}
+# 未达告警阈值的候选框统一用**灰色**。
+# 语义：系统在画面里"注意到"了这块区域，但置信度还不够，不作任何主张。
+# 这样颜色只承担一件事 —— 红/橙才代表系统认为有风险，灰只是"我看到了"。
+# 早期候选也用黄色，结果满屏都是抢眼的黄框，等于没有优先级。
+CAND_COLOR = (150, 150, 150)       # 灰：未达阈值，只表示"看到了"
+WARM_COLOR = (0, 210, 255)         # 黄：刚过阈值，疑似（还要 LLM 复核）
+CAND_COLORS = {0: CAND_COLOR, 1: CAND_COLOR}
+WARM_COLORS = {0: WARM_COLOR, 1: WARM_COLOR}
 DEFAULT_COLOR = (190, 190, 190)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -59,8 +60,14 @@ class LiveView:
         # 超过上限就降一档质量重编，体积能砍一半，代价才 0.3ms。
         self.max_bytes = int(max_bytes)
         self.fallback_quality = int(fallback_quality)
-        # 各类别的告警阈值：低于它的框画成黄色"候选"，高于它才是红色"告警"
-        self.alarm_confs: dict[int, float] = {0: 0.55, 1: 0.60}
+        # 三档着色（都由配置驱动）：
+        #   < alarm_conf          灰：未达阈值，只表示"系统看到这块区域了"
+        #   alarm_conf ~ hot_conf 黄：刚过线，疑似，等 LLM 复核
+        #   >= hot_conf           红/橙：高置信，基本可以定性
+        # 两档不够用的原因：人脸被强光照到能拿到 fire 0.49，刚过 0.45 就变红，
+        # 和真火 0.82 一个颜色，反而分不出轻重。
+        self.alarm_confs: dict[int, float] = {0: 0.45, 1: 0.50}
+        self.hot_confs: dict[int, float] = {0: 0.70, 1: 0.75}
 
         self._cond = threading.Condition(threading.Lock())
         self._jpeg: bytes | None = None
@@ -148,12 +155,18 @@ class LiveView:
 
             cid = int(getattr(d, "cls_id", -1))
             conf = float(getattr(d, "conf", 0.0))
-            is_alarm = conf >= self.alarm_confs.get(cid, 0.55)
-            color = (COLORS if is_alarm else CAND_COLORS).get(cid, DEFAULT_COLOR)
-            cv2.rectangle(img, (x1, y1), (x2, y2), color, 2 if is_alarm else 1)
+            alarm_thr = self.alarm_confs.get(cid, 0.45)
+            hot_thr = self.hot_confs.get(cid, 0.70)
+            if conf >= hot_thr:
+                color, thick, suffix = COLORS.get(cid, DEFAULT_COLOR), 2, ""
+            elif conf >= alarm_thr:
+                color, thick, suffix = WARM_COLORS.get(cid, WARM_COLOR), 2, " ?"
+            else:
+                color, thick, suffix = CAND_COLORS.get(cid, CAND_COLOR), 1, " ?"
+            cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
 
             name = str(getattr(d, "cls_name", "obj")).upper()
-            label = f"{name} {conf:.2f}" if is_alarm else f"{name} {conf:.2f} ?"
+            label = f"{name} {conf:.2f}{suffix}"
             (tw, th), base = cv2.getTextSize(label, FONT, 0.5, 1)
             bh = th + base + 4
 
@@ -169,8 +182,10 @@ class LiveView:
             placed.append((x1, ly, x1 + tw + 6, ly + bh))
 
             cv2.rectangle(img, (x1, ly), (x1 + tw + 6, ly + bh), color, -1)
+            # 告警框用白字压在彩色底上；候选框用深字压在灰底上，进一步弱化
+            dark_text = conf < alarm_thr         # 灰底用深字，彩底用白字
             cv2.putText(img, label, (x1 + 3, ly + th + 1), FONT, 0.5,
-                        (255, 255, 255), 1, cv2.LINE_AA)
+                        (30, 30, 30) if dark_text else (255, 255, 255), 1, cv2.LINE_AA)
 
         # 左上角信息条：帧号 / 检测数 / 时间
         bar = f"f{frame_idx if frame_idx is not None else '-'}  det {len(dets)}  " \

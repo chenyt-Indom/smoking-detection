@@ -237,6 +237,8 @@ def main() -> int:
         # 画面分级：低于告警阈值的画黄色候选框，高于才是红色告警框
         v.alarm_confs = {0: float(thr.get("fire_conf", 0.45)),
                          1: float(thr.get("smoke_conf", 0.50))}
+        v.hot_confs = {0: float(thr.get("hot_conf", 0.70)),
+                       1: float(thr.get("hot_conf_smoke", 0.75))}
 
     nf = Notifier(out_dir=ROOT / "alerts",
                   host=a.host or ui_cfg.get("host", "127.0.0.1"),
