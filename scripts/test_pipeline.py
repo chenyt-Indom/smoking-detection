@@ -49,6 +49,62 @@ from src.pipeline import Pipeline                                  # noqa: E402
 from src.sources.base import CameraInfo                            # noqa: E402
 from src.sources.fixed import FixedCameraSource                    # noqa: E402
 
+
+class FakeArbiter:
+    """固定答案的假裁判：验证 LLM 裁决真的会改变事件级别，且不卡主线程。
+
+    不联网，所以能把"裁判说蒸汽"和"裁判说火"两个分支都确定性地跑到。
+    """
+
+    def __init__(self, label: str, risk: str, conf: float, delay: float = 0.3):
+        from src.arbiter import ArbiterResult
+        self.res = ArbiterResult(label, risk, conf, f"假裁判：{label}", "llm", delay)
+        self.delay = delay
+        self._q: dict[str, float] = {}
+        self._done: dict[str, object] = {}
+        self.stats = {"submitted": 0, "llm": 0, "rule": 0, "skipped": 0,
+                      "timeout": 0, "error": 0}
+
+    def submit(self, key, frame, box, **kw) -> tuple[bool, str]:
+        if key in self._q or key in self._done:
+            return False, "同一目标已审过"
+        self._q[key] = time.time() + self.delay
+        self.stats["submitted"] += 1
+        return True, "已提交"
+
+    def poll(self):
+        now = time.time()
+        ready = [k for k, due in self._q.items() if now >= due]
+        out = []
+        for k in ready:
+            self._q.pop(k, None)
+            self._done[k] = self.res
+            out.append((k, self.res))
+        return out
+
+    def pending(self) -> int:
+        return len(self._q)
+
+    def close(self) -> None:
+        pass
+
+
+def make_arbiter(kind: str):
+    """--llm 参数 → 裁判实例。"""
+    if not kind or kind == "off":
+        return None
+    if kind == "dry":
+        from src.arbiter import LlmArbiter
+        cfg = {"dry_run": True, "enabled": True}
+        return LlmArbiter(cfg=cfg, api_key="dry")
+    if kind == "dismiss":       # 判成蒸汽 → 应该压掉，0 告警
+        return FakeArbiter("steam", "low", 0.85)
+    if kind == "alarm":         # 判成火 → 应该升级成 alarm
+        return FakeArbiter("fire", "high", 0.9)
+    if kind == "uncertain":     # 拿不准 → 应该降为 notice（推给人看）
+        return FakeArbiter("uncertain", "low", 0.2)
+    raise SystemExit(f"未知 --llm 取值：{kind}")
+
 WEIGHTS = ROOT / "models" / "fire_smoke_v5_26s960_best.pt"
 DATA = Path("E:/datasets/fire_smoke_v5/test")
 CACHE = ROOT / "runs" / "pipeline_patches"
@@ -309,6 +365,9 @@ def run_scene(name: str, det: Detector, args) -> dict:
     expect = spec["expect"]
     n = 320
     stub = None
+    # 裁判的答案会改变应得结果，期望值要跟着改，否则测出来的"失败"是假的
+    if args.llm in ("dismiss", "uncertain"):
+        expect = set()          # 判蒸汽 → 压掉；拿不准 → 只发 notice（不算告警）
 
     if name == "fire":
         patch, _, _ = pick_patch(det, cls_id=0, target_pct=0.012, other_cls=1)
@@ -341,8 +400,9 @@ def run_scene(name: str, det: Detector, args) -> dict:
 
     info = CameraInfo(cam_id=f"sim_{name}", kind="fixed", fps=FPS)
     src = FixedCameraSource(info, frames=frames, warmup=WARMUP_FRAMES)
+    arb = make_arbiter(args.llm)
     pipe = Pipeline(stub or det, sliced=bool(args.sliced) and stub is None, tile_grid=2,
-                    cfg={"fast_smoke": bool(args.fast)})
+                    cfg={"fast_smoke": bool(args.fast)}, arbiter=arb)
 
     events: list = []
     trace: list = []
@@ -381,6 +441,8 @@ def run_scene(name: str, det: Detector, args) -> dict:
         "elapsed_s": round(el, 1), "fps": round(n / el, 2),
         "sliced": bool(args.sliced) and stub is None, "stub_detector": stub is not None,
         "fast_smoke": bool(args.fast),
+        "llm": args.llm,
+        "llm_stats": getattr(arb, "stats", None) if arb else None,
         "events": [e.to_dict() for e in events], "n_events": len(events),
         "n_notice": n_notice, "n_cleared": n_clear,
         "expect_kinds": sorted(expect) if expect is not None else "n/a(观测)",
@@ -421,6 +483,9 @@ def main():
     ap.add_argument("--save", type=int, default=1, help="1 保存告警截图")
     ap.add_argument("--trace", type=int, default=1, help="1 打印时序判别演化")
     ap.add_argument("--fast", type=int, default=0, help="1 开极快模式（烟跳过时序判别）")
+    ap.add_argument("--llm", default="off",
+                    choices=["off", "dry", "dismiss", "alarm", "uncertain"],
+                    help="LLM 裁判：off=不用 / dry=假接口 / dismiss=判蒸汽 / alarm=判火 / uncertain=拿不准")
     ap.add_argument("--out", default=str(ROOT / "runs" / "pipeline_test.json"))
     args = ap.parse_args()
 

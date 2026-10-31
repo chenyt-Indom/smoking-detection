@@ -1,0 +1,33 @@
+# LLM 裁判配置（异步，不进前台实时循环）
+#
+# ⚠️ 密钥不写在这里。密钥放项目根目录的 .env（已在 .gitignore 里）：
+#     TELEAI_APPKEY=你的key
+#
+# 上线前必须做的两件事：
+# 1. model 填平台模型广场里的**确切名字**（现在是空的，空着裁判会自动降级到规则层）
+# 2. 确认这个模型支持图片输入（多模态），否则会返回 400
+
+enabled: true
+dry_run: false                 # true = 不发请求，只验证接线
+
+# 天翼云星辰 TokenHub（OpenAI 兼容）。海外节点换 https://ai.ctaigw.com/{region}/v1/chat/completions
+url: https://ai.ctaigw.cn/v1/chat/completions
+model: ""                      # ← 待填：例如平台给出的具体模型名
+api_key_env: TELEAI_APPKEY
+
+# 生成参数：只要一个短 JSON，给多了是浪费（也更容易被思维链吃光输出预算）
+temperature: 0.1
+max_tokens: 160
+timeout_s: 8
+
+# 图片参数：ROI 放大看细节，整幅图看环境。长边压小是为了省 token，不是为了省流量
+roi_max_side: 512
+full_max_side: 768
+jpeg_quality: 82
+
+# 成本闸门
+max_workers: 2                 # 并发上限，别调高，容易被限流
+queue_limit: 8                 # 排队超了就跳过（宁可少审也别堆积）
+hourly_limit: 300              # 每小时调用上限，超了自动降级到规则层
+dedup_seconds: 180             # 同一目标 3 分钟内只审一次
+accept_conf: 0.55              # 采信门限

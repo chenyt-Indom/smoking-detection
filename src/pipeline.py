@@ -100,6 +100,13 @@ DEFAULTS = {
     # ── 火源先验 ────────────────────────────────────────────
     "fire_nearby_grow": 0.6,   # 烟框外扩 60% 后若含火框中心，就算「旁边有火」
 
+    # ── LLM 裁判 ────────────────────────────────────────────
+    # 裁判判过的目标，**规则层不许再定级**。不设这条会出大问题：
+    # 实测 LLM 判"蒸汽"压掉之后，下一帧裁判去重生效（不重复送审），
+    # 规则路径就接手把这个目标重新报成 ALARM —— 等于裁判白判，还多花了一次钱。
+    # 静默时长和裁判自己的去重窗口对齐，过了这个时间才允许重新送审。
+    "llm_mute_sec": 180.0,
+
     # ── 杂项 ────────────────────────────────────────────────
     "min_box_pct": 0.0002,     # 面积小于画面 0.02% 的框当噪点丢掉
     "snapshot_margin": 0.25,   # 截图外扩比例
@@ -197,6 +204,28 @@ class FrameResult:
     nearby: dict[int, bool] = field(default_factory=dict)   # tid → 烟旁边有没有火
 
 
+@dataclass
+class _Pending:
+    """已送审、等 LLM 裁决的目标。
+
+    不能直接存 Track 对象：裁决回来时轨迹可能已经老化消失了，但它照样要出事件
+    （火真的烧过，只是烧完了）。所以这里存的是**事件需要的最小快照**。
+    """
+
+    kind: str
+    tid: int
+    cam_id: str
+    frame_idx: int
+    ts: float
+    t_first: float
+    box: tuple[float, float, float, float]
+    snapshot: np.ndarray | None
+    score: float
+    reasons: list[str]
+    hits: int
+    n_samples: int
+
+
 # ------------------------------------------------------------------ 主类
 
 
@@ -211,6 +240,7 @@ class Pipeline:
         cfg: dict | None = None,
         temporal_thr: dict | None = None,
         verifier=None,
+        arbiter=None,
         sliced: bool = True,
         tile_grid: int = 2,
         overlap: float = 0.25,
@@ -219,7 +249,8 @@ class Pipeline:
         self.tracker = tracker or IoUTracker()
         self.cfg = {**DEFAULTS, **(cfg or {})}
         self.temporal_thr = temporal_thr or {}
-        self.verifier = verifier            # 可选：VLM 复核（默认关，离线可跑）
+        self.verifier = verifier            # 可选：同步 VLM 复核（旧路径）
+        self.arbiter = arbiter              # 可选：异步 LLM 裁判（新路径，推荐）
         self.sliced = sliced
         self.tile_grid = tile_grid
         self.overlap = overlap
@@ -233,9 +264,12 @@ class Pipeline:
         self._notice_streak: dict[int, int] = {}
         self._noticed: set[int] = set()      # 已发 notice 的轨迹（一条轨迹只发一次）
         self._cleared: set[int] = set()      # notice 已被撤销的轨迹（防止反复发/撤）
+        self._steam_noticed: set[int] = set()  # 已推过"降级为蒸汽"提示的轨迹
         self._fired: set[int] = set()        # 已报过的轨迹（同一条火只报一次）
         self._recent_alarms: list[tuple[float, str, tuple, int]] = []   # (t, kind, box, tid)
         self._recent_notices: list[tuple[float, tuple]] = []             # (t, box)
+        self._pending: dict[str, _Pending] = {}    # key=cam:tid → 等裁决的目标
+        self._arbiter_done: dict[str, float] = {}  # key → 裁判给出结论的流内时刻
         self._recent: deque = deque(maxlen=8)   # 给 VLM 复核用的近几帧
 
         self.stats = {
@@ -243,7 +277,8 @@ class Pipeline:
             "fire_alarms": 0, "smoke_alarms": 0,
             "steam_suppressed": 0, "static_suppressed": 0,
             "steam_ignored": 0,          # 极快模式下被忽略的蒸汽判定（用于事后校准）
-            "notices": 0, "notice_cleared": 0,   # 极快模式的临时提示 / 自动撤销数
+            "notices": 0, "notice_cleared": 0, "steam_notices": 0,  # 提示 / 撤销 / 降级告知
+            "llm_reviews": 0, "llm_alarms": 0, "llm_dismissed": 0,   # LLM 裁判
             "frozen_frames": 0, "cooldown_blocked": 0,
         }
 
@@ -273,23 +308,37 @@ class Pipeline:
         return float(np.hypot(acx - bcx, acy - bcy))
 
     def _can_alarm(self, kind: str, tid: int, ts: float, box) -> tuple[bool, str]:
-        """按区域去重：同一块地方最近报过就不再报，别处新起火照报。"""
+        """按区域去重：同一块地方报过就不再报，别处新起火照报。
+
+        关键细节是**续期**：命中同区域记录时，把那条记录的时间戳刷成当前时刻。
+        不续期的话冷却一到（30s）就重新放开，同一场火会被反复报 —— 因为模型把
+        一团火切成好几条轨迹，每条轨迹都独立走完流程。实测过：一条火在 t=1.4s
+        报过，t=31.4s 和 t=61.5s 又各报一次，`cooldown_blocked` 累计 1577 次。
+        续期之后就变成：**只要这个位置还在烧，就只报一次；烧完了 30 秒后才允许重报。**
+        """
         if tid in self._fired:
             return False, "该轨迹已报过"
 
         cd = self.cfg["cooldown_sec"]
-        self._recent_alarms = [r for r in self._recent_alarms if ts - r[0] < cd]
         g = self.cfg["dedup_grow"]
-        for t0, k0, b0, _ in self._recent_alarms:
-            if k0 != kind:
-                continue
-            same_place = (
-                iou(b0, box) > self.cfg["dedup_iou"]                       # 明显重叠
-                or self._dist(b0, box) < self.cfg["dedup_dist_px"]          # 贴在一起
-                or iou(expand_box(b0, g), expand_box(box, g)) > 0           # 同一片火的碎片
-            )
-            if same_place:
-                return False, f"冷却中（{ts - t0:.1f}s 前同一区域已报过）"
+        kept: list[tuple[float, str, tuple, int]] = []
+        hit = None
+        for rec in self._recent_alarms:
+            t0, k0, b0, tid0 = rec
+            if ts - t0 >= cd:
+                continue                                   # 过期，丢掉
+            if hit is None and k0 == kind and (
+                    iou(b0, box) > self.cfg["dedup_iou"]        # 明显重叠
+                    or self._dist(b0, box) < self.cfg["dedup_dist_px"]   # 贴在一起
+                    or iou(expand_box(b0, g), expand_box(box, g)) > 0):  # 同一片火的碎片
+                hit = len(kept)
+            kept.append(rec)
+        if hit is not None:
+            t0, k0, b0, tid0 = kept[hit]
+            kept[hit] = (ts, k0, b0, tid0)                 # 续期：目标还在烧
+            self._recent_alarms = kept
+            return False, f"同一区域仍在持续告警（{(ts - t0):.0f}s 前报过，已续期）"
+        self._recent_alarms = kept
         return True, ""
 
     def _can_notice(self, ts: float, box) -> bool:
@@ -300,13 +349,23 @@ class Pipeline:
         所以它用自己的一套记录，和正式告警的冷却互不干扰。
         """
         cd = self.cfg["cooldown_sec"]
-        self._recent_notices = [r for r in self._recent_notices if ts - r[0] < cd]
         g = self.cfg["dedup_grow"]
-        for _, b0 in self._recent_notices:
-            if (iou(b0, box) > self.cfg["dedup_iou"]
-                    or self._dist(b0, box) < self.cfg["dedup_dist_px"]
-                    or iou(expand_box(b0, g), expand_box(box, g)) > 0):
-                return False
+        kept: list[tuple[float, tuple]] = []
+        hit = None
+        for rec in self._recent_notices:
+            t0, b0 = rec
+            if ts - t0 >= cd:
+                continue
+            if hit is None and (iou(b0, box) > self.cfg["dedup_iou"]
+                                or self._dist(b0, box) < self.cfg["dedup_dist_px"]
+                                or iou(expand_box(b0, g), expand_box(box, g)) > 0):
+                hit = len(kept)
+            kept.append(rec)
+        if hit is not None:
+            kept[hit] = (ts, kept[hit][1])      # 同样续期，避免目标还在却反复提示
+            self._recent_notices = kept
+            return False
+        self._recent_notices = kept
         return True
 
     def _make_event(self, kind, level, tid, t, pkt, score, box, reasons) -> Event:
@@ -335,6 +394,98 @@ class Pipeline:
         self._fired &= live
         self._noticed &= live
         self._cleared &= live
+        self._steam_noticed &= live
+        for k in [k for k in self._arbiter_done if k.rsplit(":", 1)[-1].isdigit()
+                  and int(k.rsplit(":", 1)[-1]) not in live]:
+            self._arbiter_done.pop(k, None)
+
+    # ------------------------------------------------------------ LLM 裁判
+    def _defer(self, kind, tid, t, pkt, score, box, reasons) -> bool:
+        """把定级交给 LLM 裁判。返回 True = 已送审/正在等，本帧不要发事件。
+
+        返回 False 的两种情形都**必须**让调用方继续走规则路径：
+          · 没挂裁判
+          · 裁判拒收（没 Key / 超额 / 去重 / 排队满）
+        否则 LLM 一挂告警就全停了 —— 这是最不能接受的事故。
+        """
+        if self.arbiter is None:
+            return False
+        key = f"{pkt.cam_id}:{tid}"
+        if key in self._pending:              # 已在等裁决，别重复提交
+            return True
+        done = self._arbiter_done.get(key)
+        if done is not None and (pkt.ts - done) < self.cfg["llm_mute_sec"]:
+            return True                       # 裁判已判过，规则层闭嘴
+        ok, _why = self.arbiter.submit(
+            key, pkt.image, box, rule_label=kind, rule_score=score,
+            context=f"{kind}，检测 conf {t.samples[-1].conf:.2f}，轨迹已命中 {t.hits} 帧",
+            feat=extract_features(t.samples))
+        if not ok:
+            return False
+        self._pending[key] = _Pending(
+            kind=kind, tid=tid, cam_id=pkt.cam_id, frame_idx=pkt.idx, ts=pkt.ts,
+            t_first=t.first_t, box=tuple(float(v) for v in box),
+            snapshot=crop_box(pkt.image, box, self.cfg["snapshot_margin"],
+                              self.cfg["snapshot_max_side"]),
+            score=float(score), reasons=list(reasons),
+            hits=t.hits, n_samples=len(t.samples))
+        return True
+
+    def _resolve(self, key: str, res, pkt: FramePacket | None) -> Event | None:
+        """把裁决结果变成事件（在下一帧开头收割，不在送审当帧）。"""
+        info = self._pending.pop(key, None)
+        if info is None:
+            return None
+        self.stats["llm_reviews"] += 1
+        self._arbiter_done[key] = info.ts     # 这个目标从此由裁判说了算
+        reasons = ([f"LLM 判为 {res.label}（risk={res.risk}，conf={res.confidence:.2f}）："
+                    f"{res.reason}"] + info.reasons[:2])
+
+        if res.is_dismiss:
+            # ⚠️ 这里**不能** return None。判成蒸汽就一声不响，等于给真烟开了后门：
+            # 规则层或 LLM 只要错一次，管理员屏幕上什么都没有，事故就发生在静默里。
+            # 所以降级也要推一条，让前端留下痕迹、让人可以自己复核。
+            self.stats["llm_dismissed"] += 1
+            return Event(kind=info.kind, level="cleared", cam_id=info.cam_id,
+                         track_id=info.tid, frame_idx=info.frame_idx,
+                         t_first=info.t_first,
+                         t_alarm=pkt.ts if pkt is not None else info.ts,
+                         score=float(res.confidence or info.score), box=info.box,
+                         reasons=[f"LLM 判为{res.label}，已降级（非火灾风险）"] + info.reasons[:2],
+                         snapshot=info.snapshot,
+                         meta={"hits": info.hits, "n_samples": info.n_samples,
+                               "llm_label": res.label, "llm_risk": res.risk,
+                               "llm_source": res.source,
+                               "llm_latency": round(res.latency_s, 2),
+                               "dismissed": True})
+        if res.label in ("fire", "smoke"):
+            level = "alarm" if res.risk == "high" else "warning"
+        else:                                  # uncertain → 不硬判，推给人看
+            level = "notice"
+
+        now_ts = pkt.ts if pkt is not None else info.ts
+        if level != "notice" and not self._can_alarm(info.kind, info.tid, now_ts, info.box)[0]:
+            return None
+
+        ev = Event(kind=info.kind, level=level, cam_id=info.cam_id, track_id=info.tid,
+                   frame_idx=info.frame_idx, t_first=info.t_first,
+                   # 用**裁决生效时刻**而不是送审时刻：否则"确认延迟"会把等 LLM 的
+                   # 那一两秒吞掉，数字看着漂亮但不符合实际
+                   t_alarm=now_ts,
+                   score=float(res.confidence or info.score), box=info.box,
+                   reasons=reasons, snapshot=info.snapshot,
+                   meta={"hits": info.hits, "n_samples": info.n_samples,
+                         "llm_label": res.label, "llm_risk": res.risk,
+                         "llm_source": res.source,
+                         "llm_latency": round(res.latency_s, 2)})
+        if level in ("warning", "alarm"):
+            self._fired.add(info.tid)
+            self._recent_alarms.append((info.ts, info.kind, info.box, info.tid))
+            self.stats["llm_alarms"] += 1
+            self.stats[f"{info.kind}_alarms"] += 1
+        else:
+            self._recent_notices.append((info.ts, info.box))
+        return ev
 
     # ------------------------------------------------------------ 单帧
     def process(self, pkt: FramePacket) -> FrameResult:
@@ -371,6 +522,13 @@ class Pipeline:
         verdicts: dict[int, Verdict] = {}
         nearby_map: dict[int, bool] = {}
 
+        # 先收割 LLM 裁决（上几帧送审的）。放在最前面：早一帧出结果就早一帧告警。
+        if self.arbiter is not None:
+            for key, res in self.arbiter.poll():
+                ev = self._resolve(key, res, pkt)
+                if ev is not None:
+                    events.append(ev)
+
         for t in tracks:
             if t.last_t != pkt.ts or not t.samples:
                 continue                      # 本帧没匹配上，不推进判定
@@ -390,9 +548,11 @@ class Pipeline:
                     if "冷却" in why_not:
                         self.stats["cooldown_blocked"] += 1
                     continue
+                fire_reasons = [f"连续 {self._fire_streak[t.tid]} 帧检出火焰（conf {conf:.2f}）"]
+                if self._defer("fire", t.tid, t, pkt, conf, t.last_box, fire_reasons):
+                    continue          # 已送审，等 LLM 裁决再定级
                 events.append(self._make_event(
-                    "fire", "alarm", t.tid, t, pkt, conf, t.last_box,
-                    [f"连续 {self._fire_streak[t.tid]} 帧检出火焰（conf {conf:.2f}）"]))
+                    "fire", "alarm", t.tid, t, pkt, conf, t.last_box, fire_reasons))
                 continue
 
             # ── 烟：慢路径，必须先过时序判别 ────────────────────
@@ -433,19 +593,25 @@ class Pipeline:
                         "smoke", "notice", t.tid, t, pkt, conf, t.last_box,
                         [f"极快模式：连续 {self._notice_streak[t.tid]} 帧检出烟"
                          f"（conf {conf:.2f}），尚未做蒸汽判别，需人工确认"]))
+                    # notice 之后立刻送审：这才是"YOLO 第一轮可疑就交给 LLM"的地方。
+                    # notice 已经让值班员看到画面了，LLM 的结果用来升级或压掉。
+                    self._defer("smoke", t.tid, t, pkt, conf, t.last_box,
+                                [f"极快模式第一轮可疑（conf {conf:.2f}）"])
 
             if v.label == "steam":
                 self.stats["steam_suppressed"] += 1
                 self._smoke_streak[t.tid] = 0
-                # 注意：这里**不**把 tid 从 _noticed 里移除。
-                # 移了就会 notice→cleared→notice 反复抖（实测抖了 5 轮）。
-                # 一条轨迹的 notice 只发一次；真要继续烧，后面会直接升级成正式告警。
-                if t.tid in self._noticed and t.tid not in self._cleared:
-                    self._cleared.add(t.tid)
-                    self.stats["notice_cleared"] += 1
+                # ⚠️ 同样不能静默。规则层判蒸汽只是"倾向"，不是"结论"——
+                # 面积/亮度这几个手工特征分不开真烟和蒸汽，判错一次就是漏报。
+                # 所以每条轨迹降级时推一条 notice 到前端，标注判据，让人自己看。
+                if t.tid not in self._steam_noticed and t.tid not in self._fired:
+                    self._steam_noticed.add(t.tid)
+                    self.stats["steam_notices"] += 1
                     events.append(self._make_event(
-                        "smoke", "cleared", t.tid, t, pkt, v.score, t.last_box,
-                        ["时序判别为蒸汽/水雾，撤销早前的临时提示"] + list(v.reasons[:2])))
+                        "smoke", "notice", t.tid, t, pkt, v.score, t.last_box,
+                        ["规则层倾向判为蒸汽/水雾，已降级（不是排除）"] + list(v.reasons[:2])))
+                    self._defer("smoke", t.tid, t, pkt, v.score, t.last_box,
+                                ["规则层倾向蒸汽，请复核"])
                 continue
             if v.label != "smoke" or v.score < cfg["smoke_conf"]:
                 self._smoke_streak[t.tid] = 0
@@ -463,6 +629,8 @@ class Pipeline:
 
             level = "alarm" if nearby else "warning"
             reasons = list(near_why) + list(v.reasons)
+            if self._defer("smoke", t.tid, t, pkt, v.score, t.last_box, reasons):
+                continue                  # 已送审，等 LLM 裁决再定级
             events.append(self._make_event("smoke", level, t.tid, t, pkt,
                                            v.score, t.last_box, reasons))
 

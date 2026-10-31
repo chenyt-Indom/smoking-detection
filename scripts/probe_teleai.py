@@ -38,6 +38,12 @@ import sys
 
 import requests
 
+# 复用裁判那边的 .env 读取：探针和线上用同一份 Key，别让人填两遍
+sys.path.insert(0, str(__import__("pathlib").Path(__file__).resolve().parent.parent))
+from src.arbiter import load_dotenv                                  # noqa: E402
+
+load_dotenv()
+
 # 算力归属中国大陆的模型；全球节点是 https://ai.ctaigw.com/{region}/v1（amer/eu/as）
 BASE_URL = os.environ.get("TELEAI_BASE_URL", "https://ai.ctaigw.cn/v1")
 
