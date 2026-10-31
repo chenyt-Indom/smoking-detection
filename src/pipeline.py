@@ -920,19 +920,26 @@ class Pipeline:
 
     # ------------------------------------------------------------ 多帧
     def run(self, source: CameraSource, *, on_event=None, max_frames: int | None = None,
-            every: int = 1, quiet: bool = False) -> dict:
+            every: int = 1, quiet: bool = False, on_frame=None) -> dict:
         """把一路视频源跑到底。
 
         every：抽帧间隔（2 = 隔一帧跑一次）。烟雾是慢过程，抽帧几乎不影响效果，
                但吞吐直接翻倍 —— 现场算力不够时先调这个，别去降 imgsz。
+
+        on_frame：每处理完一帧回调一次 (pkt, res)，给实时画面用。
+                  **异常一律吞掉** —— 可视化挂了不能连累检测。
         """
         t0 = time.time()
         all_events: list[Event] = []
         n = 0
         empty = 0
+        last_res = None          # 最近一次检测结果，给跳过的帧复用
 
         while not source.closed:
-            pkt = source.read()
+            # 采集若被放到独立线程（LatestFrameSource），用它带等待的读取，
+            # 避免检测比采集快时空转把 CPU 拉满
+            pkt = (source.read_blocking() if hasattr(source, "read_blocking")
+                   else source.read())
             if pkt is None:
                 empty += 1
                 if empty > 1000:        # 源活着但一直没帧 → 别死等
@@ -942,12 +949,23 @@ class Pipeline:
 
             if n % every == 0:
                 res = self.process(pkt)
+                last_res = res
+                self._last_dets = res.dets      # 给画面线程叠加用
                 for ev in res.events:
                     all_events.append(ev)
                     if not quiet:
                         print(ev, flush=True)
                     if on_event is not None:
                         on_event(ev, res)
+
+            # 画面要每一帧都推，不能只在做检测的帧推 —— 否则 every=2 时
+            # 前端帧率会直接砍半（实测 20fps 的源只有 5.8fps 画面）。
+            # 跳过的帧沿用上一次的检测框，框位置最多滞后一个抽帧间隔。
+            if on_frame is not None and last_res is not None:
+                try:
+                    on_frame(pkt, last_res)
+                except Exception:       # noqa: BLE001
+                    pass                # 画面出问题也绝不能中断检测
             n += 1
             if max_frames is not None and n >= max_frames:
                 break

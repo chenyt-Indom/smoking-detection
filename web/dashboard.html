@@ -3,285 +3,499 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>火情监控 · 实时告警</title>
+<title>火情烟雾智能监控</title>
 <style>
-  :root{
-    --bg:#0d1117; --panel:#161b22; --line:#242c37; --txt:#e6edf3; --dim:#8b949e;
-    --alarm:#f85149; --warning:#f0883e; --notice:#d29922; --cleared:#3fb950;
-    --ok:#238636;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--txt);
-       font:14px/1.6 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif}
-  header{position:sticky;top:0;z-index:10;background:rgba(13,17,23,.92);
-         backdrop-filter:blur(8px);border-bottom:1px solid var(--line);
-         padding:12px 20px;display:flex;align-items:center;gap:16px;flex-wrap:wrap}
-  h1{font-size:16px;margin:0;font-weight:600;letter-spacing:.5px}
-  .dot{width:8px;height:8px;border-radius:50%;background:var(--dim);display:inline-block}
-  .dot.on{background:var(--cleared);box-shadow:0 0 8px var(--cleared)}
-  .stat{color:var(--dim);font-size:12px}
-  .stat b{color:var(--txt);font-weight:600}
-  main{max-width:1080px;margin:0 auto;padding:16px 20px 60px}
-  .banner{border-radius:10px;padding:14px 18px;margin-bottom:16px;
-          border-left:4px solid var(--line);background:var(--panel);display:none}
-  .banner.show{display:block}
-  .banner .t{font-size:15px;font-weight:600;margin-bottom:4px}
-  .banner .s{color:var(--dim);font-size:12px}
-  .card{display:grid;grid-template-columns:180px 1fr;gap:16px;background:var(--panel);
-        border:1px solid var(--line);border-left-width:4px;border-radius:10px;
-        padding:12px;margin-bottom:12px;animation:in .25s ease}
-  @keyframes in{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
-  .card.alarm{border-left-color:var(--alarm)}
-  .card.warning{border-left-color:var(--warning)}
-  .card.notice{border-left-color:var(--notice)}
-  .card.cleared{border-left-color:var(--cleared);opacity:.62}
-  /* 同一目标先出 notice、后被 LLM 升级成 alarm 时，旧的 notice 淡化成"已升级"，
-     避免管理员把它当成两起独立事件 */
-  .card.superseded{opacity:.38}
-  .card.superseded .head::after{content:"已升级为正式告警";margin-left:8px;font-size:11px;
-      color:var(--dim);border:1px solid var(--line);padding:1px 6px;border-radius:99px}
-  .thumb{width:180px;height:120px;object-fit:cover;border-radius:6px;
-         background:#000;cursor:zoom-in;display:block}
-  .noimg{width:180px;height:120px;border-radius:6px;background:#000;
-         display:flex;align-items:center;justify-content:center;color:#444;font-size:12px}
-  .head{display:flex;align-items:center;gap:8px;flex-wrap:wrap;margin-bottom:6px}
-  .lv{font-size:11px;font-weight:700;padding:2px 8px;border-radius:99px;letter-spacing:.5px}
-  .lv.alarm{background:rgba(248,81,73,.15);color:var(--alarm);border:1px solid rgba(248,81,73,.4)}
-  .lv.warning{background:rgba(240,136,62,.15);color:var(--warning);border:1px solid rgba(240,136,62,.4)}
-  .lv.notice{background:rgba(210,153,34,.15);color:var(--notice);border:1px solid rgba(210,153,34,.4)}
-  .lv.cleared{background:rgba(63,185,80,.15);color:var(--cleared);border:1px solid rgba(63,185,80,.4)}
-  /* 被 LLM 判降级的，用琥珀色而不是绿色：它是"待复核"，不是"安全" */
-  .card.cleared.dismissed{border-left-color:var(--notice);opacity:.85}
-  .lv.cleared.dismissed{background:rgba(210,153,34,.15);color:var(--notice);
-      border-color:rgba(210,153,34,.45)}
-  .kind{font-weight:600}
-  .meta{color:var(--dim);font-size:12px}
-  ul{margin:6px 0 0;padding-left:18px;color:#b8c2cc;font-size:12.5px}
-  /* 人工反馈：误报一键落成硬负样本，回流进训练集治"会闪的假火"
-     （电焊弧光、夕阳在玻璃上跳、红色霓虹 PWM 调光）——这类闪烁闸拦不住 */
-  .act{display:flex;align-items:center;gap:8px;margin-top:9px}
-  .fb{font:inherit;font-size:12px;padding:3px 12px;border-radius:99px;cursor:pointer;
-      background:transparent;border:1px solid var(--line);color:var(--dim);
-      transition:border-color .15s,color .15s}
-  .fb:hover{color:#e6edf3;border-color:#6e7681}
-  .fb.bad:hover{color:var(--alarm);border-color:rgba(248,81,73,.55)}
-  .fb.good:hover{color:var(--cleared);border-color:rgba(63,185,80,.55)}
-  .fb:disabled{cursor:default;opacity:.45}
-  .fb.on-bad{color:var(--alarm);border-color:rgba(248,81,73,.55);opacity:1}
-  .fb.on-good{color:var(--cleared);border-color:rgba(63,185,80,.55);opacity:1}
-  .fbst{color:var(--dim);font-size:11.5px}
-  li{margin:2px 0}
-  .llm{color:#79c0ff}
-  .empty{color:var(--dim);text-align:center;padding:60px 0}
-  #viewer{position:fixed;inset:0;background:rgba(0,0,0,.9);display:none;
-          align-items:center;justify-content:center;z-index:99;cursor:zoom-out}
-  #viewer img{max-width:94vw;max-height:94vh;border-radius:8px}
-  .filters{display:flex;gap:6px;margin-left:auto}
-  .filters button{background:var(--panel);color:var(--dim);border:1px solid var(--line);
-                  border-radius:6px;padding:4px 10px;font-size:12px;cursor:pointer}
-  .filters button.on{color:var(--txt);border-color:#3d4756;background:#1f2630}
+:root{
+  --bg:#0b0e14; --panel:#141922; --panel2:#1a212c; --line:#242c3a;
+  --text:#e6ebf2; --muted:#8b96a8; --dim:#5b6675;
+  --fire:#ef4444; --smoke:#f59e0b; --ok:#22c55e; --warn:#eab308; --err:#ef4444; --accent:#3b82f6;
+}
+*{box-sizing:border-box;margin:0;padding:0}
+html,body{height:100%}
+body{
+  background:var(--bg); color:var(--text);
+  font:13px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;
+  display:flex; flex-direction:column; overflow:hidden;
+}
+header{
+  height:52px; flex:0 0 52px; display:flex; align-items:center; gap:14px;
+  padding:0 18px; background:var(--panel); border-bottom:1px solid var(--line);
+}
+.brand{font-size:15px; font-weight:600; letter-spacing:.3px; display:flex; align-items:center; gap:8px}
+.brand i{width:8px;height:8px;border-radius:50%;background:var(--ok);display:inline-block;
+  box-shadow:0 0 8px var(--ok);animation:pulse 2s infinite}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+.spacer{flex:1}
+.chip{
+  display:inline-flex; align-items:center; gap:6px; height:26px; padding:0 10px;
+  background:var(--panel2); border:1px solid var(--line); border-radius:6px;
+  font-size:12px; color:var(--muted); white-space:nowrap;
+}
+.chip b{color:var(--text); font-weight:600; font-variant-numeric:tabular-nums}
+.dot{width:7px;height:7px;border-radius:50%;background:var(--dim);flex:0 0 7px}
+.dot.on{background:var(--ok);box-shadow:0 0 6px var(--ok)}
+.dot.off{background:var(--err)}
+.dot.warn{background:var(--warn)}
+main{flex:1; display:grid; grid-template-columns:minmax(0,1fr) 380px; min-height:0}
+#left{display:flex; flex-direction:column; min-width:0; min-height:0; border-right:1px solid var(--line)}
+.viewport{position:relative; flex:1; min-height:320px; background:#05070a; display:flex;
+  align-items:center; justify-content:center; overflow:hidden}
+#stream{max-width:100%; max-height:100%; display:block; min-height:1px}
+#nosignal{
+  position:absolute; inset:0; display:flex; flex-direction:column; align-items:center;
+  justify-content:center; gap:10px; color:var(--dim); background:#05070a;
+}
+#nosignal.hide{display:none}
+#nosignal .ring{width:38px;height:38px;border:2px solid var(--line);border-top-color:var(--accent);
+  border-radius:50%;animation:spin 1s linear infinite}
+@keyframes spin{to{transform:rotate(360deg)}}
+.corner{position:absolute;width:16px;height:16px;border:2px solid var(--accent);opacity:.5}
+.c1{top:10px;left:10px;border-right:0;border-bottom:0}
+.c2{top:10px;right:10px;border-left:0;border-bottom:0}
+.c3{bottom:10px;left:10px;border-right:0;border-top:0}
+.c4{bottom:10px;right:10px;border-left:0;border-top:0}
+
+.dets{flex:0 0 auto; max-height:32%; overflow:auto; background:var(--panel);
+  border-top:1px solid var(--line)}
+.dets h3{padding:8px 14px; font-size:12px; color:var(--muted); font-weight:500;
+  border-bottom:1px solid var(--line); position:sticky; top:0; background:var(--panel); z-index:1}
+table{width:100%; border-collapse:collapse; font-variant-numeric:tabular-nums}
+th,td{padding:6px 14px; text-align:left; font-size:12px; border-bottom:1px solid rgba(36,44,58,.5)}
+th{color:var(--dim); font-weight:500; font-size:11px; text-transform:uppercase; letter-spacing:.5px}
+td.cls{font-weight:600}
+td.cls.fire{color:var(--fire)} td.cls.smoke{color:var(--smoke)}
+.empty{padding:20px 14px; color:var(--dim); text-align:center; font-size:12px}
+
+#right{display:flex; flex-direction:column; min-height:0; background:var(--panel)}
+.right-head{padding:10px 14px; border-bottom:1px solid var(--line); display:flex;
+  align-items:center; justify-content:space-between}
+.right-head span{font-size:12px; color:var(--muted)}
+#events{flex:1; overflow:auto; padding:8px}
+.ev{background:var(--panel2); border:1px solid var(--line); border-left:3px solid var(--dim);
+  border-radius:6px; padding:9px 10px; margin-bottom:7px; animation:slide .25s ease}
+@keyframes slide{from{opacity:0;transform:translateY(-6px)}to{opacity:1;transform:none}}
+.ev.alarm{border-left-color:var(--fire)} .ev.warning{border-left-color:var(--smoke)}
+.ev.notice{border-left-color:var(--accent)} .ev.cleared{border-left-color:var(--ok)}
+.ev-top{display:flex; align-items:center; gap:8px; margin-bottom:5px}
+.tag{font-size:11px; font-weight:600; padding:1px 6px; border-radius:4px}
+.tag.alarm{background:rgba(239,68,68,.16); color:var(--fire)}
+.tag.warning{background:rgba(245,158,11,.16); color:var(--smoke)}
+.tag.notice{background:rgba(59,130,246,.16); color:#60a5fa}
+.tag.cleared{background:rgba(34,197,94,.16); color:var(--ok)}
+.ev-time{font-size:11px; color:var(--dim); margin-left:auto; font-variant-numeric:tabular-nums}
+.ev-meta{font-size:11px; color:var(--muted); line-height:1.6}
+.ev-meta b{color:var(--text); font-weight:500}
+.ev img{width:100%; border-radius:4px; margin-top:7px; display:block; cursor:zoom-in}
+.ev-actions{display:flex; gap:6px; margin-top:7px}
+.btn{font-size:11px; padding:3px 9px; border-radius:4px; border:1px solid var(--line);
+  background:transparent; color:var(--muted); cursor:pointer; transition:.15s}
+.btn:hover{border-color:var(--muted); color:var(--text)}
+.btn.pri{background:var(--accent); border-color:var(--accent); color:#fff}
+.btn.pri:hover{filter:brightness(1.12)}
+.btn:disabled{opacity:.45; cursor:default}
+
+footer{flex:0 0 auto; background:var(--panel); border-top:1px solid var(--line)}
+.llm-head{display:flex; align-items:center; gap:12px; padding:9px 16px; cursor:pointer;
+  border-bottom:1px solid transparent}
+.llm-head:hover{background:var(--panel2)}
+.llm-body{display:none; padding:0 16px 14px; grid-template-columns:1fr 1fr; gap:16px}
+.llm-body.open{display:grid}
+.field{display:flex; justify-content:space-between; gap:12px; padding:5px 0; font-size:12px;
+  border-bottom:1px solid rgba(36,44,58,.6)}
+.field span{color:var(--muted); flex:0 0 auto}
+.field b{font-weight:500; font-variant-numeric:tabular-nums; text-align:right;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap}
+.mono{font-family:ui-monospace,Consolas,monospace; font-size:11px}
+.bar{height:5px; background:var(--panel2); border-radius:3px; overflow:hidden; margin-top:6px}
+.bar i{display:block; height:100%; background:var(--accent); transition:width .3s}
+.bar i.hot{background:var(--warn)} .bar i.full{background:var(--err)}
+.hist{max-height:150px; overflow:auto; margin-top:8px}
+.hist-row{display:grid; grid-template-columns:52px 1fr 52px 44px; gap:6px; font-size:11px;
+  padding:4px 0; border-bottom:1px solid rgba(36,44,58,.5); font-variant-numeric:tabular-nums}
+.hist-row .s-llm{color:var(--ok)} .hist-row .s-rule{color:var(--warn)}
+.problems{margin-top:8px}
+.problems div{font-size:11px; color:var(--warn); padding:3px 0; line-height:1.5}
+.notice{margin-top:8px; font-size:11px; line-height:1.5; word-break:break-all}
+svg.icon{width:13px;height:13px;vertical-align:-2px}
+::-webkit-scrollbar{width:8px;height:8px}
+::-webkit-scrollbar-thumb{background:#2a3240;border-radius:4px}
+::-webkit-scrollbar-track{background:transparent}
+@media(max-width:980px){
+  main{grid-template-columns:1fr; grid-template-rows:1fr 300px}
+  .llm-body{grid-template-columns:1fr}
+  #right{border-top:1px solid var(--line)}
+  .dets{max-height:26%}
+}
 </style>
 </head>
 <body>
+
 <header>
-  <span class="dot" id="dot"></span>
-  <h1>火情监控 · 实时告警</h1>
-  <span class="stat">今日 <b id="n-alarm">0</b> 火情 · <b id="n-warning">0</b> 烟情 · <b id="n-notice">0</b> 待确认 · <b id="n-cleared">0</b> 已降级</span>
-  <div class="filters">
-    <button data-f="all" class="on">全部</button>
-    <button data-f="alarm">仅火情</button>
-    <button data-f="pending">待处理</button>
-  </div>
+  <div class="brand"><i id="liveDot"></i>火情烟雾智能监控 <span style="font-size:11px;color:var(--dim);font-weight:400">v3</span></div>
+  <div class="chip"><span class="dot" id="streamDot"></span>画面 <b id="streamState">连接中</b></div>
+  <div class="chip">检测 <b id="detFps">0</b> fps</div>
+  <div class="chip">火 <b id="nFire" style="color:var(--fire)">0</b> · 烟 <b id="nSmoke" style="color:var(--smoke)">0</b></div>
+  <div class="spacer"></div>
+  <div class="chip" id="llmChip"><span class="dot" id="llmDot"></span>LLM <b id="llmState">检查中</b></div>
+  <button class="btn" id="btnTopUp">
+    <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
+      <rect x="2" y="5" width="20" height="14" rx="2"/><path d="M2 10h20"/></svg>
+    充值
+  </button>
 </header>
 
 <main>
-  <div class="banner" id="banner">
-    <div class="t" id="banner-t"></div>
-    <div class="s" id="banner-s"></div>
-  </div>
-  <div id="list"><div class="empty">等待事件…（YOLO 发现可疑目标后会立即出现在这里）</div></div>
+  <section id="left">
+    <div class="viewport">
+      <div class="corner c1"></div><div class="corner c2"></div>
+      <div class="corner c3"></div><div class="corner c4"></div>
+      <img id="stream" alt="实时画面">
+      <div id="nosignal">
+        <div class="ring"></div>
+        <div id="nsTitle">等待画面…</div>
+        <div style="font-size:11px" id="nsHint">正在连接 /api/frame.jpg</div>
+      </div>
+    </div>
+    <div class="dets">
+      <h3>当前检测 <span id="detCount" style="color:var(--dim)">0 个目标</span></h3>
+      <table>
+        <thead><tr><th>类别</th><th>置信度</th><th>位置 (x1,y1,x2,y2)</th><th>面积</th></tr></thead>
+        <tbody id="detBody"><tr><td colspan="4" class="empty">画面中没有检测到目标</td></tr></tbody>
+      </table>
+    </div>
+  </section>
+
+  <aside id="right">
+    <div class="right-head">
+      <span>事件流</span>
+      <span id="evCount" style="color:var(--dim)">0</span>
+    </div>
+    <div id="events"><div class="empty">暂无事件</div></div>
+  </aside>
 </main>
 
-<div id="viewer"><img id="viewer-img" alt=""></div>
+<footer>
+  <div class="llm-head" id="llmHead">
+    <span class="dot" id="llmDot2"></span>
+    <b style="font-size:13px">大模型裁判</b>
+    <span class="chip" style="height:22px"><b id="llmModel">—</b></span>
+    <span class="spacer"></span>
+    <span style="font-size:11px;color:var(--dim)" id="llmToggle">展开 ▾</span>
+  </div>
+  <div class="llm-body" id="llmBody">
+    <div>
+      <div class="field"><span>连接状态</span><b id="lConn">—</b></div>
+      <div class="field"><span>接口地址</span><b class="mono" id="lUrl">—</b></div>
+      <div class="field"><span>模型</span><b class="mono" id="lModel">—</b></div>
+      <div class="field"><span>API Key</span><b class="mono" id="lKey">—</b></div>
+      <div class="field"><span>本轮小时配额</span><b id="lQuota">—</b></div>
+      <div class="bar"><i id="lQuotaBar" style="width:0%"></i></div>
+      <div class="field" style="margin-top:10px"><span>累计调用</span><b id="lStats">—</b></div>
+      <div class="field"><span>排队中</span><b id="lPending">0</b></div>
+      <div class="problems" id="lProblems"></div>
+      <div class="notice" id="lNotice"></div>
+      <div style="display:flex;gap:8px;margin-top:12px">
+        <button class="btn pri" id="btnTest">测试连接</button>
+        <button class="btn" id="btnTopUp2">去充值</button>
+      </div>
+    </div>
+    <div>
+      <div style="font-size:12px;color:var(--muted);margin-bottom:6px">最近调用</div>
+      <div class="hist" id="lHist"><div class="empty" style="padding:12px">还没有调用记录</div></div>
+    </div>
+  </div>
+</footer>
 
 <script>
-const LV_NAME = {alarm:'火情告警', warning:'烟情告警', notice:'待人工确认', cleared:'已降级'};
-const KIND = {fire:'火焰', smoke:'烟雾'};
-// "已排除"是给真蒸汽的。但 LLM 判降级只是**一次判决**，没有任何人确认过 ——
-// 绿底"已排除"会让人安心地划过去，这恰恰是漏报最危险的样子。所以换个说法和配色。
-const lvName = rec => (rec.level==='cleared' && rec.dismissed) ? '已降级·待复核'
-                                                              : (LV_NAME[rec.level]||rec.level);
-const counts = {alarm:0, warning:0, notice:0, cleared:0};
-let filter = 'all';
-const list = document.getElementById('list');
-const seen = new Set();
+(function(){
+  "use strict";
+  const $ = id => document.getElementById(id);
+  const NAME_CN = {fire:"火", smoke:"烟"};
 
-function esc(s){return String(s??'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));}
+  // 后端没给充值地址时的兜底（天翼云控制台）
+  let RECHARGE_URL = "https://www.ctyun.cn/";
 
-function matches(rec){
-  if(filter==='all') return true;
-  if(filter==='alarm') return rec.level==='alarm';
-  if(filter==='pending') return rec.level==='alarm'||rec.level==='warning'||rec.level==='notice'
-                                 || (rec.level==='cleared' && rec.dismissed);
-  return true;
-}
+  // ── 1. 实时画面：逐帧拉取（比 MJPEG 兼容性好得多）─────────
+  //
+  // 早年用 /stream 的 MJPEG，接口有数据但浏览器/WebView/预览面板里就是黑屏。
+  // 改成串行拉 /api/frame.jpg：上一帧 onload 之后再拉下一帧，天然不会堆积请求，
+  // 帧率上限由后端发布速度决定（当前 20~25fps）。
+  const img = $("stream");
+  let frameN = 0, errStreak = 0, streamOk = false;
 
-function render(rec){
-  const id = rec.wall_ms + '_' + rec.track_id + '_' + rec.level;
-  if(seen.has(id)) return;
-  seen.add(id);
-
-  if(list.querySelector('.empty')) list.innerHTML='';
-  counts[rec.level] = (counts[rec.level]||0) + 1;
-  for(const k of Object.keys(counts)) {
-    const el = document.getElementById('n-'+k);
-    if(el) el.textContent = counts[k];
+  // 注意：这里**不能**判断 document.hidden 就停拉。
+  // 内嵌预览面板/WebView 里页面常被判定为 hidden，一加这个判断就永远不拉第一帧，
+  // 表现就是"一直是黑屏 + 等待画面"。监控页面本来就该持续拉取。
+  function pullFrame(){
+    img.src = "/api/frame.jpg?n=" + (++frameN);
   }
 
-  if(!matches(rec)) return;
+  img.addEventListener("load", () => {
+    errStreak = 0; streamOk = true;
+    $("nosignal").classList.add("hide");
+    $("streamDot").className = "dot on";
+    $("streamState").textContent = "在线";
+    setTimeout(pullFrame, 20);          // 上一帧画完再拉下一帧，不会堆积
+  });
 
-  const card = document.createElement('div');
-  card.className = 'card ' + rec.level + (rec.dismissed ? ' dismissed' : '');
-  card.dataset.track = rec.track_id;
-  // 升级后把同轨迹的旧 notice 淡掉
-  if(rec.level==='alarm'||rec.level==='warning'){
-    list.querySelectorAll('.card.notice[data-track="'+rec.track_id+'"]')
-        .forEach(el=>el.classList.add('superseded'));
+  img.addEventListener("error", () => {
+    errStreak++;
+    if (errStreak >= 3){
+      streamOk = false;
+      $("nosignal").classList.remove("hide");
+      $("streamDot").className = "dot off";
+      $("streamState").textContent = "断开";
+      $("nsTitle").textContent = "取不到画面";
+      $("nsHint").textContent = "已连续失败 " + errStreak + " 次 · 检查主程序是否在跑";
+    }
+    setTimeout(pullFrame, 300);
+  });
+
+  pullFrame();
+
+  // ── 2. 当前检测：轮询细节（框已经画在图上了）──────────────
+  let lastSeq = -1;
+  async function pollState(){
+    try{
+      const r = await fetch("/api/state", {cache:"no-store"});
+      const s = await r.json();
+      if (s && s.seq !== lastSeq){
+        lastSeq = s.seq;
+        renderDets(s);
+      }
+      if (!streamOk){
+        $("streamDot").className = "dot on";
+        $("streamState").textContent = "在线";
+        $("nosignal").classList.add("hide");
+      }
+    }catch(e){
+      $("streamDot").className = "dot off";
+      $("streamState").textContent = "无响应";
+    }
   }
-  const reasons = (rec.reasons||[]).map(r=>{
-    const cls = r.startsWith('LLM') ? ' class="llm"' : '';
-    return `<li${cls}>${esc(r)}</li>`;
-  }).join('');
-  const img = rec.snapshot
-    ? `<img class="thumb" src="${esc(rec.snapshot)}" alt="现场图" onclick="zoom(this.src)">`
-    : `<div class="noimg">无截图</div>`;
-  const llm = rec.llm_label
-    ? `<span class="meta">LLM：${esc(rec.llm_label)} / risk=${esc(rec.llm_risk)} / ${esc(rec.llm_latency)}s</span>`
-    : '';
 
-  card.innerHTML = `
-    ${img}
-    <div>
-      <div class="head">
-        <span class="lv ${rec.level}${rec.dismissed?' dismissed':''}">${lvName(rec)}</span>
-        <span class="kind">${KIND[rec.kind]||rec.kind}</span>
-        <span class="meta">${esc(rec.cam)} · 轨迹#${esc(rec.track_id)}</span>
-        <span class="meta">·</span>
-        <span class="meta">${esc(rec.wall)}</span>
-        <span class="meta">· 发现后 ${esc(rec.latency)}s 报出</span>
-        ${llm}
-      </div>
-      <ul>${reasons}</ul>
-      <div class="act">
-        <button class="fb bad"  data-ms="${esc(rec.wall_ms)}">误报</button>
-        <button class="fb good" data-ms="${esc(rec.wall_ms)}">属实</button>
-        <span class="fbst" id="fb_${esc(rec.wall_ms)}"></span>
-      </div>
-    </div>`;
-  list.prepend(card);
+  function renderDets(s){
+    const dets = s.dets || [];
+    const c = s.counts || {};
+    $("nFire").textContent = c.fire || 0;
+    $("nSmoke").textContent = c.smoke || 0;
+    $("detFps").textContent = (s.fps || 0).toFixed(1);
+    $("detCount").textContent = dets.length + " 个目标";
 
-  if(rec.level==='alarm') showBanner(rec);
-  if(rec.level==='alarm'||rec.level==='warning') beep(rec.level);
-}
+    const body = $("detBody");
+    if (!dets.length){
+      body.innerHTML = '<tr><td colspan="4" class="empty">画面中没有检测到目标</td></tr>';
+      return;
+    }
+    const W = (s.size && s.size[0]) || 1, H = (s.size && s.size[1]) || 1;
+    body.innerHTML = dets.map(d => {
+      const b = d.xyxy || [0,0,0,0];
+      const area = (((b[2]-b[0])*(b[3]-b[1])) / (W*H) * 100).toFixed(2);
+      const cls = (d.name || "").toLowerCase();
+      return '<tr>'
+        + '<td class="cls ' + cls + '">' + (NAME_CN[cls] || d.name) + '</td>'
+        + '<td>' + (d.conf*100).toFixed(1) + '%</td>'
+        + '<td class="mono" style="color:var(--muted)">'
+        + (b[0]|0) + ',' + (b[1]|0) + ',' + (b[2]|0) + ',' + (b[3]|0) + '</td>'
+        + '<td style="color:var(--muted)">' + area + '%</td>'
+        + '</tr>';
+    }).join("");
+  }
+  setInterval(pollState, 300);
 
-function showBanner(rec){
-  const b=document.getElementById('banner');
-  b.className='banner show';
-  b.style.borderLeftColor='var(--'+rec.level+')';
-  document.getElementById('banner-t').textContent =
-    `${LV_NAME[rec.level]} · ${KIND[rec.kind]||rec.kind} · ${rec.cam}`;
-  document.getElementById('banner-s').textContent =
-    (rec.reasons&&rec.reasons[0]) ? rec.reasons[0] : '';
-  clearTimeout(showBanner._t);
-  showBanner._t=setTimeout(()=>{ b.className='banner'; }, 20000);
-}
+  // ── 3. 事件流：SSE + 人工反馈 ────────────────────────────
+  const eventsEl = $("events");
+  let evN = 0;
+  const FB = {};
 
-let ac;
-function beep(level){
-  try{
-    ac = ac || new (window.AudioContext||window.webkitAudioContext)();
-    const o=ac.createOscillator(), g=ac.createGain();
-    o.connect(g); g.connect(ac.destination);
-    o.frequency.value = level==='alarm'?880:520;
-    g.gain.setValueAtTime(.001, ac.currentTime);
-    g.gain.exponentialRampToValueAtTime(.18, ac.currentTime+.02);
-    g.gain.exponentialRampToValueAtTime(.001, ac.currentTime+.45);
-    o.start(); o.stop(ac.currentTime+.46);
-  }catch(e){}
-}
+  function levelCN(l){
+    return ({alarm:"火情", warning:"烟情", notice:"待确认", cleared:"已排除"})[l] || l || "";
+  }
+  function esc(s){
+    return String(s == null ? "" : s).replace(/[&<>"]/g,
+      c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;"}[c]));
+  }
 
-function zoom(src){
-  document.getElementById('viewer-img').src=src;
-  document.getElementById('viewer').style.display='flex';
-}
-document.getElementById('viewer').onclick=()=>{
-  document.getElementById('viewer').style.display='none';
-};
+  function addEvent(e){
+    if (evN === 0) eventsEl.innerHTML = "";
+    evN++;
+    $("evCount").textContent = evN;
 
-document.querySelectorAll('.filters button').forEach(b=>{
-  b.onclick=()=>{
-    document.querySelectorAll('.filters button').forEach(x=>x.classList.remove('on'));
-    b.classList.add('on'); filter=b.dataset.f; redraw();
-  };
-});
+    const div = document.createElement("div");
+    div.className = "ev " + (e.level || "notice");
+    const t = (e.wall || "").slice(11) || "--:--:--";
+    const kind = NAME_CN[e.kind] || e.kind || "事件";
+    const reasons = (e.reasons || []).slice(0, 2).join(" · ");
 
-let cache=[];
-function redraw(){
-  list.innerHTML='';
-  seen.clear();
-  if(!cache.length){ list.innerHTML='<div class="empty">等待事件…</div>'; return; }
-  cache.forEach(render);
-}
+    let html = '<div class="ev-top">'
+      + '<span class="tag ' + (e.level || "notice") + '">' + levelCN(e.level) + '</span>'
+      + '<span style="font-size:12px;font-weight:600">' + esc(kind) + '</span>'
+      + '<span class="ev-time">' + esc(t) + '</span>'
+      + '</div>'
+      + '<div class="ev-meta">置信 <b>' + (e.score || 0).toFixed(2) + '</b>'
+      + ' · 耗时 <b>' + (e.latency || 0).toFixed(1) + 's</b>'
+      + (e.track_id != null ? ' · 轨迹 <b>#' + e.track_id + '</b>' : '')
+      + '</div>';
+    if (reasons) html += '<div class="ev-meta" style="color:var(--dim)">' + esc(reasons) + '</div>';
+    if (e.snapshot) html += '<img src="' + esc(e.snapshot) + '" loading="lazy" alt="现场截图">';
+    html += '<div class="ev-actions">'
+      + '<button class="btn" data-fb="false_alarm">误报</button>'
+      + '<button class="btn" data-fb="true_alarm">属实</button>'
+      + '</div>';
+    div.innerHTML = html;
 
-// ── 人工反馈：误报 → 硬负样本（回流训练集）；属实 → 只记账
-// 为什么值得做：闪烁闸能拦恒亮光源，拦不住**会闪的假火**（电焊弧光、
-// 夕阳在玻璃上跳、红色霓虹 PWM 调光、电视里的火焰画面）。这类只有拿
-// 真实误报帧重训才治得住。点一下 = 一张带空标注的训练样本。
-list.addEventListener('click', async (e)=>{
-  const btn = e.target.closest('.fb');
-  if(!btn) return;
-  const ms  = btn.dataset.ms;
-  const bad = btn.classList.contains('bad');
-  const box = btn.parentElement;
-  const st  = box.querySelector('.fbst');
-  box.querySelectorAll('.fb').forEach(b=>b.disabled=true);
-  st.textContent='提交中…';
-  try{
-    const r = await fetch('/api/report', {
-      method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({wall_ms:Number(ms), verdict: bad?'false_alarm':'true_alarm'}),
+    div.querySelectorAll("[data-fb]").forEach(btn => {
+      btn.addEventListener("click", async () => {
+        const verdict = btn.dataset.fb;
+        if (FB[e.wall_ms]) return;
+        btn.disabled = true;
+        try{
+          const r = await fetch("/api/report", {
+            method:"POST", headers:{"Content-Type":"application/json"},
+            body: JSON.stringify({verdict: verdict, wall_ms: e.wall_ms})
+          });
+          const j = await r.json();
+          if (j.ok){
+            FB[e.wall_ms] = verdict;
+            div.querySelectorAll("[data-fb]").forEach(b => { b.disabled = true; });
+            btn.textContent = verdict === "false_alarm" ? "已标误报" : "已确认";
+            btn.style.color = verdict === "false_alarm" ? "var(--warn)" : "var(--ok)";
+          }else{
+            btn.disabled = false;
+            alert("提交失败：" + (j.error || "未知错误"));
+          }
+        }catch(err){
+          btn.disabled = false;
+          alert("网络错误：" + err.message);
+        }
+      });
     });
-    const j = await r.json();
-    if(!j.ok){ throw new Error(j.error||'提交失败'); }
-    btn.classList.add(bad?'on-bad':'on-good');
-    st.textContent = bad
-      ? '已记为误报，回流进训练集'
-      : '已确认属实';
-  }catch(err){
-    box.querySelectorAll('.fb').forEach(b=>b.disabled=false);
-    st.textContent = '提交失败：'+err.message;
-  }
-});
 
-// ── SSE：断线自动重连，重连后补发历史，不会漏事件
-// ?nosse=1 → 只拉一次历史不保持长连接（截图/调试用，否则无头浏览器永远等不到加载完成）
-const NOSSE = new URLSearchParams(location.search).has('nosse');
-const dot=document.getElementById('dot');
-function connect(){
-  if(NOSSE){ dot.classList.add('on'); return; }
-  const es=new EventSource('/events');
-  es.onopen=()=>dot.classList.add('on');
-  es.onerror=()=>{ dot.classList.remove('on'); };
-  es.onmessage=(e)=>{
-    const rec=JSON.parse(e.data);
-    cache.push(rec);
-    if(cache.length>300) cache=cache.slice(-300);
-    render(rec);
-  };
-}
-fetch('/api/recent').then(r=>r.json()).then(h=>{
-  cache=h; redraw(); connect();
-}).catch(()=>connect());
+    eventsEl.prepend(div);
+    while (eventsEl.children.length > 120) eventsEl.lastChild.remove();
+  }
+
+  let es = null;
+  function connectSSE(){
+    if (es) es.close();
+    es = new EventSource("/events");
+    es.onmessage = ev => {
+      if (!ev.data) return;
+      try{ addEvent(JSON.parse(ev.data)); }catch(err){}
+    };
+    es.onerror = () => { es.close(); setTimeout(connectSSE, 3000); };
+  }
+  connectSSE();
+
+  // ── 4. LLM 面板 ──────────────────────────────────────────
+  const llmHead = $("llmHead"), llmBody = $("llmBody"), llmToggle = $("llmToggle");
+  llmHead.addEventListener("click", () => {
+    const open = llmBody.classList.toggle("open");
+    llmToggle.textContent = open ? "收起 ▴" : "展开 ▾";
+  });
+
+  async function pollLlm(){
+    try{
+      const r = await fetch("/api/llm", {cache:"no-store"});
+      renderLlm(await r.json());
+    }catch(e){
+      $("llmDot").className = "dot off";
+      $("llmDot2").className = "dot off";
+      $("llmState").textContent = "无响应";
+    }
+  }
+
+  function renderLlm(s){
+    if (s.recharge_url) RECHARGE_URL = s.recharge_url;
+
+    const configured = !!s.configured;
+    const dotCls = configured ? "on" : (s.enabled === false ? "off" : "warn");
+    $("llmDot").className = "dot " + dotCls;
+    $("llmDot2").className = "dot " + dotCls;
+    $("llmState").textContent = configured ? (s.dry_run ? "试运行" : "已就绪") : "未就绪";
+    $("llmModel").textContent = s.model || "未配置";
+    $("lModel").textContent = s.model || "未配置";
+    $("lUrl").textContent = s.url || "—";
+    $("lKey").textContent = s.has_key ? (s.key_hint || "已配置") : "缺失";
+    $("lKey").style.color = s.has_key ? "var(--ok)" : "var(--err)";
+
+    const q = s.quota || {};
+    $("lQuota").textContent = (q.used || 0) + " / " + (q.limit || 0);
+    const pct = q.limit ? Math.min(100, (q.used || 0) / q.limit * 100) : 0;
+    const bar = $("lQuotaBar");
+    bar.style.width = pct + "%";
+    bar.className = pct >= 95 ? "full" : (pct >= 70 ? "hot" : "");
+
+    const st = s.stats || {};
+    $("lStats").textContent = "真实 " + (st.llm || 0)
+      + " · 降级 " + (st.rule || 0)
+      + " · 跳过 " + (st.skipped || 0)
+      + " · 错误 " + ((st.error || 0) + (st.timeout || 0));
+    $("lPending").textContent = s.pending || 0;
+
+    $("lConn").textContent = configured
+      ? (s.dry_run ? "试运行（不发真实请求）" : "已配置")
+      : "未配置";
+    $("lConn").style.color = configured ? "var(--ok)" : "var(--warn)";
+
+    const probs = $("lProblems");
+    probs.innerHTML = "";
+    if (!configured && s.problems && s.problems.length){
+      s.problems.forEach(p => {
+        const d = document.createElement("div");
+        d.textContent = "• " + p;
+        probs.appendChild(d);
+      });
+    }
+
+    const hist = $("lHist");
+    if (!s.history || !s.history.length){
+      hist.innerHTML = '<div class="empty" style="padding:12px">还没有调用记录</div>';
+    }else{
+      hist.innerHTML = s.history.slice().reverse().map(h =>
+        '<div class="hist-row">'
+        + '<span style="color:var(--dim)">' + esc(h.at) + '</span>'
+        + '<span class="s-' + esc(h.source) + '">'
+        + (h.source === "llm" ? "模型" : "规则") + ' · ' + esc(h.label) + '</span>'
+        + '<span style="color:var(--muted)">' + (h.confidence || 0).toFixed(2) + '</span>'
+        + '<span style="color:var(--dim)">' + (h.latency_s || 0).toFixed(1) + 's</span>'
+        + '</div>').join("");
+    }
+  }
+  setInterval(pollLlm, 2000);
+
+  $("btnTest").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const old = btn.textContent;
+    btn.disabled = true; btn.textContent = "测试中…";
+    $("lNotice").textContent = "";
+    try{
+      const r = await fetch("/api/llm/test", {method:"POST"});
+      const j = await r.json();
+      const n = $("lNotice");
+      if (j.ok){
+        n.style.color = "var(--ok)";
+        n.textContent = "连接成功 · " + (j.latency_s != null ? j.latency_s + "s" : "")
+          + (j.msg ? " · 返回：" + j.msg : "");
+      }else{
+        n.style.color = "var(--err)";
+        n.textContent = "连接失败：" + (j.error || "未知错误");
+      }
+    }catch(err){
+      $("lNotice").style.color = "var(--err)";
+      $("lNotice").textContent = "请求失败：" + err.message;
+    }finally{
+      btn.disabled = false; btn.textContent = old;
+      pollLlm();
+    }
+  });
+
+  function topUp(){ window.open(RECHARGE_URL, "_blank", "noopener"); }
+  $("btnTopUp").addEventListener("click", topUp);
+  $("btnTopUp2").addEventListener("click", topUp);
+
+  pollLlm();
+})();
 </script>
 </body>
 </html>

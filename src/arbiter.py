@@ -210,6 +210,9 @@ class LlmArbiter:
         self._lock = threading.Lock()
         self.stats = {"submitted": 0, "llm": 0, "rule": 0, "skipped": 0,
                       "timeout": 0, "error": 0}
+        # 最近若干次裁决的流水，只给前端 LLM 面板展示用。
+        # 不落盘：它是"此刻连没连上、快不快"的实时证据，不是审计日志。
+        self._history: list[dict] = []
 
     # ------------------------------------------------------------ 额度 / 去重
     def _quota_ok(self) -> bool:
@@ -290,8 +293,120 @@ class LlmArbiter:
     def close(self) -> None:
         self._pool.shutdown(wait=False)
 
+    # ------------------------------------------------------------ 可观测性
+    def snapshot(self) -> dict:
+        """前端 LLM 面板要的全部状态：连没连上、配额还剩多少、刚才几次快不快。"""
+        cfg = self.cfg
+        model = str(cfg.get("model") or "")
+        dry = bool(cfg.get("dry_run"))
+        has_key = bool(self.api_key)
+        enabled = bool(cfg.get("enabled", True))
+
+        problems: list[str] = []
+        if not enabled:
+            problems.append("裁判已关闭（config/arbiter.yaml 的 enabled）")
+        if not model and not dry:
+            problems.append("model 未填 —— 去 config/arbiter.yaml 写上平台给出的模型名")
+        if not has_key and not dry:
+            problems.append("未读到 API Key —— 在项目根目录 .env 里写 TELEAI_APPKEY=...")
+
+        with self._lock:
+            used = len(self._calls)
+            pending = sum(1 for f in self._futures.values() if not f.done())
+            history = list(self._history[-12:])
+
+        limit = int(cfg.get("hourly_limit", 0) or 0)
+        return {
+            "configured": bool(enabled and (dry or (model and has_key))),
+            "enabled": enabled,
+            "dry_run": dry,
+            "model": model,
+            "url": str(cfg.get("url") or ""),
+            "has_key": has_key,
+            "key_hint": (self.api_key[:4] + "…" + self.api_key[-4:]
+                         if len(self.api_key) > 8 else ""),
+            "quota": {"used": used, "limit": limit, "left": max(0, limit - used)},
+            "pending": pending,
+            "stats": dict(self.stats),
+            "history": history,
+            "problems": problems,
+            # 看板「充值」按钮跳这里，改 config/arbiter.yaml 即可
+            "recharge_url": str(cfg.get("recharge_url") or ""),
+        }
+
+    def test_connection(self, timeout: float | None = None) -> dict:
+        """真打一次最小请求，确认 URL / 模型 / Key 三样都通。
+
+        和 submit 的区别：它**同步**返回结果，且只发文本不发图 —— 目的是验证
+        "能不能连上"，不是验证"判得准不准"。成功后会计入每小时配额。
+        """
+        cfg = self.cfg
+        if cfg.get("dry_run"):
+            return {"ok": True, "dry_run": True, "msg": "dry_run 模式下不发真实请求"}
+        if not cfg.get("model"):
+            return {"ok": False, "error": "model 未填（config/arbiter.yaml）"}
+        if not self.api_key:
+            return {"ok": False, "error": "未配置 API Key（.env 的 TELEAI_APPKEY）"}
+
+        body = {"model": cfg["model"],
+                "messages": [{"role": "user", "content": "ping"}],
+                "max_tokens": 8}
+        if str(cfg.get("thinking", "")).lower() == "disabled":
+            body["thinking"] = {"type": "disabled"}
+        t0 = time.time()
+        try:
+            import requests
+            r = requests.post(
+                cfg["url"], json=body,
+                timeout=float(timeout or cfg["timeout_s"]),
+                headers={"Authorization": f"Bearer {self.api_key}",
+                         "Content-Type": "application/json",
+                         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+            dt = round(time.time() - t0, 2)
+            if r.status_code >= 400:
+                return {"ok": False, "latency_s": dt, "status": r.status_code,
+                        "error": f"HTTP {r.status_code}: {r.text[:200]}"}
+            self._mark_call()
+            msg = (r.json().get("choices", [{}])[0]
+                   .get("message", {}).get("content") or "")
+            return {"ok": True, "latency_s": dt, "status": r.status_code,
+                    "msg": str(msg)[:80]}
+        except Exception as exc:                     # noqa: BLE001
+            return {"ok": False, "latency_s": round(time.time() - t0, 2),
+                    "error": f"{type(exc).__name__}: {exc}"}
+
     # ------------------------------------------------------------ 线程内
     def _run(self, key: str, payload) -> ArbiterResult:
+        """线程池入口：包一层计时与流水记录，任何异常都要能落地成结果。"""
+        t0 = time.time()
+        try:
+            res = self._run_inner(key, payload)
+        except Exception as exc:                     # noqa: BLE001
+            self.stats["error"] += 1
+            res = self._fallback("uncertain", 0.0,
+                                 f"未捕获异常 {type(exc).__name__}", time.time() - t0)
+        self._record(key, res, time.time() - t0)
+        return res
+
+    def _record(self, key: str, res: ArbiterResult, wall_latency: float) -> None:
+        row = {
+            "at": time.strftime("%H:%M:%S"),
+            "ts": round(time.time(), 3),
+            "key": key,
+            "source": res.source,                    # llm / rule / dry_run
+            "label": res.label,
+            "risk": res.risk,
+            "confidence": round(float(res.confidence), 3),
+            "latency_s": round(float(res.latency_s or wall_latency), 2),
+            "reason": (res.reason or "")[:80],
+            "ok": res.source == "llm",
+        }
+        with self._lock:
+            self._history.append(row)
+            if len(self._history) > 60:
+                self._history = self._history[-60:]
+
+    def _run_inner(self, key: str, payload) -> ArbiterResult:
         frame, roi, rule_score, rule_label, context, feat = payload
         cfg = self.cfg
 
@@ -322,6 +437,11 @@ class LlmArbiter:
             "temperature": cfg["temperature"],
             "max_tokens": cfg["max_tokens"],
         }
+        # DeepSeek 默认开思考模式（effort=high）。实测 max_tokens=512 时
+        # 全部 token 都被 reasoning 吃掉、content 返回空串，JSON 解析必然失败。
+        # 裁决只需一眼判断，关掉思考更快更省，temperature 也才生效。
+        if str(cfg.get("thinking", "")).lower() == "disabled":
+            body["thinking"] = {"type": "disabled"}
 
         t0 = time.time()
         try:

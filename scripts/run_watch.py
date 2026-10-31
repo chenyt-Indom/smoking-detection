@@ -29,6 +29,7 @@ from __future__ import annotations
 
 import argparse
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -39,14 +40,51 @@ sys.path.insert(0, str(ROOT))
 
 from src.arbiter import LlmArbiter, load_dotenv                    # noqa: E402
 from src.infer import Detector                                    # noqa: E402
+from src.liveview import LiveView                                 # noqa: E402
 from src.notify import Notifier                                   # noqa: E402
 from src.pipeline import Pipeline                                 # noqa: E402
 from src.sources.base import CameraInfo                           # noqa: E402
 from src.sources.fixed import FixedCameraSource                   # noqa: E402
+from src.sources.latest import LatestFrameSource                   # noqa: E402
 
 WEIGHTS = ROOT / "models" / "fire_smoke_v5_26s960_best.pt"
 
 LEVEL_TAG = {"alarm": "火情", "warning": "烟情", "notice": "待确认", "cleared": "已排除"}
+
+
+def acquire_single_instance_lock():
+    """同一时间只允许一个监控进程。
+
+    为什么必须加这把锁
+    ------------------
+    Windows 允许多个进程同时打开同一个摄像头，但它们会互相踩数据 ——
+    表现是画面花屏：上半截蓝白条纹、下半截纯绿色块，看起来像解码错误，
+    实际上是几路读取交错的结果。这个坑排查起来很费时间，所以直接在入口拦住。
+
+    用文件锁而不是端口检测：端口要等模型加载完才绑定，那之前进程已经在读摄像头了，
+    挡不住第二个实例。文件锁在进程一启动就拿到。
+    """
+    lock_path = ROOT / "data" / "monitor.lock"
+    try:
+        lock_path.parent.mkdir(parents=True, exist_ok=True)
+        fh = open(lock_path, "w")
+    except OSError:
+        return None           # 连锁文件都建不了，就不管了，别挡着启动
+
+    try:
+        if sys.platform == "win32":
+            import msvcrt
+            msvcrt.locking(fh.fileno(), msvcrt.LK_NBLCK, 1)
+        else:
+            import fcntl
+            fcntl.flock(fh.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        fh.close()
+        print("[x] 已经有一个监控进程在运行（data/monitor.lock 被占用）。")
+        print("    多个进程同时打开摄像头会导致画面花屏。")
+        print("    请先关掉旧窗口，再启动这个。")
+        return None
+    return fh                 # 必须保持引用，进程退出时才会释放锁
 
 
 def build_source(args):
@@ -72,7 +110,22 @@ def build_source(args):
     if args.video:
         src = FixedCameraSource.from_video(info, args.video)
     else:
-        cap = cv2.VideoCapture(args.camera)
+        # Windows 上必须显式指定 DirectShow：默认的 MSMF 后端对不少 USB 摄像头
+        # 会"能打开但只返回黑帧"，画面正中还带一个带锁的摄像头占位图标。
+        # 单独用 cv2.VideoCapture(0) 测试时同样会踩到，所以不是权限问题。
+        backend = cv2.CAP_DSHOW if sys.platform == "win32" else cv2.CAP_ANY
+        cap = cv2.VideoCapture(args.camera, backend)
+        if not cap.isOpened():
+            print(f"[x] 摄像头 {args.camera} 打不开。换一个索引试试（--camera 1），"
+                  f"或确认没有被其他程序占用", flush=True)
+            raise SystemExit(3)
+        # 分辨率要按摄像头的**实际能力**选，不是越高越好。
+        # 实测 Rapoo 外接：1280x720 只出 10fps，800x600 能出 25fps —— USB 带宽不够。
+        # 检测端 imgsz=896 时 800x600 已够用，帧率翻 2.5 倍更划算。
+        # 想要更高分辨率就改 config/launcher.json 里的 width/height（帧率会掉）。
+        cap.set(cv2.CAP_PROP_FRAME_WIDTH, 800)
+        cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 600)
+        cap.set(cv2.CAP_PROP_FPS, 30)
 
         def _frames():
             while True:
@@ -115,8 +168,14 @@ def main() -> int:
         print("要么 --demo，要么 --camera 0，要么 --video 文件")
         return 2
 
+    lock = acquire_single_instance_lock()
+    if lock is None:
+        return 4
+
     load_dotenv()
-    src, det, plan = build_source(args)
+    raw_src, det, plan = build_source(args)
+    # 采集放进独立线程：检测 9fps、画面 25fps，互不拖累
+    src = LatestFrameSource(raw_src)
 
     # ── LLM 裁判：异步，缺 Key/缺模型时自动降级，绝不阻塞告警 ──
     arb = None
@@ -128,10 +187,16 @@ def main() -> int:
         if args.llm == "auto" and not arb.api_key:
             print("⚠️  没读到 TELEAI_APPKEY（放 .env 里）→ 裁判会自动降级")
 
+    # ── 实时画面：后端画框后压成 JPEG，前端逐帧拉取 ──
+    # fps_limit 要跟上源帧率，否则画面会明显卡顿；20~25 是 CPU 编码和流畅度的平衡点
+    live = LiveView(max_width=1280, jpeg_quality=75, fps_limit=25.0)
+    live.llm = arb                       # /api/llm 读它的 snapshot()
+
     # ── 前端推送 ──
     nf = Notifier(out_dir=ROOT / "alerts", host=args.host, port=args.port,
-                  webhook_url=args.webhook)
+                  webhook_url=args.webhook, live=live)
     url = nf.start()
+    base_url = url[:-1] if url.endswith("/") else url
 
     pipe = Pipeline(det, sliced=bool(args.sliced), tile_grid=2,
                     cfg={"fast_smoke": bool(args.fast), "detect_mode": args.detect},
@@ -162,6 +227,29 @@ def main() -> int:
               f"tid={ev.track_id} t={ev.t_alarm:.1f}s 延迟={ev.latency:.1f}s "
               f"score={ev.score:.2f} | {ev.reasons[0][:44] if ev.reasons else ''}")
 
+    # 实时画面：独立线程，只取最新帧 + 最近一次检测框。
+    # 这样画面帧率跟着摄像头走，不受检测速度限制（检测慢就少刷几个框而已）。
+    stop_pub = threading.Event()
+
+    def publish_loop():
+        last, n, t0 = -1, 0, time.time()
+        while not stop_pub.is_set():
+            pkt, seq = src.read_new(last, timeout=0.5)
+            if pkt is None or seq == last:
+                continue
+            last = seq
+            n += 1
+            fps = n / max(1e-6, time.time() - t0)
+            try:
+                live.publish(pkt.image, getattr(pipe, "_last_dets", None) or [],
+                             frame_idx=pkt.idx, cam_id=getattr(pkt, "cam_id", ""),
+                             fps=fps)
+            except Exception:                # noqa: BLE001
+                pass
+
+    pub_th = threading.Thread(target=publish_loop, name="publish", daemon=True)
+    pub_th.start()
+
     try:
         out = pipe.run(src, on_event=on_event, every=args.every,
                        max_frames=args.max_frames)
@@ -174,6 +262,7 @@ def main() -> int:
     except KeyboardInterrupt:
         print("\n手动停止")
     finally:
+        stop_pub.set()
         if not args.demo:
             pass
         nf.stop()

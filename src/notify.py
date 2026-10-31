@@ -42,12 +42,16 @@ class Notifier:
                  host: str = "127.0.0.1", port: int = 5050,
                  webhook_url: str = "", max_history: int = 300,
                  dashboard: str | os.PathLike | None = None,
-                 report_dir: str | os.PathLike | None = None):
+                 report_dir: str | os.PathLike | None = None,
+                 live=None):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
         self.host, self.port = host, port
         self.webhook_url = webhook_url
         self.max_history = max_history
+        # 实时画面（src/liveview.py）。为 None 时 /stream 返回 503，
+        # 其余功能（事件流、反馈）照常工作。
+        self.live = live
         self.dashboard = Path(dashboard) if dashboard else (
             Path(__file__).resolve().parent.parent / "web" / "dashboard.html")
         # 人工标注的误报落在这里，等 scripts/merge_hard_negatives.py 回流进训练集
@@ -199,6 +203,21 @@ class Notifier:
             def log_message(self, *a):               # 静音，别把控制台刷爆
                 pass
 
+            def handle(self):
+                """吞掉客户端断开引发的连接异常。
+
+                HTTP/1.1 是长连接：一个请求处理完，服务器会继续读下一行请求头。
+                浏览器关标签页、或者 MJPEG/SSE 流被主动断开时，这一步会抛
+                ConnectionAbortedError(WinError 10053)，而标准库的 socketserver
+                不会吞它，会在日志里打一整段 traceback。功能没坏，但很吵，
+                而且看日志的人会以为服务出错。这里统一收掉。
+                """
+                try:
+                    super().handle()
+                except (ConnectionAbortedError, ConnectionResetError,
+                        BrokenPipeError, TimeoutError):
+                    pass
+
             def _send(self, code: int, ctype: str, body: bytes, extra=None):
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
@@ -225,6 +244,49 @@ class Notifier:
                     with notifier._lock:
                         body = json.dumps(notifier._history[-80:], ensure_ascii=False)
                     self._send(200, "application/json; charset=utf-8", body.encode())
+                    return
+
+                if path == "/stream":
+                    # MJPEG：每一帧都是一个独立 JPEG 分片，浏览器 <img> 直接能放
+                    if notifier.live is None:
+                        self._send(503, "text/plain; charset=utf-8",
+                                   "实时画面未启用（主程序没接 LiveView）".encode())
+                        return
+                    self.send_response(200)
+                    self.send_header("Content-Type",
+                                     "multipart/x-mixed-replace; boundary=frame")
+                    self.send_header("Cache-Control", "no-store")
+                    self.send_header("Connection", "keep-alive")
+                    self.send_header("X-Accel-Buffering", "no")
+                    self.end_headers()
+                    try:
+                        for chunk in notifier.live.mjpeg_iter():
+                            self.wfile.write(chunk)
+                            self.wfile.flush()
+                    except (BrokenPipeError, ConnectionResetError, OSError):
+                        pass
+                    return
+
+                if path == "/api/frame.jpg":
+                    jpeg = (notifier.live.frame_bytes()
+                            if notifier.live is not None else None)
+                    if jpeg is None:
+                        self._send(503, "text/plain; charset=utf-8", b"no frame yet")
+                    else:
+                        self._send(200, "image/jpeg", jpeg)
+                    return
+
+                if path == "/api/state":
+                    st = notifier.live.state() if notifier.live is not None else {}
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps(st, ensure_ascii=False).encode())
+                    return
+
+                if path == "/api/llm":
+                    st = (notifier.live.llm_state() if notifier.live is not None
+                          else {"configured": False, "reason": "实时视图未启用"})
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps(st, ensure_ascii=False).encode())
                     return
 
                 if path == "/events":
@@ -281,6 +343,22 @@ class Notifier:
 
             def do_POST(self):                       # noqa: N802
                 path = urlparse(self.path).path
+
+                if path == "/api/llm/test":
+                    llm = getattr(notifier.live, "llm", None) if notifier.live else None
+                    if llm is None:
+                        self._send(503, "application/json; charset=utf-8",
+                                   b'{"ok":false,"error":"\\u672a\\u542f\\u7528 LLM"}')
+                        return
+                    try:
+                        res = llm.test_connection()
+                    except Exception as exc:         # noqa: BLE001
+                        res = {"ok": False, "error": f"{type(exc).__name__}: {exc}"}
+                    self._send(200 if res.get("ok") else 502,
+                               "application/json; charset=utf-8",
+                               json.dumps(res, ensure_ascii=False).encode())
+                    return
+
                 if path != "/api/report":
                     self._send(404, "text/plain", b"not found")
                     return

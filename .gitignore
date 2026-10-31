@@ -37,3 +37,11 @@ backups/
 # （training_artifacts 里只有单份 best.pt，约 5MB，直接走普通 git，不上 LFS）
 !training_artifacts/**/*.pt
 !training_artifacts/**/*.json
+
+# ---- PyInstaller 打包产物：本地构建物、且依赖本机 Python 环境，不入库 ----
+build_app/
+dist_app/
+*.spec
+
+# ---- 桌面启动器生成的锁 ----
+data/monitor.lock

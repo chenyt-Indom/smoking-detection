@@ -1,33 +1,50 @@
 # LLM 裁判配置（异步，不进前台实时循环）
 #
-# ⚠️ 密钥不写在这里。密钥放项目根目录的 .env（已在 .gitignore 里）：
-#     TELEAI_APPKEY=你的key
+# 密钥不写在这里，走系统环境变量：
+#     DEEPSEEK_KEY=sk-...
+# 换平台时改 api_key_env 指向对应的环境变量名即可。
 #
-# 上线前必须做的两件事：
-# 1. model 填平台模型广场里的**确切名字**（现在是空的，空着裁判会自动降级到规则层）
-# 2. 确认这个模型支持图片输入（多模态），否则会返回 400
+# 当前用的是 DeepSeek 官方 API（OpenAI 兼容），deepseek-flash 原生支持图片输入。
+# 历史节点：早期配的是天翼云星辰 TokenHub（url 仍留在注释里备查）。
 
 enabled: true
 dry_run: false                 # true = 不发请求，只验证接线
 
-# 天翼云星辰 TokenHub（OpenAI 兼容）。海外节点换 https://ai.ctaigw.com/{region}/v1/chat/completions
-url: https://ai.ctaigw.cn/v1/chat/completions
-model: ""                      # ← 待填：例如平台给出的具体模型名
-api_key_env: TELEAI_APPKEY
+# ── 接口 ──────────────────────────────────────────────────
+url: https://api.deepseek.com/v1/chat/completions
+model: deepseek-flash          # DeepSeek-V4.1-Flash，原生多模态（支持 JPEG/PNG/WebP）
+api_key_env: DEEPSEEK_KEY      # 系统环境变量名，不写具体值
 
-# 生成参数：只要一个短 JSON，给多了是浪费（也更容易被思维链吃光输出预算）
+# 旧配置（天翼云星辰 TokenHub），换回来时改上面三行：
+#   url: https://ai.ctaigw.cn/v1/chat/completions
+#   model: <平台模型广场里的名字>
+#   api_key_env: TELEAI_APPKEY
+
+# ── 生成参数 ──────────────────────────────────────────────
+# ⚠️ deepseek-flash 默认开思考模式，且 effort=high。实测 max_tokens=512 时
+#    512 个 token 全被 reasoning 吃光、content 返回空字符串，解析必然失败。
+#    裁决任务本身很简单（看两张图判断是不是火），不需要长推理，关掉更划算：
+#    延迟从 3.3s 降到 1s 内，token 消耗降一个量级，正文也稳定。
+#    注意：thinking 开启时会忽略 temperature，关闭后 temperature 才生效。
+thinking: disabled             # disabled / enabled
 temperature: 0.1
-max_tokens: 160
-timeout_s: 8
+max_tokens: 512
+timeout_s: 20                  # 带图请求比纯文本慢，8 秒容易超时
 
 # 图片参数：ROI 放大看细节，整幅图看环境。长边压小是为了省 token，不是为了省流量
 roi_max_side: 512
 full_max_side: 768
 jpeg_quality: 82
 
-# 成本闸门
+# ── 成本闸门 ──────────────────────────────────────────────
+# DeepSeek Flash 价格（每百万 token）：缓存未命中输入 $0.15（低峰）/ $0.30（高峰），
+# 输出 $0.60 / $1.20。单次裁决约 1.5k 输入 + 100 输出，成本可以忽略。
 max_workers: 2                 # 并发上限，别调高，容易被限流
 queue_limit: 8                 # 排队超了就跳过（宁可少审也别堆积）
 hourly_limit: 300              # 每小时调用上限，超了自动降级到规则层
 dedup_seconds: 180             # 同一目标 3 分钟内只审一次
 accept_conf: 0.55              # 采信门限
+
+# ── 看板 ──────────────────────────────────────────────────
+# 「充值」按钮跳转地址，改完刷新看板即生效（前端从 /api/llm 读这个字段）
+recharge_url: https://platform.deepseek.com/top_up
