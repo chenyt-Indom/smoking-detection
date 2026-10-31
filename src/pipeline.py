@@ -148,7 +148,8 @@ DEFAULTS = {
     # ── 杂项 ────────────────────────────────────────────────
     "min_box_pct": 0.0002,     # 面积小于画面 0.02% 的框当噪点丢掉
     "snapshot_margin": 0.25,   # 截图外扩比例
-    "snapshot_max_side": 640,  # 截图长边上限（存盘别存 4K）
+    "snapshot_max_side": 640,  # ROI 截图长边上限（存盘别存 4K）
+    "snapshot_full_max_side": 900,  # 全景图长边上限，比 ROI 大一点才看得清位置
 }
 
 
@@ -165,6 +166,31 @@ def expand_box(box, grow: float):
 def center_in(box, pt) -> bool:
     x1, y1, x2, y2 = box
     return x1 <= pt[0] <= x2 and y1 <= pt[1] <= y2
+
+
+def full_view(image: np.ndarray, box, max_side: int = 800):
+    """全图缩略 + 把检测框标出来。
+
+    为什么要跟 ROI 一起存
+    --------------------
+    ROI 是放大看细节的（判断"这团东西是不是烟"），但它丢掉了空间上下文 ——
+    事后审查时只看到一团模糊的白色，根本不知道它在房间哪个角落、旁边有没有
+    其他东西。带上这张标了框的全景图，一眼就能定位，也方便判断"是不是窗外
+    飘进来的雾"这类环境因素。
+    """
+    img = image.copy()
+    h, w = img.shape[:2]
+    x1, y1, x2, y2 = (int(round(v)) for v in expand_box(box, 0.0))
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w - 1, x2), min(h - 1, y2)
+    if x2 > x1 and y2 > y1:
+        thick = max(2, int(max(h, w) / 320))
+        cv2.rectangle(img, (x1, y1), (x2, y2), (48, 48, 235), thick)
+    scale = max_side / max(h, w)
+    if scale < 1.0:
+        img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),
+                         interpolation=cv2.INTER_AREA)
+    return img
 
 
 def crop_box(image: np.ndarray, box, margin: float, max_side: int):
@@ -203,7 +229,8 @@ class Event:
     score: float
     box: tuple[float, float, float, float]
     reasons: list[str] = field(default_factory=list)
-    snapshot: np.ndarray | None = None
+    snapshot: np.ndarray | None = None          # ROI 裁剪（放大看细节）
+    snapshot_full: np.ndarray | None = None     # 全图缩略（看空间位置）
     meta: dict = field(default_factory=dict)
 
     @property
@@ -454,10 +481,12 @@ class Pipeline:
             self._recent_alarms.append((pkt.ts, kind, tuple(float(v) for v in box), tid))
         snap = crop_box(pkt.image, box, self.cfg["snapshot_margin"],
                         self.cfg["snapshot_max_side"])
+        # 同时留一张标了框的全景图：ROI 只能看"是什么"，全景才能看"在哪"
+        full = full_view(pkt.image, box, self.cfg["snapshot_full_max_side"])
         ev = Event(kind=kind, level=level, cam_id=pkt.cam_id, track_id=tid,
                    frame_idx=pkt.idx, t_first=t.first_t, t_alarm=pkt.ts,
                    score=float(score), box=tuple(float(v) for v in box),
-                   reasons=list(reasons), snapshot=snap,
+                   reasons=list(reasons), snapshot=snap, snapshot_full=full,
                    meta={"hits": t.hits, "n_samples": len(t.samples)})
         if level in ("warning", "alarm"):        # notice / cleared 不算告警，别污染统计
             self.stats[f"{kind}_alarms"] += 1

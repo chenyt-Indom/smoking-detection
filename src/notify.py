@@ -49,6 +49,12 @@ class Notifier:
         self.host, self.port = host, port
         self.webhook_url = webhook_url
         self.max_history = max_history
+        self.dashboard = Path(dashboard) if dashboard else (
+            Path(__file__).resolve().parent.parent / "web" / "dashboard.html")
+        # 人工标注的误报落在这里，等 scripts/merge_hard_negatives.py 回流进训练集
+        self.report_dir = Path(report_dir) if report_dir else (
+            self.out_dir.parent / "hard_negatives")
+
         # 实时画面：支持多路。key 是 cam_id，前端用 ?cam=xxx 指定。
         # 传单个 live 时自动归到 "default"，保持旧调用方式可用。
         if lives is not None:
@@ -82,23 +88,6 @@ class Notifier:
     def live(self):
         """兼容旧代码：返回第一路。"""
         return next(iter(self.lives.values())) if self.lives else None
-        self.dashboard = Path(dashboard) if dashboard else (
-            Path(__file__).resolve().parent.parent / "web" / "dashboard.html")
-        # 人工标注的误报落在这里，等 scripts/merge_hard_negatives.py 回流进训练集
-        self.report_dir = Path(report_dir) if report_dir else (
-            self.out_dir.parent / "hard_negatives")
-
-        self._clients: list[queue.Queue] = []
-        self._history: list[dict] = []
-        self._lock = threading.Lock()
-        self._httpd: ThreadingHTTPServer | None = None
-        self._thread: threading.Thread | None = None
-        # 事件落盘队列：把磁盘 IO 从检测主循环里彻底摘出去
-        self._wq: queue.Queue = queue.Queue(maxsize=2000)
-        self._wthread = threading.Thread(target=self._writer_loop, name="event-writer",
-                                         daemon=True)
-        self._wthread.start()
-        self.stats = {"pushed": 0, "clients": 0, "errors": 0}
 
     def _writer_loop(self) -> None:
         """后台串行写 jsonl。串行是为了保持事件顺序。"""
@@ -124,18 +113,23 @@ class Notifier:
         rec["wall_ms"] = int(time.time() * 1000)
         rec["level"] = rec.get("level") if rec.get("level") in LEVELS else "notice"
 
-        snap_url = None
-        if getattr(ev, "snapshot", None) is not None:
-            ts = time.strftime("%Y%m%d_%H%M%S", time.localtime())
-            name = f"{rec['wall_ms']}_{ev.cam_id}_{ev.kind}_{ev.level}.jpg"
-            p = self.out_dir / name
-            # 同步写，不再放后台线程。
-            # 实测 imencode + write_bytes 一个 250KB 的截图只要 5.5ms（最慢 6ms），
-            # 完全够快；异步反而出过问题 —— 前端拿到事件后立刻请求图片时文件还没写完，
-            # 表现为"截图点不开"、"点误报提示没有截图"。
-            self._write_snapshot(p, ev.snapshot)
-            snap_url = f"/snapshots/{name}" if p.is_file() else None
+        # 两张图一起存：ROI 看细节，全景看位置。
+        # 同步写：实测每张 5.5ms，异步反而让前端拿到事件时文件还没落地。
+        snap_url = full_url = None
+        has_roi = getattr(ev, "snapshot", None) is not None
+        has_full = getattr(ev, "snapshot_full", None) is not None
+        if has_roi or has_full:
+            base = f"{rec['wall_ms']}_{ev.cam_id}_{ev.kind}_{ev.level}"
+            if has_roi:
+                p_roi = self.out_dir / f"{base}.jpg"
+                self._write_snapshot(p_roi, ev.snapshot)
+                snap_url = f"/snapshots/{base}.jpg" if p_roi.is_file() else None
+            if has_full:
+                p_full = self.out_dir / f"{base}_full.jpg"
+                self._write_snapshot(p_full, ev.snapshot_full)
+                full_url = f"/snapshots/{base}_full.jpg" if p_full.is_file() else None
         rec["snapshot"] = snap_url
+        rec["snapshot_full"] = full_url
         if extra:
             rec.update(extra)
 

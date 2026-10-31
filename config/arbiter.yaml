@@ -32,7 +32,7 @@ max_tokens: 512
 timeout_s: 20                  # 带图请求比纯文本慢，8 秒容易超时
 
 # 图片参数：ROI 放大看细节，整幅图看环境。长边压小是为了省 token，不是为了省流量
-roi_max_side: 512
+roi_max_side: 640          # ROI 放大到 640 长边：512 时白烟细节糊成一片，模型容易只凭颜色猜
 full_max_side: 768
 jpeg_quality: 82
 
