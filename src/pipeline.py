@@ -133,6 +133,7 @@ DEFAULTS = {
     "light_memory_iou": 0.45,        # 归一化 IoU 超过这个就当同一处
     "light_memory_area_tol": 0.6,    # 面积变化 >60% 认为"已不是原来那东西"，记忆作废
     "light_memory_ttl": 604800.0,    # 7 天不出现就忘掉（场景可能已经改了）
+    "light_memory_notice_sec": 3600.0,   # 命中记忆时给前端留痕的最小间隔（默认一小时一条）
 
     # 同区域送审静音：键是**区域**不是轨迹 ID。哪怕记忆还没建立
     # （第一次见到这盏灯），也只在同一块地方问一次。
@@ -306,7 +307,6 @@ class Pipeline:
         self._cleared: set[int] = set()      # notice 已被撤销的轨迹（防止反复发/撤）
         self._steam_noticed: set[int] = set()  # 已推过"降级为蒸汽"提示的轨迹
         self._static_noticed: set[int] = set() # 已推过"疑似灯光"提示的轨迹
-        self._mem_noticed: set[int] = set()    # 已推过"该位置已知非火"提示的轨迹
         self._recheck_done: set[int] = set()   # 已对被判降级却久不消散的目标叫过人
         self._fired: set[int] = set()        # 已报过的轨迹（同一条火只报一次）
         self._recent_alarms: list[tuple[float, str, tuple, int]] = []   # (t, kind, box, tid)
@@ -458,7 +458,6 @@ class Pipeline:
         self._cleared &= live
         self._steam_noticed &= live
         self._static_noticed &= live
-        self._mem_noticed &= live
         self._saved_tids &= live
         self._recheck_done &= live
         for k in [k for k in self._arbiter_done if k.rsplit(":", 1)[-1].isdigit()
@@ -539,9 +538,10 @@ class Pipeline:
         # 只统计"这条轨迹一次都没问过 LLM、全靠记忆挡下来的"
         if f"{pkt.cam_id}:{t.tid}" not in self._arbiter_done:
             self._count_saved(t.tid)
-        if t.tid in self._mem_noticed:
-            return "silent"                   # 已提示过，本帧不出事件
-        self._mem_noticed.add(t.tid)
+        # 留痕按**时间窗口**给，不按轨迹：一顿路灯一夜被切成几十段，
+        # 每段推一条 notice 就是把屏幕刷满，那和误报没区别。
+        if not self.lights.should_notice(spot, float(self.cfg["light_memory_notice_sec"])):
+            return "silent"
         return (f"该位置此前已确认是{spot.label}（累计 {spot.hits} 次），"
                 f"外形未变，本次不再送 LLM 复核")
 

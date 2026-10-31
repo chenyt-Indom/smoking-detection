@@ -108,18 +108,21 @@ class Arrb:
         pass
 
 
-def run(plan, mem_path: str, cfg_extra: dict | None = None) -> tuple[Arrb, dict]:
+def run(plan, mem_path: str, cfg_extra: dict | None = None):
     arb = Arrb()
+    evs: list = []
     cfg = {"flicker_gate": True, "light_memory": True,
            "light_memory_path": mem_path,
            "cooldown_sec": 0.01, "dedup_grow": 0.5,
-           "llm_region_mute_sec": 5.0, "detect_mode": "full"}
+           "llm_region_mute_sec": 5.0, "detect_mode": "full",
+           "light_memory_notice_sec": 3600.0}
     cfg.update(cfg_extra or {})
     pipe = Pipeline(Stub(plan), cfg=cfg, arbiter=arb)
     src = FixedCameraSource(CameraInfo(cam_id="cam_lamp", kind="fixed", fps=FPS),
                             frames=frames_lamp(plan), warmup=WARM)
-    pipe.run(src, max_frames=420)
-    return arb, pipe.stats
+    pipe.run(src, max_frames=420, quiet=True,
+             on_event=lambda ev, _r: evs.append(ev))
+    return arb, pipe.stats, evs
 
 
 def main() -> int:
@@ -128,7 +131,7 @@ def main() -> int:
 
     # 灯亮 → 灭 → 再亮（第二条轨迹）。中间断 2 秒 > MAX_MISS_SEC，轨迹一定换了新的。
     plan = [(WARM, 160, 40), (210, 420, 40)]
-    arb, st = run(plan, str(tmp))
+    arb, st, evs = run(plan, str(tmp))
     print(f"[第一次出现] LLM 提交 {arb.submitted} 次  轨迹键 {arb.keys}")
     print(f"  记忆命中 {st['memory_hits']} 帧  llm_saved {st['llm_saved']}  "
           f"memory_reopened {st['memory_reopened']}")
@@ -146,8 +149,14 @@ def main() -> int:
     print(f"  {'✅' if c else '❌'} 记忆已落盘：{tmp}")
     ok &= c
 
+    # 不该刷屏：第二次出现（t>8s）一条 notice 都不该有 —— 留痕按小时给，不按轨迹
+    late = [e for e in evs if e.t_alarm > 8.0 and e.level == "notice"]
+    g = len(late) == 0
+    print(f"  {'✅' if g else '❌'} 第二次出现不再刷 notice（多余 {len(late)} 条）")
+    ok &= g
+
     # 重启：新 Pipeline + 同一个记忆文件
-    arb2, st2 = run([(WARM, 420, 40)], str(tmp))
+    arb2, st2, _ = run([(WARM, 420, 40)], str(tmp))
     d = arb2.submitted == 0
     print(f"[重启后]  LLM 提交 {arb2.submitted} 次 {'✅' if d else '❌'}"
           f"（应为 0：记忆跨进程有效）")
@@ -155,14 +164,14 @@ def main() -> int:
 
     # 安全阀 A：灯稍微变大（面积 ×1.69）—— 区域还匹配得上，但 `still_same`
     # 必须判"不是原来那东西"，把记忆作废并重新送审。
-    arb3, st3 = run([(WARM, 420, 52)], str(tmp))
+    arb3, st3, _ = run([(WARM, 420, 52)], str(tmp))
     e = st3["memory_reopened"] >= 1 and arb3.submitted >= 1
     print(f"[外形略变] LLM 提交 {arb3.submitted} 次  reopened={st3['memory_reopened']} "
           f"{'✅' if e else '❌'}（应≥1：面积涨 1.69 倍要重新判）")
     ok &= e
 
     # 安全阀 B：灯变成一大团火（面积 ×9）—— 连区域都匹配不上了，更该重新问
-    arb4, st4 = run([(WARM, 420, 120)], str(tmp))
+    arb4, st4, _ = run([(WARM, 420, 120)], str(tmp))
     f = arb4.submitted >= 1
     print(f"[外形突变] LLM 提交 {arb4.submitted} 次 {'✅' if f else '❌'}（应≥1）")
     ok &= f

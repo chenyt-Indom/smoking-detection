@@ -41,6 +41,7 @@ class LightSpot:
     first: float = 0.0          # 首次确认（wall clock）
     last: float = 0.0           # 最近一次确认/命中
     area: float = 0.0           # 归一化面积，用来判断"还是不是原来那个东西"
+    notice_at: float = 0.0      # 上次给前端留痕的时刻（控制"别一直上报"）
 
     @property
     def center(self) -> tuple[float, float]:
@@ -90,7 +91,8 @@ class LightMemory:
                                      hits=int(r.get("hits", 1)),
                                      first=float(r.get("first", now)),
                                      last=float(r.get("last", now)),
-                                     area=float(r.get("area", 0.0)))
+                                     area=float(r.get("area", 0.0)),
+                                     notice_at=float(r.get("notice_at", 0.0)))
                            for r in raw.get("spots", [])
                            if now - float(r.get("last", now)) <= self.ttl]
         return len(self._spots)
@@ -172,6 +174,21 @@ class LightMemory:
             spot.hits += 1
             self._dirty = True
             self.stats["hit"] += 1
+
+    def should_notice(self, spot: LightSpot, gap_sec: float) -> bool:
+        """这次命中要不要给前端留一条痕？
+
+        为什么要限：一盏路灯一夜可能被切成几十条轨迹，每条都推一条 notice，
+        值班员的屏幕就被同一盏灯刷满了 —— 那和误报没区别，只是换了个名义。
+        所以按**时间窗口**给心跳（默认一小时一条），而不是每条轨迹一条：
+        既留了痕迹，又不刷屏。
+        """
+        now = time.time()
+        if gap_sec > 0 and now - spot.notice_at < gap_sec:
+            return False
+        spot.notice_at = now
+        self._dirty = True
+        return True
 
     def forget(self, cam: str, box_n) -> int:
         """作废这一块地方的记忆（外形变了 / 人工否定）。"""
