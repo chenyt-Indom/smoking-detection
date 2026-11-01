@@ -131,6 +131,8 @@ DEFAULTS = {
     "llm_override_conf": 0.85,
     # 置信度高于此值时，即使该区域刚被判过"非火"也重新送审（防区域静音误伤真火）
     "llm_mute_bypass_conf": 0.80,
+    # 固定光源预筛（纯本地、免费）。设为 False 则所有目标都送审，更准但更贵。
+    "static_prefilter": True,
     # 被判为非风险的目标，判完之后又活了这么久 → 把人叫回来复核。
     # 真蒸汽几秒最多十几秒就散，撑过 30 秒本身就说明裁判可能看错了。
     # 这也是漏报的兜底：不给这条，一次误判就是一个完全静默的窗口。
@@ -632,6 +634,27 @@ class Pipeline:
                 f"外形未变，本次不再送 LLM 复核")
 
     # ------------------------------------------------------------ LLM 裁判
+    @staticmethod
+    def _looks_static_light(feat) -> bool:
+        """时序上看起来像固定光源（灯/反光/手电筒），纯本地判断，不花钱。
+
+        判据来自实测：手电筒和灯具的特征是面积不涨、亮度不抖、边缘稳定，
+        而燃烧会扩散、会跳。同时要求已经稳定存在足够久 —— 真火苗刚起那一两秒
+        也可能很稳，不能凭这个就认定没事。
+
+        ⚠️ 命中后**只降级为"待确认"，绝不排除**。漏检的代价远大于多问几次，
+        所以这道闸只用来省"问模型"的钱，不用来省"看见"的灵敏度。
+        """
+        if feat is None:
+            return False
+        try:
+            return (abs(float(feat.area_growth)) < 0.05
+                    and abs(float(feat.gray_trend)) < 1.0
+                    and abs(float(feat.edge_trend)) < 0.02
+                    and float(feat.duration) > 8.0)
+        except (TypeError, ValueError):
+            return False
+
     def _defer(self, kind, tid, t, pkt, score, box, reasons) -> bool:
         """把定级交给 LLM 裁判。返回 True = 已送审/正在等，本帧不要发事件。
 
@@ -661,7 +684,15 @@ class Pipeline:
             self._count_saved(tid)
             return True
 
-        # 置信度闸门（省钱的核心）：只在规则拿不准的区间才花钱
+        # ① 固定光源预筛：纯本地、零成本。命中就交回规则层（最多到"待确认"），
+        #    既不花钱，也不会把目标从屏幕上抹掉。
+        if (self.cfg.get("static_prefilter", True)
+                and score < float(self.cfg.get("llm_sure_conf", 0.92))
+                and self._looks_static_light(extract_features(t.samples))):
+            self.stats["static_prefiltered"] = self.stats.get("static_prefiltered", 0) + 1
+            return False
+
+        # ② 置信度闸门（省钱的核心）：只在规则拿不准的区间才花钱
         sure = float(self.cfg.get("llm_sure_conf", 0.85))
         low = float(self.cfg.get("llm_min_conf", 0.50))
         if score >= sure or score < low:
