@@ -308,6 +308,37 @@ def test_snapshot_and_merge() -> None:
         check(FAIL, "重叠框合并送审", "缺失，同一块地方会被送两次")
 
 
+
+def test_cigarette_reaches_llm() -> None:
+    """香烟必须真的能走到 LLM 送审 —— 这是用户反复反馈的问题。
+
+    原来香烟走的是烟雾的时序判别路径，而 `judge()` 是为"会膨胀、
+    会上飘的烟云"设计的。一支烟细长、不膨胀，永远判不出 smoke，
+    于是在 `if v.label != "smoke"` 处被清零，从头到尾一次都没送过 LLM。
+
+    检查香烟有自己的送审分支，且在时序判别**之前**。
+    """
+    src = (ROOT / "src" / "pipeline.py").read_text(encoding="utf-8")
+    i_cig = src.find('if kind == "cigarette":')
+    i_judge = src.find("v = judge(feat, thr=self.temporal_thr")
+    if i_cig < 0:
+        check(FAIL, "香烟送审路径", "没有独立分支，会走烟雾判据被拦掉")
+        return
+    if i_judge > 0 and i_cig < i_judge:
+        check(OK, "香烟送审路径", "独立分支在时序判别之前，过门槛即送 LLM")
+    else:
+        check(WARN, "香烟送审路径", "分支位置可疑，确认是否在 judge() 之前")
+
+    # 香烟分支里必须有 _defer 调用。窗口取到下一个同级分支为止，
+    # 不能写死 1600 字符 —— 注释一多就截不到（自检自己踩过这个坑）。
+    nxt = src.find('if conf < cfg["smoke_conf"]', i_cig)
+    seg = src[i_cig: nxt if nxt > 0 else i_cig + 4000]
+    if "_defer" in seg:
+        check(OK, "香烟直接送审", "分支内调用 _defer，不经过烟雾判据")
+    else:
+        check(FAIL, "香烟直接送审", "分支内没有 _defer 调用")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -322,6 +353,7 @@ def main() -> int:
     test_pipeline_attrs()
     test_filter_but_traceable()
     test_snapshot_and_merge()
+    test_cigarette_reaches_llm()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")

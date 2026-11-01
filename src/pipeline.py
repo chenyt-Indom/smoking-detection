@@ -1138,6 +1138,38 @@ class Pipeline:
                                     else list(fv.reasons[:1]))))
                 continue
 
+            # ── 香烟：独立路径，直接送 LLM ──────────────────────
+            #
+            # 香烟**不能套用烟雾的时序判据**。那套判据是为"会膨胀、会上飘、
+            # 边缘逐渐模糊"的烟云设计的：看面积增速、上飘趋势、边缘衰减。
+            # 而一支香烟只有二十几像素、细长、不膨胀、不上飘 —— 套进去
+            # 永远判不出 "smoke"，于是每个香烟目标都在后面那道
+            # `if v.label != "smoke"` 处被清零，**从头到尾一次都没送过 LLM**。
+            #
+            # 这就是用户观察到的"香烟一直不触发 LLM"。
+            # 正确做法：香烟过门槛就直接交给 LLM —— 它判断"这是香烟还是
+            # 别的细长物"靠的是截图里的视觉形态，不需要时序统计量。
+            if kind == "cigarette":
+                if conf < cfg.get("cigarette_conf", 0.03):
+                    self._smoke_streak[t.tid] = 0
+                    continue
+                self._smoke_streak[t.tid] = self._smoke_streak.get(t.tid, 0) + 1
+                # 连续 2 帧坐实就送审（和烟一致），避免单帧噪声
+                if self._smoke_streak[t.tid] < 2:
+                    continue
+                if self._defer(kind, t.tid, t, pkt, conf, t.last_box,
+                               [f"连续 {self._smoke_streak[t.tid]} 帧检出香烟"
+                                f"（conf {conf:.2f}），请判断是香烟还是别的细长物体"]):
+                    continue
+                # 裁判不可用 -> 降级为待确认，但**绝不静默丢弃**
+                if self._can_notice(pkt.ts, t.last_box):
+                    self.stats["notices"] += 1
+                    events.append(self._make_event(
+                        kind, "notice", t.tid, t, pkt, conf, t.last_box,
+                        [f"连续 {self._smoke_streak[t.tid]} 帧检出香烟"
+                         f"（conf {conf:.2f}），裁判不可用，请人工确认"]))
+                continue
+
             # ── 烟：慢路径，必须先过时序判别 ────────────────────
             if conf < cfg["smoke_conf"]:
                 self._smoke_streak[t.tid] = 0
