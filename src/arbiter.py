@@ -77,7 +77,12 @@ SYSTEM = (
     "不要因为面积小、四周没有烟就判成 light；"
     "灯是没有轮廓的弥散光斑，火苗有明确的舌状轮廓和亮黄-橙色核心\n"
     "- 灰/黑色翻滚上升、贴天花板横向扩散、地面黑色堆积 → smoke，风险高\n"
-    "- 脱离常见场景、看不出来 → uncertain，confidence 给低\n\n"
+    "- 人手/手指/衣物/家具/宠物/屏幕画面等**明确不是火的东西** → other，风险低\n"
+    "- 图片太糊、太小、被遮挡，确实无法判断 → uncertain，confidence 给低\n"
+    "- ⚠️ other 和 uncertain 必须分清：\n"
+    "  · 你看清了、并且确定它不是火/烟/蒸汽/灯光 → other（例如看清楚是手指）\n"
+    "  · 你看不清、或者看到了但没有把握 → uncertain\n"
+    "  不要把'看清楚了但没危险'答成 uncertain，那会让系统一直请你复核。\n\n"
     "只输出一个 JSON，不要任何解释文字，不要 markdown 代码块：\n"
     '{"label":"fire|smoke|steam|light|other|uncertain",'
     '"risk":"high|medium|low","confidence":0.0-1.0,'
