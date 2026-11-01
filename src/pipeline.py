@@ -966,7 +966,14 @@ class Pipeline:
         else:
             kind_out = info.kind
 
-        if res.label in ("fire", "smoke", "cigarette"):
+        if res.label == "cigarette":
+            # 香烟一旦被确认为香烟，就是**明确违规**（禁烟区抽烟），
+            # 不该因为 LLM 给的是 risk=medium 就只标黄。
+            # 用户的原话："为什么还是黄色，为什么不能确定为红色。"
+            # 黄=warning 是"疑似、需要关注"，红=alarm 是"确定有问题"。
+            # 判出 cigarette 本身就意味着"确定了"，所以直接 alarm。
+            level = "alarm"
+        elif res.label in ("fire", "smoke"):
             level = "alarm" if res.risk == "high" else "warning"
         else:                                  # uncertain → 不硬判，推给人看
             level = "notice"
