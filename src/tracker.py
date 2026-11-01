@@ -46,6 +46,74 @@ FLICKER_PIXEL_DELTA = 8
 
 
 @dataclass
+
+class _Kalman:
+    """8 维 Kalman 滤波器：状态 = [cx, cy, w, h, vx, vy, vw, vh]。
+
+    为什么必须要它
+    --------------
+    没有预测，匹配就只能拿"上一帧的框"去和"这一帧的检测"算 IOU。
+    目标一移动，两个框就错开、IOU 归零 -> 匹配失败 -> 另起新轨迹 ->
+    屏幕上出现两个框（旧的留在原地）。这就是"框分裂"的机械原因。
+
+    Kalman 每帧先预测"目标现在大概在哪、多大"，再拿**预测框**去匹配，
+    移动中的目标也能对上号。同时它对宽高也做平滑，所以框的大小会
+    自适应地跟着目标变化，而不是逐帧跳变。
+
+    为什么过程噪声给得比常规大
+    --------------------------
+    火和烟会膨胀、会抖动，不符合"匀速直线"假设。过程噪声大意味着
+    更信任新观测、允许模型快速修正 —— 对无定形目标是合适的取舍。
+    """
+
+    __slots__ = ("x", "P")
+
+    def __init__(self, box):
+        x1, y1, x2, y2 = (float(v) for v in box)
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
+        cx, cy = x1 + w / 2.0, y1 + h / 2.0
+        self.x = np.array([cx, cy, w, h, 0.0, 0.0, 0.0, 0.0], dtype=np.float64)
+        # 初始协方差：位置/尺寸不确定度按框大小的比例给
+        self.P = np.diag([w * 0.1, h * 0.1, w * 0.1, h * 0.1,
+                          w * 0.5, h * 0.5, w * 0.3, h * 0.3]) ** 2
+
+    def predict(self, dt: float = 1.0):
+        F = np.eye(8)
+        F[0, 4] = F[1, 5] = F[2, 6] = F[3, 7] = dt
+        self.x = F @ self.x
+        # 过程噪声：位置小、尺寸大（允许膨胀/收缩）
+        q = np.diag([2.0, 2.0, 6.0, 6.0, 8.0, 8.0, 4.0, 4.0]) ** 2
+        self.P = F @ self.P @ F.T + q
+        return self.box()
+
+    def correct(self, box):
+        x1, y1, x2, y2 = (float(v) for v in box)
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
+        z = np.array([x1 + w / 2.0, y1 + h / 2.0, w, h], dtype=np.float64)
+        H = np.zeros((4, 8))
+        H[0, 0] = H[1, 1] = H[2, 2] = H[3, 3] = 1.0
+        # 观测噪声：检测框本身有几个像素的抖动，尺寸的抖动更大
+        R = np.diag([3.0, 3.0, 5.0, 5.0]) ** 2
+        S = H @ self.P @ H.T + R
+        try:
+            K = self.P @ H.T @ np.linalg.inv(S)
+        except np.linalg.LinAlgError:
+            return self.box()
+        self.x = self.x + K @ (z - H @ self.x)
+        self.P = (np.eye(8) - K @ H) @ self.P
+        # 宽高不能为负
+        self.x[2] = max(4.0, self.x[2])
+        self.x[3] = max(4.0, self.x[3])
+        return self.box()
+
+    def box(self):
+        cx, cy, w, h = self.x[0], self.x[1], self.x[2], self.x[3]
+        return (cx - w / 2.0, cy - h / 2.0, cx + w / 2.0, cy + h / 2.0)
+
+
+@dataclass
 class Track:
     """一条轨迹。`samples` 就是 temporal 层要的输入。"""
 
@@ -69,6 +137,8 @@ class Track:
     # 逐像素差分会因为尺寸不一致而永远跳过（实测 flicker 恒为 0）。而且框在动，
     # 逐像素差分测到的就是"框在动"而不是"火在抖"。目标第一次出现时把窗口钉死，
     # 之后只在明显跑偏（中心偏移超过窗口尺寸）时才重钉 —— 测的始终是同一块空间。
+    # Kalman 状态：用于"预测下一帧在哪"，匹配时用它而不是上一帧的框
+    kf: "_Kalman | None" = None
     roi: "tuple[int, int, int, int] | None" = None
     prev_gray: "np.ndarray | None" = None
     prev_gray_global: float = 0.0
@@ -173,15 +243,29 @@ class IoUTracker:
         unmatched = {tid: t for tid, t in self.tracks.items()}
         used: set[int] = set()
 
-        # 贪心：所有 (track, det) 对按 IoU 降序，逐个配对
+        # ── 第一步：预测每条轨迹这一帧"应该在哪个位置、多大" ──────
+        # 这是和外头专业追踪器对齐的关键一步。之前直接拿上一帧的框去
+        # 算 IOU，目标一移动两个框就错开、IOU 归零 -> 匹配失败 -> 新轨迹。
+        # 现在先用 Kalman 预测，再拿**预测框**匹配，移动中的目标也能接上。
+        pred_box: dict[int, tuple] = {}
+        for tid, t in self.tracks.items():
+            if t.kf is None:
+                if t.last_box is not None:
+                    t.kf = _Kalman(t.last_box)
+                else:
+                    continue
+            pred_box[tid] = t.kf.predict()
+
+        # ── 第二步：贪心匹配，但用的是预测框 ────────────────────
         pairs = []
         for tid, t in self.tracks.items():
-            if t.last_box is None:
+            pb = pred_box.get(tid)
+            if pb is None:
                 continue
             for di, d in enumerate(dets):
                 if d.cls_id != t.cls_id:
                     continue
-                v = iou(t.last_box, d.xyxy)
+                v = iou(pb, d.xyxy)
                 if v >= self.match_iou:
                     pairs.append((v, tid, di))
         pairs.sort(key=lambda x: -x[0])
@@ -199,7 +283,12 @@ class IoUTracker:
                 t.roi, crop = roi, None
             t.prev_gray = crop
             t.prev_gray_global = g_global
-            t.last_box = d.xyxy
+            # 用检测框校正 Kalman，再把**平滑后的框**存为 last_box。
+            # 这样画出来的是滤波结果，不是逐帧抖动的原始检测值。
+            if t.kf is not None:
+                t.last_box = t.kf.correct(d.xyxy)
+            else:
+                t.last_box = d.xyxy
             t.last_t = ts
             t.hits += 1
             t.misses = 0
@@ -227,6 +316,7 @@ class IoUTracker:
             t = Track(tid=tid, cls_id=d.cls_id, cls_name=d.cls_name,
                       last_box=d.xyxy, last_t=ts, first_t=ts, hits=1,
                       fg_ratio_ema=fg_overlap(d.xyxy, fg_mask))
+            t.kf = _Kalman(d.xyxy)
             t.fg_ratio_first = t.fg_ratio_ema
             smp, crop, roi = self._sample(image, d, ts, gray_full, g_global,
                                           frac_global, None, None)
