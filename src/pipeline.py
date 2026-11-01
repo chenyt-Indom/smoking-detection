@@ -1051,6 +1051,11 @@ class Pipeline:
         h, w = pkt.image.shape[:2]
         min_area = cfg["min_box_pct"] * h * w
         dets = [d for d in dets if d.area >= min_area]
+        self._dbg0 = getattr(self, "_dbg0", 0) + 1
+        if self._dbg0 % 300 == 0:
+            from collections import Counter as _C0
+            print(f"[det] {pkt.cam_id} raw={len(dets)} {dict(_C0(d.cls_name for d in dets))}",
+                  flush=True)
 
         # ③ track —— 串成轨迹（云台转动时内部自己冻结）
         tracks = self.tracker.update(dets, pkt.image, pkt.ts,
@@ -1365,7 +1370,16 @@ class Pipeline:
         # 只画本帧有检测支撑的轨迹，屏幕上任何时刻一条轨迹最多一个框，
         # 物理上不可能分裂。代价是目标短暂丢失时框会立刻消失 ——
         # 对监控来说这比"两个框"更可接受（消失说明真的没看见）。
-        draw_dets: list[Detection] = []
+        # 画框直接以**原始检测**为准，再补上轨迹（两者取并集）。
+        #
+        # 之前只画 tracks，于是出现这种情况：诊断日志 tracks 里明明有
+        # 8 条 cigarette，draw 里一个都没有 —— 因为 misses 宽限一过，
+        # 轨迹就不画了，可它其实还在。用户的原话是
+        # "不是模型识别不出香烟的形态，而是 yolo 没有仔细捕捉画面上的
+        #  香烟到灰框进行阈值分析"，说的就是这个：检出了却没画出来。
+        #
+        # 现在改成：这一帧检出什么就画什么（dets），轨迹只用来补漏。
+        draw_dets: list[Detection] = list(dets)
         for _t in tracks:
             # 允许刚好 1 帧没匹配上仍然画出来。
             #
@@ -1373,7 +1387,15 @@ class Pipeline:
             # 没接上，框就瞬间没了、下一帧又回来，肉眼看到的是闪烁。
             # 放 1 帧宽限能吃掉这种单帧抖动，而 2 帧以上的断档仍然会隐藏 ——
             # 那边通常意味着目标真的走了或真的没检出，继续画旧位置反而是错的。
-            if _t.misses > 1:
+            # 宽限帧数必须 ≥ 检测降频周期，否则"画一下又消失"。
+            #
+            # 香烟模型 extra_every=2（每 2 帧才跑一次），主模型切片
+            # slice_every=3。按"每帧都检测"来设的 misses>1 宽限，
+            # 在这条链上等于连续两个空帧就把轨迹藏起来 ——
+            # 诊断日志实测：tracks={'cigarette':3} 但 draw={'光:白光':3}，
+            # 轨迹明明还在，画面上什么都不显示。
+            # 取 5 帧（约 0.25 秒）覆盖所有降频组合，又不至于让旧框赖着不走。
+            if _t.misses > 5:
                 continue
             if _t.last_box is None or not _t.samples:
                 continue
