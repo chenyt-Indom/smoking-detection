@@ -514,11 +514,14 @@ def test_ui_and_prompt_fixes() -> None:
     else:
         check(FAIL, "按钮文案按类别", "香烟事件仍问「有火/无火」")
 
+    # 需求反转过一次：最初要求"给 LLM 的图标注框指明看哪里"，
+    # 后来用户实测发现框会误导模型（把画上去的线当成画面内容），
+    # 于是改成默认不画。这里检查默认值确实是 False。
     arb = (ROOT / "src" / "arbiter.py").read_text(encoding="utf-8")
-    if "mark: bool = True" in arb and "cv2.rectangle" in arb:
-        check(OK, "送审图标注框", "裁图上画出检测框，指明该看哪里")
+    if "mark: bool = False" in arb:
+        check(OK, "送审图不加标注", "默认不画框，避免把模型带偏")
     else:
-        check(FAIL, "送审图标注框", "送审图没有框，模型容易看偏")
+        check(FAIL, "送审图不加标注", "仍在往送审图上画框，会误导模型")
 
 
 
@@ -610,6 +613,29 @@ def test_all_kind_conf_present() -> None:
         check(OK, "各类门槛已声明", vals)
 
 
+
+def test_no_ascii_quote_in_cn() -> None:
+    """中文提示串里不能出现裸 ASCII 双引号 —— 会截断 Python 字符串。
+
+    这个坑踩了三次：往 prompt 里写 "目标在哪" 这种中文引号时手滑打成
+    ASCII 的 "，整行字符串被提前截断，py_compile 报 SyntaxError 且报的
+    行号在几十行之前，很难看出是哪里写了引号。
+    """
+    bad = []
+    for rel in ("src/arbiter.py", "src/pipeline.py"):
+        f = ROOT / rel
+        if not f.is_file():
+            continue
+        try:
+            ast.parse(f.read_text(encoding="utf-8"))
+        except SyntaxError as e:
+            bad.append(f"{rel}:L{e.lineno} {e.msg}")
+    if bad:
+        check(FAIL, "语法完整", "；".join(bad))
+    else:
+        check(OK, "语法完整", "arbiter/pipeline 都能正常解析")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -635,6 +661,7 @@ def main() -> int:
     test_parse_with_thinking()
     test_cigarette_skips_static_prefilter()
     test_all_kind_conf_present()
+    test_no_ascii_quote_in_cn()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")
