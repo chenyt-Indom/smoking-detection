@@ -119,7 +119,7 @@ class Detector:
         # 香烟模型降频：它要跑 5 次前向（整图 + 2x2 切片），逐帧跑会把
         # 检测帧率从 16 拖到 8.7。而香烟是慢过程（点烟、抽烟都在秒级），
         # 每 3 帧看一次完全够，中间复用上次结果。
-        self.extra_every = 1
+        self.extra_every = 2
         self._extra_n = 0
         self._extra_cache: list[Detection] = []
 
@@ -307,8 +307,22 @@ class Detector:
             offs.append((x0, y0))
         # 粗筛那一帧就是"整图"那一路，别重复跑
         kept = [d for d in coarse if d.conf >= self.conf]
-        # 叠上香烟模型的独立结果：它和火焰/烟雾是两个模型，
-        # 各自的门限、各自的类别名，最后一起 NMS 去重。
-        dets = (kept + self._predict_batch(crops, offs)
-                + self._predict_extra(image, crops, offs))
+
+        # ── 切片降频：整图每帧都跑，切片隔几帧补一次 ──────────────
+        # 实测耗时：整图 11ms、2x2 切片 40ms。用户要求"识别频率大幅拉高
+        # 且切片必须保留"，唯一可行的办法就是拆开频率：
+        #   · 整图每帧跑      -> 响应快，大目标不漏
+        #   · 切片每 slice_every 帧跑 -> 小目标仍然有专门的放大通道
+        # 平均耗时从 51ms 降到 11 + 40/N，N=3 时约 24ms，检测频率翻倍。
+        self._slice_n = getattr(self, "_slice_n", 0) + 1
+        dets = list(kept)
+        if self._slice_n % int(self.slice_every) == 0:
+            dets += self._predict_batch(crops, offs)
+            self._slice_cache = [d for d in dets if d not in kept]
+        else:
+            # 不切片的帧沿用上一次的切片结果（框位置由追踪器平滑，不会跳）
+            dets += list(getattr(self, "_slice_cache", []))
+
+        # 香烟模型：整图 + 复用切片（它自己有降频）
+        dets += self._predict_extra(image, crops, offs)
         return nms(dets, self.iou)
