@@ -119,7 +119,7 @@ class Detector:
         # 香烟模型降频：它要跑 5 次前向（整图 + 2x2 切片），逐帧跑会把
         # 检测帧率从 16 拖到 8.7。而香烟是慢过程（点烟、抽烟都在秒级），
         # 每 3 帧看一次完全够，中间复用上次结果。
-        self.extra_every = 3
+        self.extra_every = 6
         self._extra_n = 0
         self._extra_cache: list[Detection] = []
 

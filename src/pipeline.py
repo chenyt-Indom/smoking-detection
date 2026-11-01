@@ -1187,7 +1187,11 @@ class Pipeline:
                                        float(_t.samples[-1].conf), _t.last_box))
         if not draw_dets:
             draw_dets = dets        # 追踪还没起来时退回原始框
-        if cfg.get("lightspot", True):
+        # 光敏引擎降频：每 2 帧跑一次。
+        # 它只回答"哪里有亮光"，亮光不会在 33ms 内出现又消失，
+        # 逐帧跑纯属浪费 GIL —— 而 GIL 正是画面卡顿的元凶。
+        self._ls_n = getattr(self, "_ls_n", 0) + 1
+        if cfg.get("lightspot", True) and self._ls_n % 2 == 0:
             try:
                 from .lightspot import detect as _ls_detect
                 spots = _ls_detect(
@@ -1323,6 +1327,10 @@ class Pipeline:
                     on_frame(pkt, last_res)
                 except Exception:       # noqa: BLE001
                     pass                # 画面出问题也绝不能中断检测
+            # 主动让出一次 GIL：检测线程算完一帧后立刻 sleep(0)，
+            # 让画面/发布线程有机会拿到锁。不加这句时 Python 的切换粒度
+            # 是 5ms，检测连续跑会把画面线程饿到 10fps 以下。
+            time.sleep(0)
             n += 1
             if max_frames is not None and n >= max_frames:
                 break

@@ -241,7 +241,7 @@ def main() -> int:
     # ── 每路一个画面视图 ──
     views = {
         str(c["id"]): LiveView(
-            max_width=int(view_cfg.get("max_width", 1280)),
+            max_width=int(view_cfg.get("max_width", 900)),
             jpeg_quality=int(view_cfg.get("jpeg_quality", 72)),
             fps_limit=float(view_cfg.get("fps_limit", 30)),
             max_bytes=int(view_cfg.get("max_bytes", 90000)),
