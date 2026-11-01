@@ -136,6 +136,13 @@ DEFAULTS = {
     "llm_mute_bypass_conf": 0.80,
     # 固定光源预筛（纯本地、免费）。设为 False 则所有目标都送审，更准但更贵。
     "static_prefilter": True,
+    # 光敏引擎：找出画面里所有亮斑，用灰框标出来（不参与追踪和告警）。
+    # YOLO 只认识训练过的样子，远处/被遮挡/没见过的发光物它可能完全不出框；
+    # 而"那里有光"用亮度阈值就能百分之百抓到。两者互补。
+    "lightspot": True,
+    "lightspot_v_min": 205,        # 亮度阈值：低于它的不算"发光"
+    "lightspot_min_area": 12,      # 最小光斑面积，再小基本是噪点
+    "lightspot_max_area_pct": 0.25,  # 超过画面 1/4 的是整片过曝，框它没意义
     # 被判为非风险的目标，判完之后又活了这么久 → 把人叫回来复核。
     # 真蒸汽几秒最多十几秒就散，撑过 30 秒本身就说明裁判可能看错了。
     # 这也是漏报的兜底：不给这条，一次误判就是一个完全静默的窗口。
@@ -1121,7 +1128,49 @@ class Pipeline:
                                            v.score, t.last_box, reasons))
 
         self._prune()
-        return FrameResult(pkt.idx, pkt.ts, dets, tracks, verdicts, events,
+        # ── 光敏引擎：补上 YOLO 漏掉的亮斑 ────────────────────
+        # 只加进返回给画面的 dets，**不参与追踪、不参与判定**。
+        # 它的语义是"这里有团光，但我不知道是什么"，所以一律灰框、
+        # 置信度为 0，绝不允许它触发任何告警路径。
+        draw_dets = dets
+        if cfg.get("lightspot", True):
+            try:
+                from .lightspot import detect as _ls_detect
+                spots = _ls_detect(
+                    pkt.image,
+                    v_min=int(cfg.get("lightspot_v_min", 205)),
+                    min_area=int(cfg.get("lightspot_min_area", 12)),
+                    max_area_pct=float(cfg.get("lightspot_max_area_pct", 0.25)),
+                )
+                if spots:
+                    # 与已有检测框重叠的不要重复画
+                    kept = []
+                    for sp in spots:
+                        sx1, sy1, sx2, sy2 = sp["box"]
+                        dup = False
+                        for d in dets:
+                            dx1, dy1, dx2, dy2 = d.box
+                            ix = max(0.0, min(sx2, dx2) - max(sx1, dx1))
+                            iy = max(0.0, min(sy2, dy2) - max(sy1, dy1))
+                            inter = ix * iy
+                            union = ((sx2 - sx1) * (sy2 - sy1)
+                                     + (dx2 - dx1) * (dy2 - dy1) - inter)
+                            if union > 0 and inter / union > 0.35:
+                                dup = True
+                                break
+                        if not dup:
+                            kept.append(sp)
+                    if kept:
+                        draw_dets = list(dets) + [
+                            Detection(cls_id=-1, cls_name=f"光:{sp['color']}",
+                                      conf=0.0, box=sp["box"])
+                            for sp in kept
+                        ]
+                        self.stats["lightspots"] = self.stats.get("lightspots", 0) + len(kept)
+            except Exception:                 # noqa: BLE001
+                pass                          # 光敏引擎坏了也绝不能拖垮主流程
+
+        return FrameResult(pkt.idx, pkt.ts, draw_dets, tracks, verdicts, events,
                            frozen=False, nearby=nearby_map)
 
     # ------------------------------------------------------------ 多帧

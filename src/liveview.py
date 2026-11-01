@@ -178,7 +178,8 @@ class LiveView:
             cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
 
             name = str(getattr(d, "cls_name", "obj")).upper()
-            label = f"{name} {conf:.2f}{suffix}"
+            # 光敏引擎的框 conf=0，显示 "0.00" 没意义，只留颜色名
+            label = name if conf <= 0.0 else f"{name} {conf:.2f}{suffix}"
             (tw, th), base = cv2.getTextSize(label, FONT, 0.5, 1)
             bh = th + base + 4
 
