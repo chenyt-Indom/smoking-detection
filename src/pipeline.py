@@ -69,6 +69,11 @@ DEFAULTS = {
     "fire_confirm": 8,
     "smoke_confirm": 8,
     "cigarette_confirm": 5,    # 香烟连续几帧才送审（抽烟是持续行为，瞬时的都是噪声）
+    # ⚠️ cigarette_conf 必须在这里声明。之前只写在 monitor.yaml 里，
+    # 而 _defer 用的是 self.cfg（DEFAULTS 打底），键不存在就取兜底 0.35 ——
+    # 于是 yaml 改成 0.005 完全不起作用，香烟永远过不了送审门槛。
+    # 诊断日志抓到的证据：[defer] 门槛拦下 kind=cigarette score=0.061 floor=0.35
+    "cigarette_conf": 0.005,
 
     # ── 极快模式（烟跳过时序判别）──────────────────────────
     # 白烟和蒸汽在**单帧**上同色同形，要分开必须观察一段时间 —— 这是物理事实，
@@ -831,10 +836,16 @@ class Pipeline:
         # llm_min_conf(0.30) 比 fire_conf(0.35) 还低，于是 0.30~0.35 的目标
         # 画的是灰框、却照样被送审。灰色框的语义是"只是看到了、不作主张"，
         # 那就不该花这笔钱，也不该在裁判那里刷存在感。
-        floor = float(self.cfg.get(f"{kind}_conf", 0.35))
+        # 兜底用 0.05 而不是 0.35：0.35 是"火"的门槛，拿它当所有类的
+        # 兜底会把香烟（分数天然 0.01~0.2）全部挡死。
+        floor = float(self.cfg.get(f"{kind}_conf",
+                                   self.cfg.get("det_conf", 0.05)))
         if float(score) < floor:
             self.stats["below_floor_skipped"] = \
                 self.stats.get("below_floor_skipped", 0) + 1
+            if self.stats["below_floor_skipped"] in (1, 50, 200):
+                print(f"[defer] 门槛拦下 kind={kind} score={score:.3f} floor={floor}",
+                      flush=True)
             return False
 
         # ② 置信度闸门（省钱的核心）：只在规则拿不准的区间才花钱
@@ -853,6 +864,9 @@ class Pipeline:
             low = float(self.cfg.get("llm_min_conf", 0.50))
         if score >= sure or score < low:
             self.stats["llm_gated"] = self.stats.get("llm_gated", 0) + 1
+            if self.stats["llm_gated"] in (1, 50, 200):
+                print(f"[defer] 闸门拦下 kind={kind} score={score:.3f} "
+                      f"low={low} sure={sure}", flush=True)
             return False          # 交回规则层，一次 API 都不花
 
         ok, _why = self.arbiter.submit(

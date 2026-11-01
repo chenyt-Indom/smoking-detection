@@ -589,6 +589,27 @@ def test_cigarette_skips_static_prefilter() -> None:
         check(FAIL, "香烟豁免静态预筛", "香烟静止时仍会被判成光源、不送审")
 
 
+
+def test_all_kind_conf_present() -> None:
+    """每一类的 {kind}_conf 都必须在 DEFAULTS 里声明。
+
+    踩过的坑：cigarette_conf 只写在 monitor.yaml，但 _defer 用
+    self.cfg（DEFAULTS 打底），键不存在就取兜底 0.35 ——
+    yaml 改成 0.005 完全不起作用，香烟永远过不了送审门槛。
+    诊断日志：[defer] 门槛拦下 kind=cigarette score=0.061 floor=0.35
+    """
+    sys.path.insert(0, str(ROOT))
+    from src.pipeline import DEFAULTS
+    missing = [k for k in ("fire_conf", "smoke_conf", "cigarette_conf")
+               if k not in DEFAULTS]
+    if missing:
+        check(FAIL, "各类门槛已声明", "DEFAULTS 缺少 " + "、".join(missing))
+    else:
+        vals = " ".join(f"{k.split('_')[0]}={DEFAULTS[k]}" for k in
+                        ("fire_conf", "smoke_conf", "cigarette_conf"))
+        check(OK, "各类门槛已声明", vals)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -613,6 +634,7 @@ def main() -> int:
     test_floor_order()
     test_parse_with_thinking()
     test_cigarette_skips_static_prefilter()
+    test_all_kind_conf_present()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")
