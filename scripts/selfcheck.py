@@ -515,6 +515,29 @@ def test_ui_and_prompt_fixes() -> None:
         check(FAIL, "送审图标注框", "送审图没有框，模型容易看偏")
 
 
+
+def test_floor_order() -> None:
+    """检测层总门槛必须低于所有类别门槛。
+
+    det_conf 是 ultralytics 推理时的一道全局过滤，比它低的**全部丢掉**。
+    实测踩过：det_conf 提到 0.18、cigarette_conf 是 0.12，
+    结果香烟模型明明检出了 0.17 的目标，在检测层就被滤掉 ——
+    用户看到的是"画面里明明在抽烟，却一个框都没有"。
+    """
+    import yaml
+    c = (yaml.safe_load((ROOT / "config" / "monitor.yaml")
+                        .read_text(encoding="utf-8")) or {}).get("thresholds", {})
+    det = float(c.get("det_conf", 1))
+    lows = {k: float(c.get(k, 1)) for k in
+            ("fire_conf", "smoke_conf", "cigarette_conf")}
+    bad = [f"{k}={v} < det_conf={det}" for k, v in lows.items() if v < det]
+    if bad:
+        check(FAIL, "检测层门槛次序", "总门槛高于类别门槛 -> " + "；".join(bad))
+    else:
+        detail = f"det={det} " + " ".join(f"{k.split('_')[0]}={v}" for k, v in lows.items())
+        check(OK, "检测层门槛次序", detail)
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -536,6 +559,7 @@ def main() -> int:
     test_confirm_frames_all()
     test_json_parse()
     test_ui_and_prompt_fixes()
+    test_floor_order()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")
