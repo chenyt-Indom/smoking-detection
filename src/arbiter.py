@@ -278,7 +278,7 @@ class LlmArbiter:
 
         # 主线程只做裁剪（约 1ms），编码和网络都扔进线程池
         roi = _crop(frame, box)
-        payload = (frame, roi, float(rule_score), str(rule_label), str(context), feat)
+        payload = (frame, roi, float(rule_score), str(rule_label), str(context), feat, box)
         with self._lock:
             self._futures[key] = self._pool.submit(self._run, key, payload)
         self.stats["submitted"] += 1
@@ -422,7 +422,7 @@ class LlmArbiter:
                 self._history = self._history[-60:]
 
     def _run_inner(self, key: str, payload) -> ArbiterResult:
-        frame, roi, rule_score, rule_label, context, feat = payload
+        frame, roi, rule_score, rule_label, context, feat, box = payload
         cfg = self.cfg
 
         if cfg.get("dry_run"):

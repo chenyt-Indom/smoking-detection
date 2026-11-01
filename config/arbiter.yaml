@@ -26,10 +26,16 @@ api_key_env: DEEPSEEK_KEY      # 系统环境变量名，不写具体值
 #    裁决任务本身很简单（看两张图判断是不是火），不需要长推理，关掉更划算：
 #    延迟从 3.3s 降到 1s 内，token 消耗降一个量级，正文也稳定。
 #    注意：thinking 开启时会忽略 temperature，关闭后 temperature 才生效。
-thinking: disabled             # disabled / enabled
+# 推理链必须开。之前为了"不让思维链吃光输出预算"关掉了它，代价是模型只能
+# 凭一眼印象作答 —— 而"火苗 vs 手电筒 vs 打火机 vs 反光"恰恰需要它在心里
+# 比对形状、梯度、色温这些细节。关掉思考后这类细粒度判别明显变差。
+# 正确做法是开着思考 + 给足输出预算，而不是关掉它。
+thinking: enabled              # disabled / enabled
 temperature: 0.1
-max_tokens: 512
-timeout_s: 20                  # 带图请求比纯文本慢，8 秒容易超时
+# 开思考后输出预算要够：推理链本身就可能几百到上千 token。
+# 512 会让它思考到一半被截断，content 返回空 —— 那正是当初关思考的原因。
+max_tokens: 2048
+timeout_s: 35                  # 开思考后明显变慢，20 秒不够；超时会退回规则层
 
 # 图片参数：ROI 放大看细节，整幅图看环境。长边压小是为了省 token，不是为了省流量
 roi_max_side: 640          # ROI 放大到 640 长边：512 时白烟细节糊成一片，模型容易只凭颜色猜
