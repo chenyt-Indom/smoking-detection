@@ -1192,8 +1192,14 @@ class Pipeline:
         # 对监控来说这比"两个框"更可接受（消失说明真的没看见）。
         draw_dets: list[Detection] = []
         for _t in tracks:
-            if _t.misses != 0:
-                continue                 # 本帧没匹配上，不画
+            # 允许刚好 1 帧没匹配上仍然画出来。
+            #
+            # 纯 misses==0 会出现"闪一下又消失"：只要某一帧检测抖动一下
+            # 没接上，框就瞬间没了、下一帧又回来，肉眼看到的是闪烁。
+            # 放 1 帧宽限能吃掉这种单帧抖动，而 2 帧以上的断档仍然会隐藏 ——
+            # 那边通常意味着目标真的走了或真的没检出，继续画旧位置反而是错的。
+            if _t.misses > 1:
+                continue
             if _t.last_box is None or not _t.samples:
                 continue
             draw_dets.append(Detection(_t.cls_id, _t.cls_name,
