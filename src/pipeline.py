@@ -1407,9 +1407,9 @@ class Pipeline:
         # 这条通道用几何特征把它捞出来：细长、浅色、有明确边界。
         # **只做检索，不做判定** —— 框出来的东西只是"候选"，
         # 全部画成灰框，由人看、或者由 LLM 在送审时裁决。
-        if cfg.get("cigshape", True):
+        if cfg.get("cigshape", False):
             self._cs_n = getattr(self, "_cs_n", 0) + 1
-            if self._cs_n % 2 == 0:
+            if self._cs_n % 6 == 0:
                 try:
                     from .cigshape import detect as _cs_detect
                     cands = _cs_detect(
@@ -1453,7 +1453,7 @@ class Pipeline:
         _has_fire = any(d.cls_name == "fire" for d in draw_dets)
         if (cfg.get("lightspot", True)
                 and (_has_fire or not cfg.get("lightspot_only_fire", True))
-                and self._ls_n % 2 == 0):
+                and self._ls_n % 4 == 0):
             try:
                 from .lightspot import detect as _ls_detect
                 spots = _ls_detect(
