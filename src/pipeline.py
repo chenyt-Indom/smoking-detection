@@ -169,7 +169,10 @@ DEFAULTS = {
 
     # ── 杂项 ────────────────────────────────────────────────
     "min_box_pct": 0.0002,     # 面积小于画面 0.02% 的框当噪点丢掉
-    "snapshot_margin": 0.25,   # 截图外扩比例
+    "snapshot_margin": 0.45,   # 截图外扩比例（0.25 -> 0.45，多带一点周边环境）
+    # ROI 最小边长：框太小（比如 30x30 的火苗）时按比例扩到这个尺寸再裁，
+    # 否则模型只能看到一个色块，判断不了它在人脸/墙面/半空中
+    "snapshot_min_side": 220,
     "snapshot_max_side": 640,  # ROI 截图长边上限（存盘别存 4K）
     "snapshot_full_max_side": 900,  # 全景图长边上限，比 ROI 大一点才看得清位置
 }
@@ -215,10 +218,27 @@ def full_view(image: np.ndarray, box, max_side: int = 800):
     return img
 
 
-def crop_box(image: np.ndarray, box, margin: float, max_side: int):
-    """按框裁图（带外扩），长边超限就等比缩小。返回新数组，不持有原图引用。"""
+def crop_box(image: np.ndarray, box, margin: float, max_side: int,
+             min_side: int = 220):
+    """按框裁图（带外扩），长边超限就等比缩小。返回新数组，不持有原图引用。
+
+    为什么要 min_side
+    -----------------
+    实测小火苗的检测框可能只有 30x30，按框裁出来就是一张 33x34 的小图：
+    模型看到的只是一个白色小方块，判断不了它是火苗、反光还是手电筒。
+    用户的原话是"可以根据周围环境进行判断"，那就得让裁剪图带足周边 ——
+    所以框太小时按比例向四周扩到至少 min_side，让它能看到
+    "这个亮点是在人脸上、在墙上、还是在半空中"。
+    """
     h, w = image.shape[:2]
     x1, y1, x2, y2 = expand_box(box, margin)
+    # 太小就围绕中心继续外扩，直到达到最小边长（受画面边界限制）
+    cw, ch = max(1.0, x2 - x1), max(1.0, y2 - y1)
+    if min(cw, ch) < min_side:
+        k = max(min_side / cw, min_side / ch)
+        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+        x1, x2 = cx - cw * k / 2.0, cx + cw * k / 2.0
+        y1, y2 = cy - ch * k / 2.0, cy + ch * k / 2.0
     x1 = int(max(0, min(w - 1, x1)))
     y1 = int(max(0, min(h - 1, y1)))
     x2 = int(max(x1 + 1, min(w, x2)))
@@ -530,7 +550,8 @@ class Pipeline:
             reasons = [f"置信 {score:.2f} 不足以直接定性，待人工确认"] + list(reasons)[:1]
 
         snap = crop_box(pkt.image, box, self.cfg["snapshot_margin"],
-                        self.cfg["snapshot_max_side"])
+                        self.cfg["snapshot_max_side"],
+                        int(self.cfg.get("snapshot_min_side", 220)))
         # 同时留一张标了框的全景图：ROI 只能看"是什么"，全景才能看"在哪"
         full = full_view(pkt.image, box, self.cfg["snapshot_full_max_side"])
         ev = Event(kind=kind, level=level, cam_id=pkt.cam_id, track_id=tid,
@@ -718,7 +739,8 @@ class Pipeline:
             kind=kind, tid=tid, cam_id=pkt.cam_id, frame_idx=pkt.idx, ts=pkt.ts,
             t_first=t.first_t, box=tuple(float(v) for v in box),
             snapshot=crop_box(pkt.image, box, self.cfg["snapshot_margin"],
-                              self.cfg["snapshot_max_side"]),
+                              self.cfg["snapshot_max_side"],
+                              int(self.cfg.get("snapshot_min_side", 220))),
             score=float(score), reasons=list(reasons),
             hits=t.hits, n_samples=len(t.samples),
             box_n=box_n, area_n=area_n)

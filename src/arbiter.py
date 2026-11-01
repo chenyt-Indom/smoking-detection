@@ -65,7 +65,7 @@ DEFAULTS = {
 
 SYSTEM = (
     "你是消防安防值班员，正在看一路监控。图1是整幅画面（判断环境），"
-    "图2是可疑区域放大（判断细节）。\n"
+    "图2是可疑区域放大（判断细节）；若只有一张图，那张就是整幅画面。\n"
     "任务：判断这个可疑目标是否构成火灾风险。\n\n"
     "判据：\n"
     "- 厨房灶台、焊接工位、排气口、水壶上方的白色羽流 → 水汽/工艺气，风险低\n"
@@ -437,10 +437,15 @@ class LlmArbiter:
                                  "high" if rule_label in ("fire", "smoke") else "low",
                                  max(rule_score, 0.6), "dry-run 假裁决", "dry_run", 0.05)
 
+        # ⚠️ 顺序必须与 SYSTEM 里的描述一致：图1 整幅画面、图2 可疑区域放大。
+        # 原来这里是 ROI 在前、全图在后，而 prompt 写的正好相反 ——
+        # 模型把裁剪图当成"整幅画面"去理解环境，把全图当成"放大细节"，
+        # 判断依据整个错位。这种错配比少给一张图更糟。
+        # 先看环境再看细节也是更自然的顺序。
         imgs = []
+        imgs.append(_encode(frame, int(cfg["full_max_side"]), int(cfg["jpeg_quality"])))
         if roi is not None:
             imgs.append(_encode(roi, int(cfg["roi_max_side"]), int(cfg["jpeg_quality"])))
-        imgs.append(_encode(frame, int(cfg["full_max_side"]), int(cfg["jpeg_quality"])))
         uris = [u for u in imgs if u]
         if not uris:
             return self._fallback(rule_label, rule_score, "画面编码失败")
