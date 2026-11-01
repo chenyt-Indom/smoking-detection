@@ -33,6 +33,7 @@
 from __future__ import annotations
 
 import json
+import re
 import os
 import threading
 import time
@@ -210,11 +211,20 @@ def _parse_json(text: str) -> dict | None:
     i, j = t.find("{"), t.rfind("}")
     if i < 0 or j <= i:
         return None
-    try:
-        d = json.loads(t[i:j + 1])
-        return d if isinstance(d, dict) else None
-    except json.JSONDecodeError:
-        return None
+    frag = t[i:j + 1]
+    # 中文引号（模型偶尔把英文引号写成 “ ” ‘ ’）。
+    # 用 chr() 而不是字面量，避免源码经过几层替换后转义失效。
+    _cn = frag
+    for _ch, _ascii in ((chr(0x201C), '"'), (chr(0x201D), '"'),
+                        (chr(0x2018), "'"), (chr(0x2019), "'")):
+        _cn = _cn.replace(_ch, _ascii)
+    for cand in (frag, _cn, re.sub(r",\s*([}\]])", r"\1", frag), _cn):
+        try:
+            d = json.loads(cand)
+            return d if isinstance(d, dict) else None
+        except json.JSONDecodeError:
+            continue
+    return None
 
 
 def _crop(image: np.ndarray, box, margin: float = 0.85) -> np.ndarray | None:
@@ -553,9 +563,18 @@ class LlmArbiter:
                 return self._fallback(rule_label, rule_score,
                                       f"HTTP {r.status_code} {r.text[:100]}", latency)
             msg = r.json().get("choices", [{}])[0].get("message", {})
-            parsed = _parse_json((msg.get("content") or "").strip())
+            content = (msg.get("content") or "").strip()
+            # DeepSeek 思考模式下，答案可能只出现在 reasoning_content 里，
+            # content 为空或只有一个换行。直接判"返回不是合法 JSON"就会
+            # 白白退回规则层 —— 用户截图里那次"火情 / 耗时 15.1s"就是这么来的：
+            # 模型其实答了，只是答在了另一个字段。
+            if not content:
+                content = (msg.get("reasoning_content") or "").strip()
+            parsed = _parse_json(content)
             if not parsed:
                 self.stats["error"] += 1
+                # 记录原始返回的前 120 字符，方便以后定位到底长什么样
+                print(f"[llm] 解析失败，原始返回：{content[:120]!r}", flush=True)
                 return self._fallback(rule_label, rule_score, "返回不是合法 JSON", latency)
             self.stats["llm"] += 1
             res = self._to_result(parsed, latency)

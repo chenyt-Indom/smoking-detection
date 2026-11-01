@@ -450,6 +450,35 @@ def test_confirm_frames_all() -> None:
         check(OK, "确认帧数（合并后）", f"{vals}，三类都不低于 5 帧")
 
 
+
+def test_json_parse() -> None:
+    """LLM 返回的各种脏格式都要能解析出来。
+
+    用户截图：事件被判成"火情"，理由是"裁判不可用（返回不是合法 JSON）"，
+    耗时 15.1s —— 模型其实答了，只是格式不标准，系统退回规则层
+    按检测类别（fire）定级，把一支香烟判成了火。
+    """
+    sys.path.insert(0, str(ROOT))
+    from src.arbiter import _parse_json
+    L, R = chr(0x201C), chr(0x201D)
+    cases = [
+        ("标准 JSON", '{"label":"fire","confidence":0.8}', "fire"),
+        ("裹代码块", '```json\n{"label":"smoke"}\n```', "smoke"),
+        ("前面带解释", '判定如下：{"label":"other"}', "other"),
+        ("中文引号", '{' + L + 'label' + R + ':' + L + 'cigarette' + R + '}', "cigarette"),
+        ("尾逗号", '{"label":"fire",}', "fire"),
+    ]
+    bad = []
+    for name, txt, want in cases:
+        got = _parse_json(txt)
+        if not got or got.get("label") != want:
+            bad.append(name)
+    if bad:
+        check(FAIL, "LLM 返回解析容错", "解析不出来 -> " + "、".join(bad))
+    else:
+        check(OK, "LLM 返回解析容错", f"{len(cases)} 种脏格式全部能解析")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -469,6 +498,7 @@ def main() -> int:
     test_cigarette_gate()
     test_cigarette_confirm_frames()
     test_confirm_frames_all()
+    test_json_parse()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")
