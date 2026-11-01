@@ -219,6 +219,15 @@ class LlmArbiter:
         # 不落盘：它是"此刻连没连上、快不快"的实时证据，不是审计日志。
         self._history: list[dict] = []
 
+    def _is_local(self) -> bool:
+        """端点是不是本机（Ollama / vLLM / LM Studio 之类）。
+
+        本地服务不校验 Key，硬要求它填 key 会让人以为配错了。
+        判断只看 url 的主机部分，不做 DNS 解析。
+        """
+        url = str(self.cfg.get("url") or "")
+        return any(h in url for h in ("127.0.0.1", "localhost", "0.0.0.0", "::1"))
+
     # ------------------------------------------------------------ 额度 / 去重
     def _quota_ok(self) -> bool:
         now = time.time()
@@ -251,7 +260,7 @@ class LlmArbiter:
         """
         if not self.cfg.get("enabled", True):
             return False, "裁判已关闭"
-        if not self.api_key and not self.cfg.get("dry_run"):
+        if not self.api_key and not self.cfg.get("dry_run") and not self._is_local():
             return False, "未配置 API Key"
         if not self.cfg.get("model") and not self.cfg.get("dry_run"):
             return False, "未配置 model（去 config/arbiter.yaml 填）"
@@ -312,8 +321,8 @@ class LlmArbiter:
             problems.append("裁判已关闭（config/arbiter.yaml 的 enabled）")
         if not model and not dry:
             problems.append("model 未填 —— 去 config/arbiter.yaml 写上平台给出的模型名")
-        if not has_key and not dry:
-            problems.append("未读到 API Key —— 在项目根目录 .env 里写 TELEAI_APPKEY=...")
+        if not has_key and not dry and not self._is_local():
+            problems.append("未读到 API Key —— 在项目根目录 .env 里写对应变量")
 
         with self._lock:
             used = len(self._calls)
@@ -322,12 +331,13 @@ class LlmArbiter:
 
         limit = int(cfg.get("hourly_limit", 0) or 0)
         return {
-            "configured": bool(enabled and (dry or (model and has_key))),
+            "configured": bool(enabled and (dry or (model and (has_key or self._is_local())))),
             "enabled": enabled,
             "dry_run": dry,
             "model": model,
             "url": str(cfg.get("url") or ""),
             "has_key": has_key,
+            "local": self._is_local(),
             "key_hint": (self.api_key[:4] + "…" + self.api_key[-4:]
                          if len(self.api_key) > 8 else ""),
             "quota": {"used": used, "limit": limit, "left": max(0, limit - used)},
@@ -350,8 +360,8 @@ class LlmArbiter:
             return {"ok": True, "dry_run": True, "msg": "dry_run 模式下不发真实请求"}
         if not cfg.get("model"):
             return {"ok": False, "error": "model 未填（config/arbiter.yaml）"}
-        if not self.api_key:
-            return {"ok": False, "error": "未配置 API Key（.env 的 TELEAI_APPKEY）"}
+        if not self.api_key and not self._is_local():
+            return {"ok": False, "error": "未配置 API Key"}
 
         body = {"model": cfg["model"],
                 "messages": [{"role": "user", "content": "ping"}],
