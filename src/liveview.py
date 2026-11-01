@@ -176,9 +176,10 @@ class LiveView:
     def _smooth(self, dets, alpha: float = 0.45):
         """跨帧框平滑：同类别 + IOU 匹配 → 指数滑动平均。
 
-        alpha 是"新观测"的权重。0.45 意味着 55% 沿用历史 —— 框会明显变稳，
-        代价是目标快速移动时略有滞后。监控场景看的是"有没有事"，
-        不是"精确到像素的跟踪"，这个取舍值得。
+        alpha 是基准权重（0.45）。实际使用时按每帧位移自适应：
+          静止  -> 约 0.45，重在历史，压抖动
+          移动快 -> 最高 0.9，重在观测，不拖影
+        框的宽高也各自独立平滑，避免尺寸忽大忽小。
         """
         prev = self._prev_boxes
         used = set()
@@ -198,7 +199,17 @@ class LiveView:
                     best, best_iou = i, v
             if best >= 0:
                 pb = prev[best][0]
-                box = tuple(alpha * float(c) + (1.0 - alpha) * float(p)
+                # 自适应 alpha：按"这一帧移动了多少"动态调整历史权重。
+                #   目标基本不动 -> 重在历史（更稳，压下抖动）
+                #   目标快速移动 -> 重在观测（跟手，避免拖影和滞后）
+                # 移动量用两框中心的位移 / 框对角线长度衡量，做归一化。
+                _mx = (float(box[0] + box[2]) - float(pb[0] + pb[2])) / 2.0
+                _my = (float(box[1] + box[3]) - float(pb[1] + pb[3])) / 2.0
+                _diag = max(1.0, ((float(pb[2] - pb[0])) ** 2
+                                  + (float(pb[3] - pb[1])) ** 2) ** 0.5)
+                _shift = (_mx * _mx + _my * _my) ** 0.5 / _diag
+                _a = min(0.9, max(0.25, alpha + _shift * 1.4))
+                box = tuple(_a * float(c) + (1.0 - _a) * float(p)
                             for c, p in zip(box, pb))
                 used.add(best)
             out.append((box, name, getattr(d, "conf", 0.0)))

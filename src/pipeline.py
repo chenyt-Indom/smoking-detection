@@ -1192,7 +1192,7 @@ class Pipeline:
         # 它只回答"哪里有亮光"，亮光不会在 33ms 内出现又消失，
         # 逐帧跑纯属浪费 GIL —— 而 GIL 正是画面卡顿的元凶。
         self._ls_n = getattr(self, "_ls_n", 0) + 1
-        if cfg.get("lightspot", True) and self._ls_n % 2 == 0:
+        if cfg.get("lightspot", True):
             try:
                 from .lightspot import detect as _ls_detect
                 spots = _ls_detect(

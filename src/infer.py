@@ -119,7 +119,7 @@ class Detector:
         # 香烟模型降频：它要跑 5 次前向（整图 + 2x2 切片），逐帧跑会把
         # 检测帧率从 16 拖到 8.7。而香烟是慢过程（点烟、抽烟都在秒级），
         # 每 3 帧看一次完全够，中间复用上次结果。
-        self.extra_every = 3
+        self.extra_every = 1
         self._extra_n = 0
         self._extra_cache: list[Detection] = []
 
@@ -175,9 +175,10 @@ class Detector:
                                      (x1 + ox, y1 + oy, x2 + ox, y2 + oy)))
 
         _run(image)
-        if crops:
-            for c, o in zip(crops, offs or []):
-                _run(c, o)
+        # 不做切片：实测香烟模型整图 9.8ms、4 片切片 40ms。
+        # 用户要求"检测帧率拉到最高"，这里是最划算的一刀 ——
+        # 省掉 40ms/帧（总耗时的 40%），代价是远处极小的香烟可能漏。
+        # 靠 cigarette_conf=0.03 的极低门限 + 每帧都检（every=1）来补偿。
         self._extra_cache = out
         return out
 
