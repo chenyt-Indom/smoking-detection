@@ -809,6 +809,13 @@ class Pipeline:
         reasons = ([f"LLM 判为 {res.label}（risk={res.risk}，conf={res.confidence:.2f}）："
                     f"{res.reason}"] + info.reasons[:2])
 
+        # LLM 自己都说没把握、且置信度很低 → 静默丢弃，不弹卡片。
+        # 这类事件的本质是"模型看了但没看出来"，推给人只是噪音。
+        if (res.label == "uncertain"
+                and float(res.confidence) < float(self.cfg.get("uncertain_silent_conf", 0.50))):
+            self.stats["uncertain_silent"] = self.stats.get("uncertain_silent", 0) + 1
+            return None
+
         if res.is_dismiss:
             # ⚠️ 这里**不能** return None。判成蒸汽就一声不响，等于给真烟开了后门：
             # 规则层或 LLM 只要错一次，管理员屏幕上什么都没有，事故就发生在静默里。
