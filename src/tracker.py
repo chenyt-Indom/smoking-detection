@@ -260,7 +260,35 @@ class IoUTracker:
                     continue
             pred_box[tid] = t.kf.predict()
 
-        # ── 第二步：贪心匹配，但用的是预测框 ────────────────────
+        # ── 第二步：贪心匹配（IOU 主判据 + 中心距离兜底）──────────
+        #
+        # 为什么光靠 IOU 不够：打火机、香烟这类小目标只有 20x20 像素，
+        # 火苗一抖位置跳 10px，IOU 立刻掉到 0.1 以下 —— 明明还是同一团火，
+        # 却因为"框不重叠"被判成新目标。实测一次打火冒出 #419/#421/#422
+        # 三条轨迹、三张卡片，根子就在这里。
+        #
+        # 兜底判据：IOU 不够时看中心距离。容差取"框对角线的一半、至少 12px"，
+        # 距离在容差内就给一个低分（0~0.1），确保它**永远排在纯 IOU 匹配之后** ——
+        # 有正常重叠的目标不会被距离匹配抢走。
+        def _score(pb, db) -> float:
+            v = iou(pb, db)
+            if v >= self.match_iou:
+                return v
+            pcx, pcy = (pb[0] + pb[2]) / 2.0, (pb[1] + pb[3]) / 2.0
+            dcx, dcy = (db[0] + db[2]) / 2.0, (db[1] + db[3]) / 2.0
+            pw, ph = pb[2] - pb[0], pb[3] - pb[1]
+            dist = ((pcx - dcx) ** 2 + (pcy - dcy) ** 2) ** 0.5
+            # 容差 = 框对角线全长（至少 20px）。
+            #
+            # 之前取 0.6 倍对角线，实测 20x20 的小火苗抖动 ±8px 时中心距离
+            # 能到 17.8px，而容差只有 17.0 —— 差 0.8 像素就判成新目标，
+            # 一次打火照样分裂成三条轨迹。小目标的抖动幅度本身就接近它的
+            # 尺寸，容差必须按整条对角线给，不能打折。
+            tol = max(20.0, (pw * pw + ph * ph) ** 0.5)
+            if dist <= tol:
+                return 0.1 * (1.0 - dist / tol)      # 0~0.1，永远低于 IOU 阈值
+            return 0.0
+
         pairs = []
         for tid, t in self.tracks.items():
             pb = pred_box.get(tid)
@@ -269,8 +297,8 @@ class IoUTracker:
             for di, d in enumerate(dets):
                 if d.cls_id != t.cls_id:
                     continue
-                v = iou(pb, d.xyxy)
-                if v >= self.match_iou:
+                v = _score(pb, d.xyxy)
+                if v > 0.0:
                     pairs.append((v, tid, di))
         pairs.sort(key=lambda x: -x[0])
 

@@ -249,6 +249,41 @@ def test_filter_but_traceable() -> None:
         check(FAIL, "配额：降级但留痕", "降级了但没有日志 —— 静默降级不可接受")
 
 
+
+def test_small_target_no_split() -> None:
+    """极小目标和抖动时不能分裂 —— 这是打火机出三条事件的根因。
+
+    打火机的火只有约 20x20 像素，火苗抖动一下位置跳 10px，
+    两个框就完全不重叠（IOU=0）。纯 IOU 匹配会判成新目标，
+    于是一次打火冒出三条轨迹、三张卡片。
+    这里模拟"20x20 小目标每帧随机抖动 ±8px"，看会不会分裂。
+    """
+    import random
+    import numpy as np
+    from src.infer import Detection
+    from src.tracker import IoUTracker
+    random.seed(7)
+    tr = IoUTracker()
+    img = np.zeros((480, 640, 3), dtype=np.uint8)
+    tids = set()
+    cx, cy = 320, 240
+    for i in range(12):
+        # 目标位置小幅漂移 + 每帧检测抖动
+        cx += random.uniform(-4, 4)
+        cy += random.uniform(-4, 4)
+        jx, jy = random.uniform(-8, 8), random.uniform(-8, 8)
+        x = cx + jx
+        y = cy + jy
+        dets = [Detection(0, "fire", 0.8, (x, y, x + 20, y + 20))]
+        for t in tr.update(dets, img, ts=i * 0.05):
+            if t.cls_name == "fire":
+                tids.add(t.tid)
+    if len(tids) == 1:
+        check(OK, "小目标抖动不分裂", "20x20 目标抖动 ±8px，12 帧仍是一条轨迹")
+    else:
+        check(FAIL, "小目标抖动不分裂", f"分裂出 {len(tids)} 条轨迹（应为 1）")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -259,6 +294,7 @@ def main() -> int:
     test_nms_grouping()
     test_kalman()
     test_tracker_no_split()
+    test_small_target_no_split()
     test_pipeline_attrs()
     test_filter_but_traceable()
 
