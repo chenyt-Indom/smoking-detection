@@ -72,7 +72,16 @@ class LiveView:
         #   >= hot_conf           红/橙：高置信，基本可以定性
         # 两档不够用的原因：人脸被强光照到能拿到 fire 0.49，刚过 0.45 就变红，
         # 和真火 0.82 一个颜色，反而分不出轻重。
+        # 告警阈值（pipeline 用来决定要不要送审/报警，由 run_multi 注入）
         self.alarm_confs: dict[int, float] = {0: 0.45, 1: 0.50}
+        # **彩色框阈值**：比告警阈值更高。
+        #
+        # 用户的要求是"门限可以压低，但不要一直有彩色框认错"。
+        # 这两件事本来是两个问题：
+        #   · 检测门限低  -> 多出框（灰框），不漏
+        #   · 彩色框门槛高 -> 只有相当确定才上色，不刺眼
+        # 拆开之后可以放心把检测放宽，而画面依然干净。
+        self.color_confs: dict[int, float] = {0: 0.45, 1: 0.55}
         self.hot_confs: dict[int, float] = {0: 0.70, 1: 0.75}
 
         self._cond = threading.Condition(threading.Lock())
@@ -167,7 +176,14 @@ class LiveView:
 
             cid = int(getattr(d, "cls_id", -1))
             conf = float(getattr(d, "conf", 0.0))
-            alarm_thr = self.alarm_confs.get(cid, 0.25)
+            # 画彩色框用 color_thr（更严）；alarm_thr 只用于告警逻辑，不参与配色。
+            # 香烟单独取阈值：它的 cls_id 也是 0，和 fire 撞了，
+            # 所以按**类别名**判断，不能按 id。
+            _nm = str(getattr(d, "cls_name", "")).lower()
+            if "cig" in _nm:
+                alarm_thr = self.color_confs.get(2, 0.55)
+            else:
+                alarm_thr = self.color_confs.get(cid, 0.50)
             # 颜色只由「类别 + 是否达阈值」决定，不再分置信度档位
             # 灰框限量：未达阈值的框最多画 N 个（按置信度从高到低）。
             # 阈值降到 0.08 后画面里能冒出几十个灰框，满屏标签反而什么都看不清 ——
