@@ -120,7 +120,7 @@ DEFAULTS = {
     # 两头都省，只留中间那段真正需要判断的。
     # 送审下限必须**低于**报警阈值，否则会出现"不够格送审、却够格报警"的漏洞：
     # 实测 conf 0.47 撞上 fire_conf 0.45，跳过裁判直接报了火情。
-    "llm_min_conf": 0.30,
+    "llm_min_conf": 0.35,
     # 免裁线：达到这个置信度才允许不送审直接定性。
     # 设太高浪费钱，设太低会让检测器单方面定性 —— 实测 0.85 时一张人脸被
     # 直接推成「火情」，裁判根本没参与。0.92 是"基本只可能是真火"的量级。
@@ -723,6 +723,18 @@ class Pipeline:
                 and self._looks_static_light(extract_features(t.samples))):
             self.stats["static_prefiltered"] = self.stats.get("static_prefiltered", 0) + 1
             self._prefiltered.add(tid)
+            return False
+
+        # 硬门槛：连「画框/告警」的门槛都没到，就不该占用裁判。
+        #
+        # 用户观察到"框还是灰的就推给 DeepSeek 了"—— 根因是送审下限
+        # llm_min_conf(0.30) 比 fire_conf(0.35) 还低，于是 0.30~0.35 的目标
+        # 画的是灰框、却照样被送审。灰色框的语义是"只是看到了、不作主张"，
+        # 那就不该花这笔钱，也不该在裁判那里刷存在感。
+        floor = float(self.cfg.get(f"{kind}_conf", 0.35))
+        if float(score) < floor:
+            self.stats["below_floor_skipped"] = \
+                self.stats.get("below_floor_skipped", 0) + 1
             return False
 
         # ② 置信度闸门（省钱的核心）：只在规则拿不准的区间才花钱
