@@ -66,8 +66,8 @@ DEFAULTS = {
     # 火：连续命中几帧才报。从 3 提到 5 是为了让闪烁闸有足够样本：
     # 判"抖不抖"至少需要 4 个帧间差分（=5 帧）。3 帧时算不出，闸等于不存在。
     # 代价是 0.12s → 0.20s（25fps），对火灾尺度无关紧要。
-    "fire_confirm": 8,
-    "smoke_confirm": 8,
+    "fire_confirm": 5,
+    "smoke_confirm": 5,
     "cigarette_confirm": 5,    # 香烟连续几帧才送审（抽烟是持续行为，瞬时的都是噪声）
     # ⚠️ cigarette_conf 必须在这里声明。之前只写在 monitor.yaml 里，
     # 而 _defer 用的是 self.cfg（DEFAULTS 打底），键不存在就取兜底 0.35 ——
