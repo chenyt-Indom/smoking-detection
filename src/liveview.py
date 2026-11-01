@@ -161,6 +161,9 @@ class LiveView:
         img = image.copy()
         h, w = img.shape[:2]
         placed: list[tuple[int, int, int, int]] = []   # 已占用的标签区域，防重叠
+        # 灰框限量：未达彩色阈值的框最多画这么多个
+        _cand_limit = 4
+        _cand_drawn = 0
 
         def collides(box) -> bool:
             x1, y1, x2, y2 = box

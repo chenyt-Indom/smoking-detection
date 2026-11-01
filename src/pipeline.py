@@ -1236,104 +1236,122 @@ class Pipeline:
             every: int = 1, quiet: bool = False, on_frame=None) -> dict:
         """把一路视频源跑到底。
 
-        every：抽帧间隔（2 = 隔一帧跑一次）。烟雾是慢过程，抽帧几乎不影响效果，
-               但吞吐直接翻倍 —— 现场算力不够时先调这个，别去降 imgsz。
+        ⚠️ 检测跑在**独立线程**里，主循环只负责采集 + 推画面。
 
-        on_frame：每处理完一帧回调一次 (pkt, res)，给实时画面用。
-                  **异常一律吞掉** —— 可视化挂了不能连累检测。
+        为什么必须拆线程
+        ----------------
+        原来检测是在主循环里同步调用的：算一帧要 11~60ms，这段时间主循环
+        完全停住、不能推画面 —— 表现就是"每次检测画面就卡一下"。
+        用户的原话是"调用检测时会卡顿"，观察得完全准确。
+
+        拆开之后：
+          · 主循环每来一帧就推画面，**永不阻塞**
+          · 检测线程从队列里拿最新帧处理，跟不上就丢帧（宁丢不积压）
+          · 画面用最近一次检测结果，最多滞后一个检测周期（约 200ms）
+            这种滞后对监控来说无所谓 —— 人眼看的是"发生了什么"，
+            不是"精确到毫秒的同步"
+
+        every：抽帧间隔（3 = 每 3 帧送一次检测）。烟/火都是慢过程。
+
+        on_frame：每帧回调 (pkt, res)，给实时画面用。异常一律吞掉 ——
+                  可视化挂了不能连累检测。
         """
+        import queue as _q
+        import threading as _th
+
         t0 = time.time()
         all_events: list[Event] = []
         n = 0
         empty = 0
-        last_res = None          # 最近一次检测结果，给跳过的帧复用
-        last_det_t = 0.0         # 上次真正跑检测的时刻
-        force_detect_s = 0.6     # 重复帧期间最多隔这么久强制重检一次
-        last_idx = -1            # 上一帧的序号，用来识别"重复帧"
+        last_idx = -1
+        last_det_t = 0.0
+        force_detect_s = 0.6      # 重复帧期间最多隔这么久强制重检一次
+        detq: _q.Queue = _q.Queue(maxsize=2)   # 只留最新两帧
+        stop = _th.Event()
+        shared: dict = {"res": None}          # 检测线程写，主线程读
 
-        while not source.closed:
-            # 非阻塞取帧 + 主动让出 CPU。
-            # 早先用带条件等待的 read_blocking，会和画面发布线程抢同一把
-            # Condition 锁：采集每来一帧都 notify_all，两个等待方同时被唤醒、
-            # 同时抢锁，锁竞争把吞吐压到 15fps 上不去（降检测开销也没用）。
-            # 这里改成纯轮询，锁只做一次极短的读，竞争基本消失。
-            pkt = source.read()
-            if pkt is None:
-                empty += 1
-                if empty > 1000:        # 源活着但一直没帧 → 别死等
+        def _detect_loop():
+            while not stop.is_set():
+                try:
+                    pkt = detq.get(timeout=0.1)
+                except _q.Empty:
+                    continue
+                if pkt is None:
                     break
-                time.sleep(0.002)
-                continue
-            empty = 0
-
-            # 重复帧（画面完全没变，摄像头不产新帧时的常态）：
-            # 不能一 continue 了事 —— 那会同时造成两个问题：
-            #   ① 静止的火苗永远轮不到检测。它一动就能出框、一停就消失，
-            #      用户看到的就是"小火苗不动就没框"，根子在这里。
-            #   ② 画面线程也拿不到新帧，前端会冻在最后一帧 —— 而那一帧
-            #      很可能是在目标出现之前画的，于是屏幕上什么都没有。
-            #
-            # 正确做法：画面照常推（用上一次的检测结果），
-            # 但每隔 force_detect_s 秒**强制重检一次**，保证静止目标也有机会出框。
-            if pkt.idx == last_idx:
-                if on_frame is not None and last_res is not None:
-                    try:
-                        on_frame(pkt, last_res)
-                    except Exception:       # noqa: BLE001
-                        pass
-                if time.time() - last_det_t >= force_detect_s:
+                try:
                     res = self.process(pkt)
-                    last_det_t = time.time()
-                    last_res = res
-                    self._last_dets = res.dets
-                    for ev in res.events:
-                        all_events.append(ev)
-                        if not quiet:
-                            print(ev, flush=True)
-                        if on_event is not None:
-                            on_event(ev, res)
-                time.sleep(0.002)
-                continue
-            last_idx = pkt.idx
-
-            if n % every == 0:
-                _tp = time.time()
-                res = self.process(pkt)
-                _dt_proc = (time.time() - _tp) * 1000
-                # 单帧检测耗时探针：正常约 100~130ms，一旦超过 300ms 说明
-                # 这一帧把主线程（也就是 GIL）占住了，画面线程必然跟着卡
-                if _dt_proc > 300:
-                    print(f"[slow] 检测耗时 {_dt_proc:.0f}ms  frame={pkt.idx}", flush=True)
-                last_res = res
-                last_det_t = time.time()
-                self._last_dets = res.dets      # 给画面线程叠加用
-                self._det_ts.append(time.time())
-                if len(self._det_ts) >= 4:
-                    span = self._det_ts[-1] - self._det_ts[0]
-                    if span > 0:
-                        self.det_fps = (len(self._det_ts) - 1) / span
+                except Exception:                  # noqa: BLE001
+                    continue
+                shared["res"] = res
+                self._last_dets = res.dets
                 for ev in res.events:
                     all_events.append(ev)
                     if not quiet:
                         print(ev, flush=True)
                     if on_event is not None:
-                        on_event(ev, res)
+                        try:
+                            on_event(ev, res)
+                        except Exception:          # noqa: BLE001
+                            pass
 
-            # 画面要每一帧都推，不能只在做检测的帧推 —— 否则 every=2 时
-            # 前端帧率会直接砍半（实测 20fps 的源只有 5.8fps 画面）。
-            # 跳过的帧沿用上一次的检测框，框位置最多滞后一个抽帧间隔。
-            if on_frame is not None and last_res is not None:
-                try:
-                    on_frame(pkt, last_res)
-                except Exception:       # noqa: BLE001
-                    pass                # 画面出问题也绝不能中断检测
-            # 主动让出一次 GIL：检测线程算完一帧后立刻 sleep(0)，
-            # 让画面/发布线程有机会拿到锁。不加这句时 Python 的切换粒度
-            # 是 5ms，检测连续跑会把画面线程饿到 10fps 以下。
-            time.sleep(0)
-            n += 1
-            if max_frames is not None and n >= max_frames:
-                break
+        th = _th.Thread(target=_detect_loop, name="detect", daemon=True)
+        th.start()
+
+        def _push(pkt):
+            """推一帧画面。检测还没出结果时先推空框，别让画面黑着。"""
+            if on_frame is None:
+                return
+            res = shared["res"]
+            if res is None:
+                res = FrameResult(pkt.idx, pkt.ts, [], [], {}, [])
+            try:
+                on_frame(pkt, res)
+            except Exception:                      # noqa: BLE001
+                pass
+
+        try:
+            while not source.closed:
+                pkt = source.read()
+                if pkt is None:
+                    empty += 1
+                    if empty > 1000:
+                        break
+                    time.sleep(0.002)
+                    continue
+                empty = 0
+
+                # 重复帧：画面照推（否则前端冻住），并按周期强制重检
+                if pkt.idx == last_idx:
+                    _push(pkt)
+                    if time.time() - last_det_t >= force_detect_s:
+                        last_det_t = time.time()
+                        try:
+                            detq.put_nowait(pkt)
+                        except _q.Full:
+                            pass
+                    time.sleep(0.002)
+                    continue
+                last_idx = pkt.idx
+
+                # 抽帧送检：**不等结果**，丢进队列就继续
+                if n % every == 0:
+                    last_det_t = time.time()
+                    try:
+                        detq.put_nowait(pkt)
+                    except _q.Full:
+                        # 检测跟不上就丢这一帧。宁可少检一次，也不能让队列
+                        # 积压 —— 那会导致检测永远在处理几秒前的旧画面。
+                        self.stats["det_dropped"] = self.stats.get("det_dropped", 0) + 1
+
+                _push(pkt)
+
+                n += 1
+                if max_frames is not None and n >= max_frames:
+                    break
+        finally:
+            stop.set()
+            th.join(timeout=2.0)
+
 
         elapsed = max(1e-6, time.time() - t0)
         if self.lights is not None:
