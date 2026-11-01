@@ -1061,7 +1061,7 @@ class Pipeline:
                     continue
                 if mem:
                     events.append(self._make_event(
-                        "smoke", "notice", t.tid, t, pkt, v.score, t.last_box,
+                        kind, "notice", t.tid, t, pkt, v.score, t.last_box,
                         [mem, "不是排除：外形一旦变化会自动恢复复核"]))
                     continue
 
@@ -1075,12 +1075,12 @@ class Pipeline:
                     self._noticed.add(t.tid)
                     self.stats["notices"] += 1
                     events.append(self._make_event(
-                        "smoke", "notice", t.tid, t, pkt, conf, t.last_box,
+                        kind, "notice", t.tid, t, pkt, conf, t.last_box,
                         [f"极快模式：连续 {self._notice_streak[t.tid]} 帧检出烟"
                          f"（conf {conf:.2f}），尚未做蒸汽判别，需人工确认"]))
                     # notice 之后立刻送审：这才是"YOLO 第一轮可疑就交给 LLM"的地方。
                     # notice 已经让值班员看到画面了，LLM 的结果用来升级或压掉。
-                    self._defer("smoke", t.tid, t, pkt, conf, t.last_box,
+                    self._defer(kind, t.tid, t, pkt, conf, t.last_box,
                                 [f"极快模式第一轮可疑（conf {conf:.2f}）"])
 
             if v.label == "steam":
@@ -1095,9 +1095,9 @@ class Pipeline:
                     if self._can_notice(pkt.ts, t.last_box):
                         self.stats["steam_notices"] += 1
                         events.append(self._make_event(
-                            "smoke", "notice", t.tid, t, pkt, v.score, t.last_box,
+                            kind, "notice", t.tid, t, pkt, v.score, t.last_box,
                             ["规则层倾向判为蒸汽/水雾，已降级（不是排除）"] + list(v.reasons[:2])))
-                    self._defer("smoke", t.tid, t, pkt, v.score, t.last_box,
+                    self._defer(kind, t.tid, t, pkt, v.score, t.last_box,
                                 ["规则层倾向蒸汽，请复核"])
                 continue
             if v.label != "smoke" or v.score < cfg["smoke_conf"]:
@@ -1122,11 +1122,11 @@ class Pipeline:
                 self.stats["recheck_notices"] += 1
                 held = pkt.ts - self._dismissed[f"{pkt.cam_id}:{t.tid}"]
                 events.append(self._make_event(
-                    "smoke", "notice", t.tid, t, pkt, v.score, t.last_box,
+                    kind, "notice", t.tid, t, pkt, v.score, t.last_box,
                     [f"判为非火灾风险后仍持续 {held:.0f}s 未消散（共 {pkt.ts - t.first_t:.0f}s），"
                      f"请人工确认是否误判"] + list(v.reasons[:2])))
                 continue
-            if self._defer("smoke", t.tid, t, pkt, v.score, t.last_box, reasons):
+            if self._defer(kind, t.tid, t, pkt, v.score, t.last_box, reasons):
                 continue                  # 已送审，等 LLM 裁决再定级
             events.append(self._make_event("smoke", level, t.tid, t, pkt,
                                            v.score, t.last_box, reasons))

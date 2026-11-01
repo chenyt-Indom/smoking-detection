@@ -393,8 +393,13 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
   let evN = 0;
   const FB = {};
 
-  function levelCN(l){
-    return ({alarm:"火情", warning:"烟情", notice:"待确认", cleared:"已排除"})[l] || l || "";
+  function levelCN(l, kind){
+    // 级别名要结合类别：同样是 warning，烟是"烟情"、香烟是"香烟"、火是"火情"。
+    // 之前只用 level 一个维度，导致香烟目标被显示成"烟情"。
+    const k = String(kind || "").toLowerCase();
+    if (l === "alarm")   return k === "cigarette" ? "香烟" : "火情";
+    if (l === "warning") return k === "cigarette" ? "香烟" : (k === "fire" ? "火情" : "烟情");
+    return ({notice:"待确认", cleared:"已排除"})[l] || l || "";
   }
   function esc(s){
     return String(s == null ? "" : s).replace(/[&<>"]/g,
@@ -414,7 +419,7 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
     const reasons = (e.reasons || []).slice(0, 2).join(" · ");
 
     let html = '<div class="ev-top">'
-      + '<span class="tag ' + (e.level || "notice") + '">' + levelCN(e.level) + '</span>'
+      + '<span class="tag ' + (e.level || "notice") + '">' + levelCN(e.level, e.kind) + '</span>'
       + '<span style="font-size:12px;font-weight:600">' + esc(kind) + '</span>'
       + '<span class="ev-time">' + esc(t) + '</span>'
       + '</div>'
