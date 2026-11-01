@@ -362,6 +362,13 @@ class Notifier:
                 kind_dir = str(rec.get("kind") or "fire").lower()
                 if kind_dir not in ("fire", "smoke"):
                     kind_dir = "fire"
+                # 目录按**事件类别**分，不能写死 fire。
+                # 原来所有样本都塞进 images/fire/，香烟和烟的样本混在里面，
+                # 重训时按目录取数据就会把香烟样本当火用 ——
+                # 用户的原话："注意样本对应的是烟而不是火"。
+                _k = str(rec.get("kind") or "fire").lower()
+                if _k not in ("fire", "smoke", "cigarette", "steam", "light"):
+                    _k = "fire"
                 base = self.report_dir / "positives" if vclass == "FN" else self.report_dir
                 img_dir = base / "images" / kind_dir
                 lbl_dir = base / "labels" / kind_dir

@@ -236,7 +236,9 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
 (function(){
   "use strict";
   const $ = id => document.getElementById(id);
-  const NAME_CN = {fire:"火", smoke:"烟"};
+  // 三个类别都要有中文名。原来只有 {fire:"火", smoke:"烟"}，
+  // cigarette 落到 `|| e.kind` 兜底，界面上直接显示英文 "cigarette"。
+  const NAME_CN = {fire:"火", smoke:"烟", cigarette:"香烟"};
 
   // 后端没给充值地址时的兜底（天翼云控制台）
   let RECHARGE_URL = "https://www.ctyun.cn/";

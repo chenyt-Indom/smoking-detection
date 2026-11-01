@@ -1445,7 +1445,15 @@ class Pipeline:
         # 它只回答"哪里有亮光"，亮光不会在 33ms 内出现又消失，
         # 逐帧跑纯属浪费 GIL —— 而 GIL 正是画面卡顿的元凶。
         self._ls_n = getattr(self, "_ls_n", 0) + 1
-        if cfg.get("lightspot", True) and self._ls_n % 2 == 0:
+        # 光感引擎**只对火有用** —— 它的职责是"这块亮的是不是灯"，
+        # 用来帮火模型排除灯具反光。香烟和烟不需要它：
+        # 香烟是细长实物、烟是白色羽流，都不靠"亮点"识别，
+        # 多画一堆光斑框只会把画面搞得更乱（用户的原话：
+        # "只有火需要，其余两个不用光感"）。
+        _has_fire = any(d.cls_name == "fire" for d in draw_dets)
+        if (cfg.get("lightspot", True)
+                and (_has_fire or not cfg.get("lightspot_only_fire", True))
+                and self._ls_n % 2 == 0):
             try:
                 from .lightspot import detect as _ls_detect
                 spots = _ls_detect(
