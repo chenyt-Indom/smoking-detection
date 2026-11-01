@@ -140,11 +140,15 @@ class Detector:
         # 送进 imgsz=960 只放大 1.5 倍 —— 一支 26x43 的香烟在切片里
         # 仍然只有 39x65，模型照样看不清。3x3 每块约 426x240，
         # 放大到 960 是 2.25 倍，香烟变成 58x97，这才进入"能认"的量级。
-        # 切片 imgsz 从 1280 回落到 1024：
-        # 实测 3x3 + 1280 时检测只有 11fps（cam_1 从 18 掉到 11），
-        # 追踪开始断续。1024 仍能把 3x3 的块放大 2.4x（426x240 -> 1024），
-        # 香烟约 62x103，够认；速度能回到 15 上下。
-        self.tile_imgsz = 1024
+        # ⚠️ 切片参数要和**训练时的尺度**对齐，否则模型学的是"16x26 的小白条"，
+        # 推理时看到的是"111x183 的大白条"，学到的特征用不上。
+        #
+        # 训练用 imgsz=960（整图），香烟在整图里约 20x32。
+        # 因此推理这边用 2x2 切片 + imgsz 960：
+        #     640x360 的块 -> 960，放大 1.5x -> 香烟 39x62
+        # 和训练的 20x32 在同一量级。原来 3x3+1024 会放大 4.27x（111x183），
+        # 与训练尺度差 5 倍以上，是"训练完反而更差"的隐藏原因。
+        self.tile_imgsz = 960
         self.slice_every = 3
         self._slice_n = 0
         self._slice_cache: list[Detection] = []
@@ -299,8 +303,8 @@ class Detector:
         self,
         image: np.ndarray,
         trigger_conf: float = 0.03,
-        tile_grid: int = 3,
-        overlap: float = 0.3,
+        tile_grid: int = 2,
+        overlap: float = 0.25,
     ) -> list[Detection]:
         """分级检测：先粗筛一帧，**只有粗筛出了东西才切片**。
 
@@ -325,8 +329,23 @@ class Detector:
         """
         h, w = image.shape[:2]
         coarse = self._predict(image, conf=trigger_conf)
-        if not coarse:
-            return []                  # 一片空白：不切片，这是快路径
+
+        # ⚠️ **不再因为粗筛为空就跳过切片** —— 这是个死循环。
+        #
+        # 原来的逻辑：整图粗筛没东西 -> 不切片 -> 返回空。
+        # 但实测（同一帧、同一模型）：
+        #     整图  1 块   检出 0 个
+        #     2x2   4 块   检出 6 个（fire 5, smoke 1）
+        #     3x3   9 块   检出 13 个（smoke 8, fire 5）
+        # **整图对香烟和小火苗完全无效**（目标只有 20~40px，缩到 960 后
+        # 和噪点没区别）。而恰恰是这种帧，粗筛给的是"0 个"而不是"低分"，
+        # 于是永远走快路径、永远不切片、永远检不出 ——
+        # 这就是用户说的"很多细节 yolo 没有去主动识别"。
+        #
+        # 现在：粗筛只用来提供"整图那一路的检出"（有火/大目标时有用），
+        # **不再作为切片的前置条件**。切片该跑就跑。
+        if coarse is None:
+            coarse = []
 
         crops: list[np.ndarray] = []
         offs: list[tuple[int, int]] = []
