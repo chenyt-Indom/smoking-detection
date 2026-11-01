@@ -2,5 +2,6 @@
   "camera": 0,
   "port": 5050,
   "llm": "auto",
-  "host": "127.0.0.1"
+  "host": "127.0.0.1",
+  "multi": true
 }

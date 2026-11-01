@@ -116,19 +116,37 @@ def main() -> int:
         input("按回车退出…")
         return 1
 
-    script = PROJECT / "scripts" / "run_watch.py"
+    # ⚠️ 默认跑**双路** run_multi.py，不是单路 run_watch.py。
+    #
+    # 原来这里写死 run_watch.py + camera 0，结果是：桌面图标启动后
+    # 只看外接那颗 640x480 的摄像头，而香烟在 640x480 里只有十几像素
+    # （实测 cam_0 的检测结果恒为 0 个），用户看到的就是"怎么调都一样"。
+    # 真正能检出香烟的是内置那颗 1280x720（cam_1）。
+    #
+    # launcher.json 里加 "multi": false 可以退回单路模式。
+    use_multi = bool(cfg.get("multi", True))
+    if use_multi:
+        script = PROJECT / "scripts" / "run_multi.py"
+        cmd = [py, "-u", str(script),
+               "--llm", str(cfg["llm"]),
+               "--port", str(port),
+               "--host", str(cfg["host"])]
+        mode_txt = "双路（cam_0 外接 + cam_1 内置）"
+    else:
+        script = PROJECT / "scripts" / "run_watch.py"
+        cmd = [py, "-u", str(script),
+               "--camera", str(cfg["camera"]),
+               "--llm", str(cfg["llm"]),
+               "--port", str(port),
+               "--host", str(cfg["host"])]
+        mode_txt = f"单路（cam {cfg['camera']}）"
     if not script.is_file():
         print(f"[x] 找不到主程序：{script}")
         input("按回车退出…")
         return 1
-
-    cmd = [py, "-u", str(script),
-           "--camera", str(cfg["camera"]),
-           "--llm", str(cfg["llm"]),
-           "--port", str(port),
-           "--host", str(cfg["host"])]
     print(f"解释器 : {py}")
-    print(f"摄像头 : {cfg['camera']}   大模型: {cfg['llm']}   端口: {port}")
+    print(f"模式   : {mode_txt}")
+    print(f"大模型 : {cfg['llm']}   端口: {port}")
     print("-" * 56)
 
     env = dict(os.environ)
