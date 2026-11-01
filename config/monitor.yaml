@@ -87,8 +87,9 @@ thresholds:
   hot_conf_smoke: 0.75
 
   # 连续命中帧数：确认"稳定存在"，不是闪一下
-  fire_confirm: 6     # 5 -> 6
-  smoke_confirm: 3    # 2 -> 3
+  fire_confirm: 8     # 连续 8 帧（约 0.3~0.4 秒）才报，滤掉瞬时闪光
+  smoke_confirm: 8    # 连续 8 帧才报。原来只有 2~3 帧，烟最容易刷屏
+  cigarette_confirm: 8  # 香烟同样是 8 帧，三类统一
 
   # 告警去重（同一块地方不重复报，防轨迹断裂后重报）
   cooldown_sec: 60.0  # 30 -> 60

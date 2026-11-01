@@ -419,6 +419,37 @@ def test_cigarette_confirm_frames() -> None:
         check(FAIL, "香烟检测门限", f"{tc} 太低，全是噪声")
 
 
+
+def test_confirm_frames_all() -> None:
+    """三类目标的确认帧数都不能太低，否则会刷屏。
+
+    用户要求："火和烟也不能说时刻上报，还是要帧数不能太低的。"
+
+    注意要读**合并后**的配置（monitor.yaml 会覆盖代码里的 DEFAULTS）。
+    第一次改的时候只改了 DEFAULTS，yaml 里还留着 fire_confirm:6 /
+    smoke_confirm:3，白改一场 —— 所以这项检查必须走真实合并结果。
+    """
+    import yaml
+    cfg_file = ROOT / "config" / "monitor.yaml"
+    y = (yaml.safe_load(cfg_file.read_text(encoding="utf-8")) or {}).get("thresholds", {})
+    sys.path.insert(0, str(ROOT))
+    from src.pipeline import DEFAULTS
+    merged = dict(DEFAULTS)
+    merged.update(y or {})
+
+    bad = []
+    for k in ("fire_confirm", "smoke_confirm", "cigarette_confirm"):
+        n = int(merged.get(k, 0))
+        if n < 5:
+            bad.append(f"{k}={n}")
+    if bad:
+        check(FAIL, "确认帧数（合并后）", "过低 -> " + ", ".join(bad))
+    else:
+        vals = " ".join(f"{k.split('_')[0]}={int(merged[k])}"
+                        for k in ("fire_confirm", "smoke_confirm", "cigarette_confirm"))
+        check(OK, "确认帧数（合并后）", f"{vals}，三类都不低于 5 帧")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -437,6 +468,7 @@ def main() -> int:
     test_llm_label_wins()
     test_cigarette_gate()
     test_cigarette_confirm_frames()
+    test_confirm_frames_all()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")
