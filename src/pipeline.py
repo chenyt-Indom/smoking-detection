@@ -179,7 +179,7 @@ DEFAULTS = {
     # 刚好卡在这条线附近被当噪点丢掉。降到 0.00008（约 6x8）给小火留余地，
     # 真正的像素噪声由后面的 LLM 和连续帧确认来兜。
     "min_box_pct": 0.00003,
-    "snapshot_margin": 0.45,   # 截图外扩比例（0.25 -> 0.45，多带一点周边环境）
+    "snapshot_margin": 0.85,   # 截图外扩比例（0.45 -> 0.85，烟雾/小火苗必须带周边才能判）
     # ROI 最小边长：框太小（比如 30x30 的火苗）时按比例扩到这个尺寸再裁，
     # 否则模型只能看到一个色块，判断不了它在人脸/墙面/半空中
     "snapshot_min_side": 220,
@@ -414,6 +414,10 @@ class Pipeline:
         self._recent_alarms: list[tuple[float, str, tuple, int]] = []   # (t, kind, box, tid)
         self._recent_notices: list[tuple[float, tuple]] = []             # (t, box)
         self._pending: dict[str, _Pending] = {}    # key=cam:tid → 等裁决的目标
+        # 被"合并送审"的轨迹：tid -> 时间戳。
+        # 同一位置出现多个类别的框时，只把其中一条送给 LLM，其余记在这里
+        # 表示"已经一起看过了"，避免同一块地方被送两次、判出两个矛盾结论。
+        self._peer_suppressed: dict[int, float] = {}
         self._arbiter_done: dict[str, float] = {}  # key → 裁判给出结论的流内时刻
         self._dismissed: dict[str, float] = {}     # key → 被判"非风险"的时刻（只这些才复核）
         self._recent: deque = deque(maxlen=8)   # 给 VLM 复核用的近几帧
@@ -743,6 +747,14 @@ class Pipeline:
         """
         if self.arbiter is None:
             return False
+
+        # 已经被"合并送审"带走了 —— 不要再单独送一次
+        _ps = self._peer_suppressed.get(tid)
+        if _ps is not None and (pkt.ts - _ps) < 3.0:
+            return True
+        if _ps is not None:
+            self._peer_suppressed.pop(tid, None)     # 过期清理
+
         key = f"{pkt.cam_id}:{tid}"
         if key in self._pending:              # 已在等裁决，别重复提交
             return True
@@ -761,6 +773,33 @@ class Pipeline:
         if score < high_bypass and self._region_muted(pkt.cam_id, box_n, pkt.ts):
             self._count_saved(tid)
             return True
+
+        # ⓪ 同位置多类别：合并成一次送审
+        #
+        # 主模型会把白色香烟误检成 fire，香烟模型又会单独出一个 cigarette，
+        # 两条轨迹框在同一块地方。如果各送一次，LLM 会看到两张几乎一样的图、
+        # 分别判成"火"和"香烟"，业务上就成了自相矛盾的两个结论。
+        # 合并一次送审、把两个类别都摆到它面前，它才能给出一个统一判断。
+        _peers = []
+        for _otid, _ot in getattr(self.tracker, "tracks", {}).items():
+            if _otid == tid or _ot.last_box is None or not _ot.samples:
+                continue
+            if _ot.cls_name == t.cls_name:
+                continue
+            if iou(box, _ot.last_box) > 0.35:
+                _peers.append(_ot)
+        if _peers:
+            _desc = "、".join(
+                f"{p.cls_name}（置信 {p.samples[-1].conf:.2f}）" for p in _peers
+            )
+            reasons = list(reasons) + [
+                f"⚠️ 同一位置另检出 {_desc}。这几个框高度重叠，很可能是"
+                f"**同一个物体被不同模型判成了不同类别**。请只给一个结论："
+                f"这到底是哪一种？（例如白色细长条端头有红点 = 香烟；"
+                f"手指上有会飘动的橙黄火苗 = 火；两者都有 = 各自判断）"
+            ]
+            for _p in _peers:
+                self._peer_suppressed[_p.tid] = pkt.ts
 
         # ① 固定光源预筛：纯本地、零成本。命中就交回规则层（最多到"待确认"），
         #    既不花钱，也不会把目标从屏幕上抹掉。

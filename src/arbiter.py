@@ -203,8 +203,19 @@ def _parse_json(text: str) -> dict | None:
         return None
 
 
-def _crop(image: np.ndarray, box, margin: float = 0.35) -> np.ndarray | None:
-    """按框裁图并外扩一点 —— 只看框内会丢掉"周围是什么环境"这个最强线索。"""
+def _crop(image: np.ndarray, box, margin: float = 0.85) -> np.ndarray | None:
+    """按框裁图并外扩 —— 只看框内会丢掉"周围是什么环境"这个最强线索。
+
+    为什么外扩到 0.85（框尺寸的 85%，接近一倍）
+    ------------------------------------------
+    烟雾是**向外扩散**的东西，只框住核心那一团完全看不出形态：
+    分不清是"烟在扩散"还是"一团静态白斑"。外扩近一倍后，
+    能看到烟从哪冒出来、往哪飘、边缘是硬的还是毛的 —— 这些才是
+    LLM 判断"烟 vs 蒸汽 vs 白墙斑点"的关键。
+
+    火苗同理：小火苗单独看只是一点橙色，加上周边才知道是打火机、
+    蜡烛还是灯罩反光。
+    """
     h, w = image.shape[:2]
     x1, y1, x2, y2 = [float(v) for v in box[:4]]
     bw, bh = max(1.0, x2 - x1), max(1.0, y2 - y1)

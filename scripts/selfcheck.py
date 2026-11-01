@@ -284,6 +284,30 @@ def test_small_target_no_split() -> None:
         check(FAIL, "小目标抖动不分裂", f"分裂出 {len(tids)} 条轨迹（应为 1）")
 
 
+
+def test_snapshot_and_merge() -> None:
+    """截图边距要够大 + 重叠框必须合并送审。
+
+    用户提出的两点：
+      · 截图框太小，烟雾扩散形态看不出来，LLM 无法判断
+      · 同一物体不同类别的框离得近时，不该分两次送给 LLM
+    """
+    src = (ROOT / "src" / "pipeline.py").read_text(encoding="utf-8")
+    import re
+    m = re.search(r'"snapshot_margin":\s*([0-9.]+)', src)
+    if m and float(m.group(1)) >= 0.8:
+        check(OK, "截图边距", f"外扩 {float(m.group(1)):.0%}，能看到烟雾扩散形态")
+    elif m:
+        check(FAIL, "截图边距", f"只有 {float(m.group(1)):.0%}，烟雾判断会失真")
+    else:
+        check(WARN, "截图边距", "未找到 snapshot_margin 配置")
+
+    if "_peer_suppressed" in src and "_peers" in src:
+        check(OK, "重叠框合并送审", "同位置多类别只送一次，LLM 统一判断")
+    else:
+        check(FAIL, "重叠框合并送审", "缺失，同一块地方会被送两次")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -297,6 +321,7 @@ def main() -> int:
     test_small_target_no_split()
     test_pipeline_attrs()
     test_filter_but_traceable()
+    test_snapshot_and_merge()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")
