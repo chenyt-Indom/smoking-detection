@@ -1365,7 +1365,7 @@ class Pipeline:
                         sx1, sy1, sx2, sy2 = sp["box"]
                         dup = False
                         for d in dets:
-                            dx1, dy1, dx2, dy2 = d.box
+                            dx1, dy1, dx2, dy2 = d.xyxy
                             ix = max(0.0, min(sx2, dx2) - max(sx1, dx1))
                             iy = max(0.0, min(sy2, dy2) - max(sy1, dy1))
                             inter = ix * iy
@@ -1376,15 +1376,27 @@ class Pipeline:
                                 break
                         if not dup:
                             kept.append(sp)
+                    # 限流：只画最大的 3 处。
+                    # 实测一帧能检出 25 处亮斑（顶灯、窗玻璃反光、屏幕、
+                    # 金属高光全都算）。全画出来等于把画面糊死 ——
+                    # 而光斑的信息量只有"这里有光"这一点，留最大的几处足够。
+                    kept.sort(key=lambda x: -x["area"])
+                    kept = kept[:int(cfg.get("lightspot_max_draw", 3))]
                     if kept:
                         draw_dets = list(dets) + [
                             Detection(cls_id=-1, cls_name=f"光:{sp['color']}",
-                                      conf=0.0, box=sp["box"])
+                                      conf=0.0, xyxy=sp["box"])
                             for sp in kept
                         ]
                         self.stats["lightspots"] = self.stats.get("lightspots", 0) + len(kept)
-            except Exception:                 # noqa: BLE001
-                pass                          # 光敏引擎坏了也绝不能拖垮主流程
+            except Exception as _e:           # noqa: BLE001
+                # 光敏引擎坏了不能拖垮主流程，但也**绝不能静默**。
+                # 之前这里写的是 bare pass，于是 `d.box` 这个属性名错误
+                # （Detection 的字段叫 xyxy）被吞了整整一版都没人发现 ——
+                # 光感引擎从上线到现在一次都没真正跑过。
+                self.stats["lightspot_err"] = self.stats.get("lightspot_err", 0) + 1
+                if self.stats["lightspot_err"] in (1, 100):     # 只打第一次和第 100 次
+                    print(f"[lightspot] 引擎异常：{type(_e).__name__}: {_e}", flush=True)
 
         return FrameResult(pkt.idx, pkt.ts, draw_dets, tracks, verdicts, events,
                            frozen=False, nearby=nearby_map)
