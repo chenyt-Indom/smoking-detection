@@ -1140,6 +1140,8 @@ class Pipeline:
         n = 0
         empty = 0
         last_res = None          # 最近一次检测结果，给跳过的帧复用
+        last_det_t = 0.0         # 上次真正跑检测的时刻
+        force_detect_s = 0.6     # 重复帧期间最多隔这么久强制重检一次
         last_idx = -1            # 上一帧的序号，用来识别"重复帧"
 
         while not source.closed:
@@ -1157,9 +1159,32 @@ class Pipeline:
                 continue
             empty = 0
 
-            # 重复帧直接跳过，不计数（独立采集线程在没新帧时会返回上一帧，
-            # 让重复帧参与 every 计数会让抽帧形同虚设）
+            # 重复帧（画面完全没变，摄像头不产新帧时的常态）：
+            # 不能一 continue 了事 —— 那会同时造成两个问题：
+            #   ① 静止的火苗永远轮不到检测。它一动就能出框、一停就消失，
+            #      用户看到的就是"小火苗不动就没框"，根子在这里。
+            #   ② 画面线程也拿不到新帧，前端会冻在最后一帧 —— 而那一帧
+            #      很可能是在目标出现之前画的，于是屏幕上什么都没有。
+            #
+            # 正确做法：画面照常推（用上一次的检测结果），
+            # 但每隔 force_detect_s 秒**强制重检一次**，保证静止目标也有机会出框。
             if pkt.idx == last_idx:
+                if on_frame is not None and last_res is not None:
+                    try:
+                        on_frame(pkt, last_res)
+                    except Exception:       # noqa: BLE001
+                        pass
+                if time.time() - last_det_t >= force_detect_s:
+                    res = self.process(pkt)
+                    last_det_t = time.time()
+                    last_res = res
+                    self._last_dets = res.dets
+                    for ev in res.events:
+                        all_events.append(ev)
+                        if not quiet:
+                            print(ev, flush=True)
+                        if on_event is not None:
+                            on_event(ev, res)
                 time.sleep(0.002)
                 continue
             last_idx = pkt.idx
@@ -1173,6 +1198,7 @@ class Pipeline:
                 if _dt_proc > 300:
                     print(f"[slow] 检测耗时 {_dt_proc:.0f}ms  frame={pkt.idx}", flush=True)
                 last_res = res
+                last_det_t = time.time()
                 self._last_dets = res.dets      # 给画面线程叠加用
                 self._det_ts.append(time.time())
                 if len(self._det_ts) >= 4:
