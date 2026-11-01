@@ -220,8 +220,12 @@ def full_view(image: np.ndarray, box, max_side: int = 800):
     x1, y1 = max(0, x1), max(0, y1)
     x2, y2 = min(w - 1, x2), min(h - 1, y2)
     if x2 > x1 and y2 > y1:
-        thick = max(2, int(max(h, w) / 320))
+        thick = max(3, int(max(h, w) / 260))
         cv2.rectangle(img, (x1, y1), (x2, y2), (48, 48, 235), thick)
+        # 框上标一句"看这里"，让审查的人和模型都一眼知道重点在哪
+        cv2.putText(img, "TARGET", (x1 + 4, max(18, y1 - 8)),
+                    cv2.FONT_HERSHEY_SIMPLEX, max(0.5, max(h, w) / 1400),
+                    (48, 48, 235), max(1, thick // 2), cv2.LINE_AA)
     scale = max_side / max(h, w)
     if scale < 1.0:
         img = cv2.resize(img, (max(1, int(w * scale)), max(1, int(h * scale))),

@@ -479,6 +479,42 @@ def test_json_parse() -> None:
         check(OK, "LLM 返回解析容错", f"{len(cases)} 种脏格式全部能解析")
 
 
+
+def test_ui_and_prompt_fixes() -> None:
+    """三个用户反馈点的守门检查。
+
+    一、JSON 截断必须能救回来
+       实测模型把 reason 写到一半就停（连右括号都没有），
+       原来直接判"不是合法 JSON"退回规则层，把香烟判成了火。
+    二、按钮文案按三类区分
+       原来只判 === "smoke"，香烟事件落进 else 分支，
+       明明是香烟却问"有火/无火"。
+    三、送审截图要标出检测框
+       不标框，模型得自己猜"让我看哪一块"。
+    """
+    sys.path.insert(0, str(ROOT))
+    from src.arbiter import _parse_json
+    trunc = ('{"label":"cigarette","risk":"low","confidence":0.62,'
+             '"reason":"手指夹白色细长条，无飘动火苗、无扩散烟')
+    r = _parse_json(trunc)
+    if r and r.get("label") == "cigarette":
+        check(OK, "JSON 截断可救回", "缺右括号也能解析出 label/confidence")
+    else:
+        check(FAIL, "JSON 截断可救回", "截断后解析失败，会退回规则层")
+
+    ui = (ROOT / "web" / "dashboard.html").read_text(encoding="utf-8")
+    if '"cigarette"' in ui and "有香烟" in ui:
+        check(OK, "按钮文案按类别", "香烟事件问「有香烟/无香烟」")
+    else:
+        check(FAIL, "按钮文案按类别", "香烟事件仍问「有火/无火」")
+
+    arb = (ROOT / "src" / "arbiter.py").read_text(encoding="utf-8")
+    if "mark: bool = True" in arb and "cv2.rectangle" in arb:
+        check(OK, "送审图标注框", "裁图上画出检测框，指明该看哪里")
+    else:
+        check(FAIL, "送审图标注框", "送审图没有框，模型容易看偏")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -499,6 +535,7 @@ def main() -> int:
     test_cigarette_confirm_frames()
     test_confirm_frames_all()
     test_json_parse()
+    test_ui_and_prompt_fixes()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")

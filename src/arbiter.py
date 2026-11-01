@@ -115,6 +115,7 @@ SYSTEM = (
     "  · 你看不清、或者看到了但没有把握 → uncertain\n"
     "  不要把'看清楚了但没危险'答成 uncertain，那会让系统一直请你复核。\n\n"
     "只输出一个 JSON，不要任何解释文字，不要 markdown 代码块：\n"
+    '"reason":"一句话，不超过 40 字",\n'
     '{"label":"fire|smoke|cigarette|steam|light|other|uncertain",'
     '"risk":"high|medium|low","confidence":0.0-1.0,'
     '"reason":"20字以内，必须指出画面里的具体依据"}'
@@ -209,16 +210,30 @@ def _parse_json(text: str) -> dict | None:
         if t.rstrip().endswith("```"):
             t = t.rstrip()[:-3]
     i, j = t.find("{"), t.rfind("}")
-    if i < 0 or j <= i:
+    if i < 0:
         return None
-    frag = t[i:j + 1]
+    # j <= i 说明**没有右括号** —— 这恰恰是「输出被截断」的典型形态
+    # （实测模型把 reason 写到一半就停，整串连 } 都没有）。
+    # 之前这里直接 return None，等于把本来能救回来的结果扔了。
+    # 现在改成取到末尾，后面再补全。
+    frag = t[i:j + 1] if j > i else t[i:]
     # 中文引号（模型偶尔把英文引号写成 “ ” ‘ ’）。
     # 用 chr() 而不是字面量，避免源码经过几层替换后转义失效。
     _cn = frag
     for _ch, _ascii in ((chr(0x201C), '"'), (chr(0x201D), '"'),
                         (chr(0x2018), "'"), (chr(0x2019), "'")):
         _cn = _cn.replace(_ch, _ascii)
-    for cand in (frag, _cn, re.sub(r",\s*([}\]])", r"\1", frag), _cn):
+    # 截断补全：实测模型有时把 reason 写到一半就停（返回
+    # '{"label":"cigarette",..."reason":"手指夹白色细长条，无飘动火苗、无扩散烟'
+    # —— 引号和右括号都没了）。这种情况完全可以救回来：
+    # 关键是 label/risk/confidence 已经完整，reason 缺个尾巴不影响判定。
+    _fix = frag
+    if _fix.count('"') % 2 == 1:      # 引号不成对 -> 末尾少一个
+        _fix += '"'
+    if not _fix.rstrip().endswith("}"):
+        _fix = _fix.rstrip() + "}"
+    for cand in (frag, _cn, _fix,
+                 re.sub(r",\s*([}\]])", r"\1", frag), _cn, _fix):
         try:
             d = json.loads(cand)
             return d if isinstance(d, dict) else None
@@ -227,7 +242,8 @@ def _parse_json(text: str) -> dict | None:
     return None
 
 
-def _crop(image: np.ndarray, box, margin: float = 0.85) -> np.ndarray | None:
+def _crop(image: np.ndarray, box, margin: float = 0.85,
+          mark: bool = True) -> np.ndarray | None:
     """按框裁图并外扩 —— 只看框内会丢掉"周围是什么环境"这个最强线索。
 
     为什么外扩到 0.85（框尺寸的 85%，接近一倍）
@@ -247,7 +263,19 @@ def _crop(image: np.ndarray, box, margin: float = 0.85) -> np.ndarray | None:
     y1 = int(max(0, y1 - margin * bh)); y2 = int(min(h, y2 + margin * bh))
     if x2 <= x1 or y2 <= y1:
         return None
-    return image[y1:y2, x1:x2].copy()
+    out = image[y1:y2, x1:x2].copy()
+    if mark:
+        # 在裁图上把检测框标出来。
+        # 用户的原话："截图能不能把整个画面都截下来，并且标注方框位置，
+        # 以便模型更好理解。" —— 不标框的话，模型得自己猜"你让我看哪一块"，
+        # 外扩 85% 之后画面里东西很多，很容易看偏。
+        bx1 = int(max(0, box[0] - x1)); by1 = int(max(0, box[1] - y1))
+        bx2 = int(min(out.shape[1] - 1, box[2] - x1))
+        by2 = int(min(out.shape[0] - 1, box[3] - y1))
+        if bx2 > bx1 and by2 > by1:
+            thick = max(2, int(max(out.shape[:2]) / 200))
+            cv2.rectangle(out, (bx1, by1), (bx2, by2), (0, 210, 255), thick)
+    return out
 
 
 # ---------------------------------------------------------------- 裁判

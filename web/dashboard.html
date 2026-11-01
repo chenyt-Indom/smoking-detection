@@ -440,9 +440,13 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
     }
     // 按事件类别给按钮文案：烟的事件问"有没有烟"，火的事件问"有没有火"。
     // 判定的本质是"画面里到底有没有这个东西"，用对的词人才不会点错。
-    const isSmoke = String(e.kind || "").toLowerCase() === "smoke";
-    const yesTxt = isSmoke ? "有烟" : "有火";
-    const noTxt  = isSmoke ? "无烟" : "无火";
+    // 三类各有各的问法。之前只判 === "smoke"，香烟事件落进了 else 分支，
+    // 于是明明是香烟却问"有火/无火" —— 用户点下去也不知道自己在答什么。
+    const _k = String(e.kind || "").toLowerCase();
+    const isCig = _k === "cigarette";
+    const isSmoke = _k === "smoke";
+    const yesTxt = isCig ? "有香烟" : (isSmoke ? "有烟" : "有火");
+    const noTxt  = isCig ? "无香烟" : (isSmoke ? "无烟" : "无火");
     html += '<div class="ev-actions">'
       + '<button class="btn btn-fire" data-fb="present">' + yesTxt + '</button>'
       + '<button class="btn btn-nofire" data-fb="absent">' + noTxt + '</button>'
