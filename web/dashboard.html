@@ -2,6 +2,9 @@
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
+<meta http-equiv="Cache-Control" content="no-store, no-cache, must-revalidate">
+<meta http-equiv="Pragma" content="no-cache">
+<meta http-equiv="Expires" content="0">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>火情烟雾智能监控</title>
 <style>
@@ -238,7 +241,10 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
   const $ = id => document.getElementById(id);
   // 三个类别都要有中文名。原来只有 {fire:"火", smoke:"烟"}，
   // cigarette 落到 `|| e.kind` 兜底，界面上直接显示英文 "cigarette"。
-  const NAME_CN = {fire:"火", smoke:"烟", cigarette:"香烟"};
+  // 构建时间：改过前端就更新这一行，用户看页面右上角就能确认是不是新版
+  const BUILD = "11-01 21:59";
+
+  const NAME_CN = {fire:"火", smoke:"烟雾", cigarette:"香烟"};
 
   // 后端没给充值地址时的兜底（天翼云控制台）
   let RECHARGE_URL = "https://www.ctyun.cn/";
@@ -447,8 +453,12 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
     const _k = String(e.kind || "").toLowerCase();
     const isCig = _k === "cigarette";
     const isSmoke = _k === "smoke";
-    const yesTxt = isCig ? "有香烟" : (isSmoke ? "有烟" : "有火");
-    const noTxt  = isCig ? "无香烟" : (isSmoke ? "无烟" : "无火");
+    // 三类各用完整词，绝不缩写：
+    //   香烟 -> 有香烟/无香烟（不能写"烟"，会和烟雾混）
+    //   烟雾 -> 有烟雾/无烟雾（不能写"烟"，会和香烟混）
+    //   火   -> 有火/无火
+    const yesTxt = isCig ? "有香烟" : (isSmoke ? "有烟雾" : "有火");
+    const noTxt  = isCig ? "无香烟" : (isSmoke ? "无烟雾" : "无火");
     html += '<div class="ev-actions">'
       + '<button class="btn btn-fire" data-fb="present">' + yesTxt + '</button>'
       + '<button class="btn btn-nofire" data-fb="absent">' + noTxt + '</button>'
@@ -633,5 +643,9 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
   pollLlm();
 })();
 </script>
+<div id="buildTag" style="position:fixed;right:8px;bottom:8px;z-index:9999;
+     font:11px/1.4 ui-monospace,monospace;color:#8a8fa3;background:rgba(0,0,0,.55);
+     padding:3px 7px;border-radius:5px;pointer-events:none"></div>
+<script>document.getElementById("buildTag").textContent="build " + BUILD;</script>
 </body>
 </html>

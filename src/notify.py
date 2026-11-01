@@ -445,7 +445,12 @@ class Notifier:
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
-                self.send_header("Cache-Control", "no-store")
+                # 三重防缓存。只写 no-store 时部分浏览器对主文档仍走内存缓存，
+                # 用户改了前端却一直看到旧页面（实测踩过好几次）。
+                self.send_header("Cache-Control",
+                                 "no-store, no-cache, must-revalidate, max-age=0")
+                self.send_header("Pragma", "no-cache")
+                self.send_header("Expires", "0")
                 for k, v in (extra or {}).items():
                     self.send_header(k, v)
                 self.end_headers()
