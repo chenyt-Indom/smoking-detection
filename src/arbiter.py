@@ -312,15 +312,34 @@ def _crop(image: np.ndarray, box, margin: float = 0.85,
     # 实测：一支 12x39 的香烟，按 85% 外扩后只有 22x72 —— 送进 LLM
     # 它只能看到"一小段白色"，判成 other（已排除）。用户截图里就是这个情况。
     # 改成按"最小可视边长"反推外扩比例：让短边至少到 MIN_SIDE。
-    MIN_SIDE = 220.0
+    MIN_SIDE = 160.0
     need = MIN_SIDE / max(1.0, min(bw, bh))
     margin = max(margin, (need - 1.0) / 2.0)
 
-    x1 = int(max(0, x1 - margin * bw)); x2 = int(min(w, x2 + margin * bw))
-    y1 = int(max(0, y1 - margin * bh)); y2 = int(min(h, y2 + margin * bh))
-    if x2 <= x1 or y2 <= y1:
+    # ⚠️ 关键：一边被画面边缘截断时，要把截掉的部分补到另一边，
+    # 否则目标会被推到角落 —— 用户截图里"细节图只有头发和脸、
+    # 打火机不在画面里"就是这么来的。
+    # 原写法 max(0, x1-pad) / min(w, x2+pad) 各自独立截断，
+    # 框靠边时中心就偏移了。
+    pad_x, pad_y = margin * bw, margin * bh
+    x1 -= pad_x; x2 += pad_x
+    y1 -= pad_y; y2 += pad_y
+    # 先按整数取，超界的部分稍后用**镜像填充**补上 ——
+    # 直接截断会把目标推到角落（实测贴左的目标质心落在 0.11 处），
+    # 镜像填充能保持目标居中，且视觉上不会引入突兀的黑边。
+    ix1, iy1 = int(np.floor(x1)), int(np.floor(y1))
+    ix2, iy2 = int(np.ceil(x2)), int(np.ceil(y2))
+    if ix2 <= ix1 or iy2 <= iy1:
         return None
-    out = image[y1:y2, x1:x2].copy()
+    pl, pt = max(0, -ix1), max(0, -iy1)
+    pr, pb = max(0, ix2 - w), max(0, iy2 - h)
+    sx1, sy1 = max(0, ix1), max(0, iy1)
+    sx2, sy2 = min(w, ix2), min(h, iy2)
+    if sx2 <= sx1 or sy2 <= sy1:
+        return None
+    out = image[sy1:sy2, sx1:sx2].copy()
+    if pl or pt or pr or pb:
+        out = cv2.copyMakeBorder(out, pt, pb, pl, pr, cv2.BORDER_REFLECT_101)
     if mark:
         # ⚠️ 默认**不画**。用户的原话："给LLM模型的图片不要加方框标注，
         # 不然会误导模型判断。"

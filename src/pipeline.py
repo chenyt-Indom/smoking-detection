@@ -1231,6 +1231,11 @@ class Pipeline:
                 # 5 帧能滤掉绝大部分瞬时噪声，对真烟完全无影响。
                 if self._smoke_streak[t.tid] < int(cfg.get("cigarette_confirm", 5)):
                     continue
+                # 只在**本帧确实匹配上**时送审。t.last_box 是轨迹最后的位置，
+                # 若这一帧 misses>0，last_box 就是旧坐标 —— 裁图会裁到目标
+                # 已经离开的地方（用户看到"细节图只有头发和脸，打火机不在画面里"）。
+                if t.misses != 0:
+                    continue
                 if self._defer(kind, t.tid, t, pkt, conf, t.last_box,
                                [f"连续 {self._smoke_streak[t.tid]} 帧检出香烟"
                                 f"（conf {conf:.2f}），请判断是香烟还是别的细长物体"]):
