@@ -1025,6 +1025,26 @@ class Pipeline:
                     continue
                 fire_reasons = [f"连续 {self._fire_streak[t.tid]} 帧检出火焰（conf {conf:.2f}）"]
 
+                # 附上"同一位置其他类别的检测"作为交叉证据。
+                #
+                # 主模型（fire_smoke）会把白色细长的香烟误检成 fire —— 这是
+                # 两个模型训练数据不同带来的必然重叠。此时香烟模型往往也在
+                # 同一位置给出 cigarette，但那是一条独立轨迹，LLM 原本看不到。
+                # 把这条客观事实告诉它，让它自己综合判断，而不是由规则层
+                # 擅自把 fire 改成 cigarette。
+                for _d in dets:
+                    if _d.cls_name == t.cls_name:
+                        continue
+                    ix = max(0.0, min(_d.xyxy[2], t.last_box[2]) - max(_d.xyxy[0], t.last_box[0]))
+                    iy = max(0.0, min(_d.xyxy[3], t.last_box[3]) - max(_d.xyxy[1], t.last_box[1]))
+                    _inter = ix * iy
+                    _u = (_d.area + t.samples[-1].area - _inter)
+                    if _u > 0 and _inter / _u > 0.3:
+                        fire_reasons.append(
+                            f"⚠️ 同一位置另检出 {_d.cls_name}（conf {_d.conf:.2f}），"
+                            f"可能与火模型重复判定，请结合画面核对")
+                        break
+
                 fv = (judge_fire(extract_features(t.samples),
                                  area_px=t.samples[-1].area, thr=self.temporal_thr)
                       if cfg["flicker_gate"] else None)
