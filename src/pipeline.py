@@ -458,6 +458,10 @@ class Pipeline:
         n = (cls_name or "").lower()
         if "fire" in n or "flame" in n:
             return "fire"
+        # 香烟单独成一类：它有自己的模型、自己的阈值，
+        # 但判定流程完全沿用烟的那套（时序 + LLM），不另起一套逻辑。
+        if "cig" in n or "tobacco" in n:
+            return "cigarette"
         if "smoke" in n:
             return "smoke"
         return "fire" if cls_id == 0 else "smoke"

@@ -209,8 +209,23 @@ def main() -> int:
 
     # ── 共享检测器：整机只有一份模型 ──
     print(f"\n加载模型 {WEIGHTS.name} ...", flush=True)
+    # 香烟模型（可选）：和主模型是两份权重，分开推理后合并结果
+    extra_w = det_cfg.get("extra_weights") or ""
+    extra_path = None
+    if extra_w:
+        cand = Path(extra_w)
+        if not cand.is_absolute():
+            cand = WEIGHTS.parent.parent / extra_w      # 相对仓库根目录
+        if cand.is_file():
+            extra_path = str(cand)
+            print(f"加载香烟模型 {cand.name} ...", flush=True)
+        else:
+            print(f"[warn] 香烟模型不存在，跳过：{cand}", flush=True)
+
     detector = Detector(str(WEIGHTS), conf=float(thr.get("det_conf", 0.20)),
-                        imgsz=int(det_cfg.get("imgsz", 640)), device=0)
+                        imgsz=int(det_cfg.get("imgsz", 640)), device=0,
+                        extra_weights=extra_path,
+                        extra_conf=float(thr.get("cigarette_conf", 0.20)))
 
     # ── LLM 裁判（全局共享，各路共用同一个配额与去重表）──
     arb = None

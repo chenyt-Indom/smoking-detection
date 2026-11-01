@@ -98,6 +98,8 @@ class Detector:
         imgsz: int = 896,
         device: str | int = 0,
         classes: Sequence[int] | None = None,
+        extra_weights: str | None = None,
+        extra_conf: float | None = None,
     ) -> None:
         from ultralytics import YOLO  # 延迟导入：只做标注审计时不必装 ultralytics
 
@@ -108,6 +110,12 @@ class Detector:
         self.imgsz = imgsz
         self.device = device
         self.classes = list(classes) if classes is not None else None
+        # 第二个模型（香烟）：与主模型分开推理，结果在 detect 里合并。
+        # 香烟本体和明火是两套完全不同的训练数据，硬合成一个模型
+        # 会互相干扰、两边精度都掉。
+        self.extra = YOLO(extra_weights) if extra_weights else None
+        self.extra_names = self.extra.names if self.extra else {}
+        self.extra_conf = float(extra_conf if extra_conf is not None else conf)
 
     # ---------------------------------------------------------------- 内部
     def _predict(self, img: np.ndarray, offset: tuple[int, int] = (0, 0),
@@ -123,6 +131,30 @@ class Detector:
             cid = int(b.cls)
             out.append(Detection(cid, self.names[cid], float(b.conf),
                                  (x1 + ox, y1 + oy, x2 + ox, y2 + oy)))
+        return out
+
+    def _predict_extra(self, image: np.ndarray) -> list[Detection]:
+        """第二个模型（香烟）跑一遍整图。
+
+        为什么不走切片：香烟目标比火焰还小，切片确实能提召回，但每帧再多
+        4 次前向，双路会直接掉到 8fps 以下。这里只跑整图 + 放宽门限(extra_conf)
+        来补召回，帧率代价约 +10ms/帧。
+        """
+        if self.extra is None:
+            return []
+        try:
+            r = self.extra.predict(
+                image, imgsz=self.imgsz, conf=self.extra_conf,
+                iou=self.iou, device=self.device, verbose=False,
+            )[0]
+        except Exception:                     # noqa: BLE001
+            return []
+        out = []
+        for b in r.boxes:
+            x1, y1, x2, y2 = b.xyxy[0].tolist()
+            cid = int(b.cls)
+            out.append(Detection(cid, self.extra_names.get(cid, "cigarette"),
+                                 float(b.conf), (x1, y1, x2, y2)))
         return out
 
     def _predict_batch(self, imgs: list[np.ndarray],
@@ -205,7 +237,7 @@ class Detector:
         dets: list[Detection] = []
         for crop, off in zip(crops, offs):
             dets.extend(self._predict(crop, offset=off))
-        return nms(dets, self.iou)
+        return nms(dets + self._predict_extra(image), self.iou)
 
     def detect_auto(
         self,
@@ -250,4 +282,7 @@ class Detector:
             offs.append((x0, y0))
         # 粗筛那一帧就是"整图"那一路，别重复跑
         kept = [d for d in coarse if d.conf >= self.conf]
-        return nms(kept + self._predict_batch(crops, offs), self.iou)
+        # 叠上香烟模型的独立结果：它和火焰/烟雾是两个模型，
+        # 各自的门限、各自的类别名，最后一起 NMS 去重。
+        dets = kept + self._predict_batch(crops, offs) + self._predict_extra(image)
+        return nms(dets, self.iou)
