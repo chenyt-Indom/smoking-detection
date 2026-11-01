@@ -28,24 +28,24 @@ import cv2
 import numpy as np
 
 # 类别 → 框颜色（BGR）。0=fire 1=smoke，与 dataset.yaml 一致
+# 颜色只表达"是什么"，不再表达"有多确定"。
+#
+# 之前用红/黄区分置信度档位，问题是：同一种目标在不同置信下会变色，
+# 看起来像换了个东西；而且黄红都在抢注意力，反而分不出类别。
+# 现在按用户要求改成固定四色：
+#   灰 = 未达阈值（只是看到了，不作主张）
+#   红 = 火（达阈值）
+#   黄 = 烟（达阈值）
+#   蓝 = 香烟（达阈值）
 COLORS = {
-    0: (48, 48, 235),      # 红：火（达到告警阈值）
-    1: (40, 165, 255),     # 橙：烟（达到告警阈值）
+    0: (48, 48, 235),      # 红：火
+    1: (0, 215, 255),      # 黄：烟
 }
-# 未达告警阈值的候选框统一用**灰色**。
-# 语义：系统在画面里"注意到"了这块区域，但置信度还不够，不作任何主张。
-# 这样颜色只承担一件事 —— 红/橙才代表系统认为有风险，灰只是"我看到了"。
-# 早期候选也用黄色，结果满屏都是抢眼的黄框，等于没有优先级。
-# 未达阈值的候选框统一用灰色。
-# 语义单一：灰 = 系统"看到"了这块区域，但置信度不够，不作任何主张。
-# 之前短暂用过暗红/暗橙（想保留类别信息），但那会让画面颜色过载 ——
-# 阈值降到 0.35 之后真火基本都能进黄/红档，灰色留给真正的噪声就够了。
-CAND_COLORS = {
-    0: (150, 150, 150),
-    1: (150, 150, 150),
-}
-WARM_COLOR = (0, 210, 255)         # 黄：刚过阈值，疑似（还要 LLM 复核）
-WARM_COLORS = {0: WARM_COLOR, 1: WARM_COLOR}
+# 香烟单独一色：蓝。它是独立类别（自己的模型、自己的门限），
+# 视觉上也要能一眼和"烟情"分开 —— 很多场景里烟和香烟会同时出现。
+CIG_COLOR = (235, 140, 40)     # 蓝（BGR）
+CAND_COLOR = (150, 150, 150)   # 灰：未达阈值
+CAND_COLORS = {0: CAND_COLOR, 1: CAND_COLOR}
 DEFAULT_COLOR = (190, 190, 190)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
@@ -167,14 +167,16 @@ class LiveView:
 
             cid = int(getattr(d, "cls_id", -1))
             conf = float(getattr(d, "conf", 0.0))
-            alarm_thr = self.alarm_confs.get(cid, 0.45)
-            hot_thr = self.hot_confs.get(cid, 0.70)
-            if conf >= hot_thr:
-                color, thick, suffix = COLORS.get(cid, DEFAULT_COLOR), 2, ""
-            elif conf >= alarm_thr:
-                color, thick, suffix = WARM_COLORS.get(cid, WARM_COLOR), 2, " ?"
+            alarm_thr = self.alarm_confs.get(cid, 0.25)
+            # 颜色只由「类别 + 是否达阈值」决定，不再分置信度档位
+            if conf >= alarm_thr:
+                if "cig" in str(getattr(d, "cls_name", "")).lower():
+                    color = CIG_COLOR
+                else:
+                    color = COLORS.get(cid, DEFAULT_COLOR)
+                thick, suffix = 2, ""
             else:
-                color, thick, suffix = CAND_COLORS.get(cid, DEFAULT_COLOR), 1, " ?"
+                color, thick, suffix = CAND_COLOR, 1, " ?"
             cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
 
             name = str(getattr(d, "cls_name", "obj")).upper()

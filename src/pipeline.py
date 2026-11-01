@@ -1136,7 +1136,22 @@ class Pipeline:
         # 只加进返回给画面的 dets，**不参与追踪、不参与判定**。
         # 它的语义是"这里有团光，但我不知道是什么"，所以一律灰框、
         # 置信度为 0，绝不允许它触发任何告警路径。
-        draw_dets = dets
+        # 画框用 **tracks 的 last_box**，不用原始 dets。
+        #
+        # 原始检测框每帧都在抖（YOLO 的回归本身就有几个像素的抖动，加上
+        # 框大小变化，视觉上就是"一闪一闪"）。而 Track.last_box 是经过
+        # Kalman 平滑的，位置连续、尺寸稳定 —— 用户要的"框稳定、平滑"
+        # 本来就已经算好了，只是之前画的是原始框没用上。
+        #
+        # 顺带一个好处：轨迹有 coasting，目标被短暂遮挡时框不会立刻消失。
+        draw_dets: list[Detection] = []
+        for _t in tracks:
+            if _t.last_box is None or not _t.samples:
+                continue
+            draw_dets.append(Detection(_t.cls_id, _t.cls_name,
+                                       float(_t.samples[-1].conf), _t.last_box))
+        if not draw_dets:
+            draw_dets = dets        # 追踪还没起来时退回原始框
         if cfg.get("lightspot", True):
             try:
                 from .lightspot import detect as _ls_detect
