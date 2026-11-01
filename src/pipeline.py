@@ -67,7 +67,8 @@ DEFAULTS = {
     # 判"抖不抖"至少需要 4 个帧间差分（=5 帧）。3 帧时算不出，闸等于不存在。
     # 代价是 0.12s → 0.20s（25fps），对火灾尺度无关紧要。
     "fire_confirm": 5,
-    "smoke_confirm": 2,        # 烟：时序判为 smoke 后再连续几帧坐实
+    "smoke_confirm": 2,
+    "cigarette_confirm": 5,    # 香烟连续几帧才送审（抽烟是持续行为，瞬时的都是噪声）
 
     # ── 极快模式（烟跳过时序判别）──────────────────────────
     # 白烟和蒸汽在**单帧**上同色同形，要分开必须观察一段时间 —— 这是物理事实，
@@ -1182,8 +1183,13 @@ class Pipeline:
                     self._smoke_streak[t.tid] = 0
                     continue
                 self._smoke_streak[t.tid] = self._smoke_streak.get(t.tid, 0) + 1
-                # 连续 2 帧坐实就送审（和烟一致），避免单帧噪声
-                if self._smoke_streak[t.tid] < 2:
+                # 连续帧数门槛：从 2 提到 5（约 0.3~0.5 秒）。
+                #
+                # 原来 2 帧就送审，于是 conf 0.03（正好卡在检测门槛上的噪声）
+                # 也会弹出"待确认"，而截图里那帧根本没有香烟 —— 只是人脸和马赛克。
+                # 抽烟是**持续行为**：真烟至少会亮几秒，不可能只存在 0.1 秒。
+                # 5 帧能滤掉绝大部分瞬时噪声，对真烟完全无影响。
+                if self._smoke_streak[t.tid] < int(cfg.get("cigarette_confirm", 5)):
                     continue
                 if self._defer(kind, t.tid, t, pkt, conf, t.last_box,
                                [f"连续 {self._smoke_streak[t.tid]} 帧检出香烟"

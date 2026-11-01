@@ -393,6 +393,32 @@ def test_cigarette_gate() -> None:
         check(FAIL, "香烟置信度闸门", "香烟仍在用通用门槛，会被 0.50 挡住")
 
 
+
+def test_cigarette_confirm_frames() -> None:
+    """香烟必须有足够的连续帧门槛，否则瞬时噪声会刷屏。
+
+    用户截图：一个只有人脸和马赛克的画面，conf 0.03（正好卡在检测门槛），
+    2 帧就弹了"待确认"。抽烟是持续行为，瞬间的不可能是真烟。
+    """
+    src = (ROOT / "src" / "pipeline.py").read_text(encoding="utf-8")
+    import re
+    m = re.search(r'"cigarette_confirm":\s*(\d+)', src)
+    n = int(m.group(1)) if m else 0
+    if n >= 5:
+        check(OK, "香烟确认帧数", f"连续 {n} 帧才送审（约 0.3~0.5 秒），滤掉瞬时噪声")
+    else:
+        check(FAIL, "香烟确认帧数", f"只有 {n} 帧，太容易被噪声触发")
+
+    cfg = (ROOT / "config" / "monitor.yaml").read_text(encoding="utf-8")
+    import yaml
+    c = yaml.safe_load(cfg) or {}
+    tc = float((c.get("thresholds") or {}).get("cigarette_conf", 0))
+    if tc >= 0.06:
+        check(OK, "香烟检测门限", f"{tc} 已离开噪声区")
+    else:
+        check(FAIL, "香烟检测门限", f"{tc} 太低，全是噪声")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -410,6 +436,7 @@ def main() -> int:
     test_cigarette_reaches_llm()
     test_llm_label_wins()
     test_cigarette_gate()
+    test_cigarette_confirm_frames()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")
