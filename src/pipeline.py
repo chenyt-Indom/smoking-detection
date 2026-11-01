@@ -1366,6 +1366,45 @@ class Pipeline:
             draw_dets.append(Detection(_t.cls_id, _t.cls_name,
                                        float(_t.samples[-1].conf), _t.last_box))
 
+        # ── 细长物候选通道（补充）────────────────────────────
+        # 香烟模型对非标准形态（通体白色、一端尖锐、竖直举着）响应很低，
+        # 这条通道用几何特征把它捞出来：细长、浅色、有明确边界。
+        # **只做检索，不做判定** —— 框出来的东西只是"候选"，
+        # 全部画成灰框，由人看、或者由 LLM 在送审时裁决。
+        if cfg.get("cigshape", True):
+            self._cs_n = getattr(self, "_cs_n", 0) + 1
+            if self._cs_n % 2 == 0:
+                try:
+                    from .cigshape import detect as _cs_detect
+                    cands = _cs_detect(
+                        pkt.image,
+                        min_len=int(cfg.get("cigshape_min_len", 25)),
+                        aspect_min=float(cfg.get("cigshape_aspect_min", 3.0)),
+                        max_area_pct=float(cfg.get("cigshape_max_area_pct", 0.03)),
+                        max_keep=int(cfg.get("cigshape_max_keep", 3)),
+                    )
+                    for _b, _tag in cands:
+                        sx1, sy1, sx2, sy2 = _b
+                        # 与已有框重叠的跳过
+                        _dup = False
+                        for _d in draw_dets:
+                            dx1, dy1, dx2, dy2 = _d.xyxy
+                            _ix = max(0.0, min(sx2, dx2) - max(sx1, dx1))
+                            _iy = max(0.0, min(sy2, dy2) - max(sy1, dy1))
+                            _u = ((sx2 - sx1) * (sy2 - sy1)
+                                  + (dx2 - dx1) * (dy2 - dy1) - _ix * _iy)
+                            if _u > 0 and (_ix * _iy) / _u > 0.3:
+                                _dup = True
+                                break
+                        if not _dup:
+                            draw_dets.append(Detection(cls_id=-2, cls_name=f"候选:{_tag}",
+                                                       conf=0.0, xyxy=_b))
+                            self.stats["cigshape"] = self.stats.get("cigshape", 0) + 1
+                except Exception as _e:           # noqa: BLE001
+                    self.stats["cigshape_err"] = self.stats.get("cigshape_err", 0) + 1
+                    if self.stats["cigshape_err"] in (1, 100):
+                        print(f"[cigshape] 异常：{type(_e).__name__}: {_e}", flush=True)
+
         # 光敏引擎降频：每 2 帧跑一次。
         # 它只回答"哪里有亮光"，亮光不会在 33ms 内出现又消失，
         # 逐帧跑纯属浪费 GIL —— 而 GIL 正是画面卡顿的元凶。

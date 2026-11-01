@@ -37,15 +37,24 @@ def _elongated_candidates(mask: np.ndarray, min_len: int, max_area_pct: float,
                           aspect_min: float):
     """从二值掩码里找细长连通域。"""
     h, w = mask.shape[:2]
-    n, _labels, stats, _cent = cv2.connectedComponentsWithStats(mask, 8)
+    n, labels, stats, _cent = cv2.connectedComponentsWithStats(mask, 8)
     out = []
     max_area = h * w * max_area_pct
     for i in range(1, n):
         x, y, bw, bh, area = (int(v) for v in stats[i])
         if area < 30 or area > max_area:
             continue
-        long_side = max(bw, bh)
-        short_side = max(1, min(bw, bh))
+        # ⚠️ 长宽比必须用**最小外接矩形**算，不能用 bbox。
+        # 香烟通常是**斜着拿的**：一根 20px 粗、160px 长的斜烟，
+        # 它的 bbox 可能是 120x110 —— 比值只有 1.1，直接被筛掉。
+        # 用户现场那根就是这样：bbox 143x88（比值 1.6），
+        # 但用最小外接矩形量出来是 168x20（比值 8.4），明显是细长物。
+        comp = (labels[y:y + bh, x:x + bw] == i).astype(np.uint8)
+        pts = cv2.findNonZero(comp)
+        if pts is None:
+            continue
+        (_, _), (rw, rh), _ = cv2.minAreaRect(pts)
+        long_side, short_side = max(rw, rh), max(1.0, min(rw, rh))
         if long_side < min_len:
             continue
         if long_side / short_side < aspect_min:
@@ -71,9 +80,14 @@ def detect(image: np.ndarray, *, min_len: int = 25, aspect_min: float = 3.0,
     found: list[tuple[tuple, str]] = []
 
     # ① 白色细长条：低饱和 + 高亮度。香烟本体就是这种。
-    white = cv2.inRange(hsv, (0, 0, 130), (180, 70, 255))
-    k = cv2.getStructuringElement(cv2.MORPH_RECT, (3, 3))
-    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, k, iterations=2)
+    # 实测用户现场那根烟：V≈140、S≈80~100 —— 不是纯白，是"灰白"。
+    # 原来的 S<=70 直接把它筛掉了。放宽到 S<=135、V>=105。
+    white = cv2.inRange(hsv, (0, 0, 105), (180, 135, 255))
+    # 核要小、迭代要少：实测 3x3 迭代 2 次会把细长的香烟和旁边的
+    # 手臂/衣服一起聚类成一个大块，长宽比立刻降到 3 以下，反而被筛掉。
+    # 2x2 迭代 1 次足够把被 JPEG 压缩断开的细条接上。
+    k = cv2.getStructuringElement(cv2.MORPH_RECT, (2, 2))
+    white = cv2.morphologyEx(white, cv2.MORPH_CLOSE, k, iterations=1)
     for b in _elongated_candidates(white, min_len, max_area_pct, aspect_min):
         found.append((b, "白色细长"))
 
