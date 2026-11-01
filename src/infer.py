@@ -61,11 +61,17 @@ def iou(a: Sequence[float], b: Sequence[float]) -> float:
 
 
 def nms(dets: Iterable[Detection], iou_thr: float = 0.5) -> list[Detection]:
-    """按类别做贪心 NMS（不同类之间不抑制：烟里的火不该被烟框吃掉）。"""
+    """按类别做贪心 NMS（不同类之间不抑制：烟里的火不该被烟框吃掉）。
+
+    ⚠️ 分组用**类名**而不是 cls_id。
+    主模型是 {0: fire, 1: smoke}，香烟模型是 {0: cigarette} —— 两者的 0 是
+    不同的东西。按 id 分组会把"火"和"香烟"塞进同一组互相抑制，
+    同一处既着火又有烟时会凭空删掉一个框。按类名分组才正确。
+    """
     out: list[Detection] = []
-    by_cls: dict[int, list[Detection]] = {}
+    by_cls: dict[str, list[Detection]] = {}
     for d in dets:
-        by_cls.setdefault(d.cls_id, []).append(d)
+        by_cls.setdefault(str(d.cls_name).lower(), []).append(d)
     for _, group in by_cls.items():
         group = sorted(group, key=lambda d: -d.conf)
         keep: list[Detection] = []
@@ -94,7 +100,7 @@ class Detector:
         self,
         weights: str,
         conf: float = 0.35,
-        iou: float = 0.5,
+        iou: float = 0.45,
         imgsz: int = 896,
         device: str | int = 0,
         classes: Sequence[int] | None = None,
@@ -246,7 +252,7 @@ class Detector:
         h, w = image.shape[:2]
 
         if not sliced:
-            return nms(self._predict(image), self.iou)
+            return nms(self._predict(image), 0.25)
 
         crops: list[np.ndarray] = []
         offs: list[tuple[int, int]] = []
@@ -261,12 +267,12 @@ class Detector:
             offs.append((x0, y0))
 
         if batched:
-            return nms(self._predict_batch(crops, offs), self.iou)
+            return nms(self._predict_batch(crops, offs), 0.25)
 
         dets: list[Detection] = []
         for crop, off in zip(crops, offs):
             dets.extend(self._predict(crop, offset=off))
-        return nms(dets + self._predict_extra(image), self.iou)
+        return nms(dets + self._predict_extra(image), 0.25)
 
     def detect_auto(
         self,
@@ -329,4 +335,12 @@ class Detector:
 
         # 香烟模型：整图 + 复用切片（它自己有降频）
         dets += self._predict_extra(image, crops, offs)
-        return nms(dets, self.iou)
+
+        # ⚠️ 合并后必须做**更严格的**二级 NMS（0.25，而不是 0.5）。
+        #
+        # 原因：整图推理和 2x2 切片推理是**分开跑的**，各自内部已经 NMS 过，
+        # 但同一团火会在两个通道里各出一个框 —— 它们的 IOU 常在 0.3~0.5 之间，
+        # 用 0.5 的门槛压不掉，于是就出现"同一个打火机上两个红框"。
+        # 0.25 能把这些跨通道的重复彻底合并，而真正的两个独立目标
+        # （比如手和烟）IOU 远低于 0.25，不会被误合并。
+        return nms(dets, 0.25)
