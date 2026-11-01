@@ -985,9 +985,17 @@ class Pipeline:
             kind = self._kind_of(t.cls_name, t.cls_id)
             # 形态不合物理常识的直接丢（只有香烟有约束，火/烟原样通过）
             h_img, w_img = pkt.image.shape[:2]
-            if not self._shape_ok(t.last_box or (0, 0, 1, 1), kind, w_img, h_img, cfg):
-                self.stats["shape_rejected"] = self.stats.get("shape_rejected", 0) + 1
-                continue
+            # 形态校验**只做标记，不拦截**。
+            #
+            # 之前形态不符直接 continue，等于规则层替 LLM 下了"这不是香烟"
+            # 的结论 —— 而形态判断偶尔会把真烟挡掉（侧对镜头几乎成一条线、
+            # 正对镜头看着偏方、只露出一截）。用户明确要求"所有内容都得有
+            # LLM 裁判、香烟必须不能漏"，所以这里改成记一个标记，
+            # 把"形态可疑"作为提示一起送给 LLM 决断，而不是自己拍板。
+            shape_ok = self._shape_ok(t.last_box or (0, 0, 1, 1), kind,
+                                      w_img, h_img, cfg)
+            if not shape_ok:
+                self.stats["shape_flagged"] = self.stats.get("shape_flagged", 0) + 1
             conf = t.samples[-1].conf
 
             # ── 火：快路径，但必过一道「闪烁闸」────────────────

@@ -219,6 +219,33 @@ def test_pipeline_attrs() -> None:
         check(FAIL, "Detector 实例化", f"{type(e).__name__}: {e}")
 
 
+
+def test_all_go_to_llm() -> None:
+    """过阈值的目标必须全部送 LLM —— 规则层不得自作主张拦截。
+
+    用户明确要求："所有内容务必都得有 LLM 裁判，不能自作主张，
+    特别是香烟，必须不能漏。"
+
+    这里检查两个具体的拦截点是否已经放开：
+      · 香烟形态校验（原来是 continue，现在只标记）
+      · LLM 配额耗尽（原来降级到规则层，现在照送）
+    """
+    src = (ROOT / "src" / "pipeline.py").read_text(encoding="utf-8")
+    if "shape_flagged" in src and "shape_rejected" not in src:
+        check(OK, "香烟形态不拦截", "形态不符只标记，仍送 LLM")
+    else:
+        check(FAIL, "香烟形态不拦截", "仍在用 shape_rejected 直接 continue")
+
+    arb = (ROOT / "src" / "arbiter.py").read_text(encoding="utf-8")
+    # _quota_ok 必须无条件返回 True
+    seg = arb[arb.find("def _quota_ok"):]
+    seg = seg[:seg.find("def ", 10)] if "def " in seg[10:] else seg
+    if "return True" in seg and "return False" not in seg:
+        check(OK, "配额不拦截送审", "配额耗尽只是提醒，仍送 LLM")
+    else:
+        check(FAIL, "配额不拦截送审", "_quota_ok 仍会返回 False 拦截")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -230,6 +257,7 @@ def main() -> int:
     test_kalman()
     test_tracker_no_split()
     test_pipeline_attrs()
+    test_all_go_to_llm()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")

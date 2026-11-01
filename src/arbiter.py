@@ -240,10 +240,29 @@ class LlmArbiter:
 
     # ------------------------------------------------------------ 额度 / 去重
     def _quota_ok(self) -> bool:
+        """配额检查 —— 只做提醒，**永不阻止送审**。
+
+        用户要求："所有内容务必都得有 LLM 裁判，不能自作主张，
+        特别是香烟，必须不能漏。"
+
+        原来配额到上限就返回 False，等于规则层单方面决定"这个目标
+        不送 LLM 了"，而且完全静默 —— 值班员不知道裁判那段时间缺席。
+        对安全系统来说这是最不该有的行为：漏报的代价远高于几次 API 费用。
+
+        现在配额只是成本提醒，照样送审。
+        """
         now = time.time()
         with self._lock:
             self._calls = [t for t in self._calls if now - t < 3600]
-            return len(self._calls) < int(self.cfg["hourly_limit"])
+            used = len(self._calls)
+        limit = int(self.cfg["hourly_limit"])
+        if used >= limit and not getattr(self, "_quota_warned", False):
+            self._quota_warned = True
+            print(f"[warn] LLM 配额已达 {used}/{limit} 次/小时，"
+                  f"按配置**继续送审**（不漏报优先），请留意成本。", flush=True)
+        elif used < limit * 0.5:
+            self._quota_warned = False
+        return True
 
     def _mark_call(self) -> None:
         with self._lock:
