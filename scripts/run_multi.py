@@ -114,15 +114,6 @@ class Worker:
         self.src = LatestFrameSource(FixedCameraSource(info, frames=frames()))
         # 每路一个独立 Pipeline：轨迹/时序/区域记忆都是**按路**隔离的，
         # 共用一份会把 A 摄像头的轨迹和 B 摄像头的混在一起。
-        # 按路数自适应抽帧：所有路**共用同一个 detector**，而 YOLO 推理
-        # 不是线程安全的，实际是串行的。N 路的检测轮转时间是 N×13ms，
-        # 路越多每路分到的检测频率越低。
-        # 与其让每路都排队等着（延迟随机变大），不如主动把抽帧间隔调大 ——
-        # 检测频率稳定可预期，而且火/烟都是慢过程，少检几次没关系。
-        _n_cams = max(1, len(cams))
-        _auto_every = max(1, min(6, _n_cams))     # 1路=1, 2路=2, 4路=4, 6路以上=6
-        if "every" not in pipe_cfg:
-            pipe_cfg["every"] = _auto_every
         self.pipe = Pipeline(detector, sliced=pipe_cfg.pop("sliced", False),
                              cfg=pipe_cfg, arbiter=arbiter)
         self.pipe._last_dets = []
