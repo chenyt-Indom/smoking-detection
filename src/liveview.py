@@ -88,6 +88,12 @@ class LiveView:
         self._jpeg: bytes | None = None
         self._seq = 0
         self._state: dict = {"seq": 0, "dets": [], "counts": {}, "fps": 0.0}
+        # 跨帧框平滑缓存：[(box, cls_name, conf), ...]
+        # 用 IOU 把本帧的框和上一帧匹配上，然后做指数滑动平均。
+        # 为什么在这层做：上游已经用 Kalman 平滑了位置，但轨迹重建
+        # （目标短暂丢失后重新捕获）时新轨迹的框会跳到新位置 —— 这一层
+        # 兜住那种跨轨迹的跳变，让眼睛看到的是连续的。
+        self._prev_boxes: list = []
 
         self._last_pub = 0.0
         self._n_pub = 0
@@ -157,7 +163,64 @@ class LiveView:
         return True
 
     # ------------------------------------------------------------ 画框
+    @staticmethod
+    def _iou(a, b) -> float:
+        ax1, ay1, ax2, ay2 = a
+        bx1, by1, bx2, by2 = b
+        ix = max(0.0, min(ax2, bx2) - max(ax1, bx1))
+        iy = max(0.0, min(ay2, by2) - max(ay1, by1))
+        inter = ix * iy
+        union = ((ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter)
+        return inter / union if union > 0 else 0.0
+
+    def _smooth(self, dets, alpha: float = 0.45):
+        """跨帧框平滑：同类别 + IOU 匹配 → 指数滑动平均。
+
+        alpha 是"新观测"的权重。0.45 意味着 55% 沿用历史 —— 框会明显变稳，
+        代价是目标快速移动时略有滞后。监控场景看的是"有没有事"，
+        不是"精确到像素的跟踪"，这个取舍值得。
+        """
+        prev = self._prev_boxes
+        used = set()
+        out = []
+        for d in dets:
+            box = getattr(d, "xyxy", None)
+            if box is None:
+                out.append((None, getattr(d, "cls_name", ""), getattr(d, "conf", 0.0)))
+                continue
+            name = str(getattr(d, "cls_name", ""))
+            best, best_iou = -1, 0.25
+            for i, (pb, pn, _pc) in enumerate(prev):
+                if i in used or pn != name or pb is None:
+                    continue
+                v = self._iou(pb, box)
+                if v > best_iou:
+                    best, best_iou = i, v
+            if best >= 0:
+                pb = prev[best][0]
+                box = tuple(alpha * float(c) + (1.0 - alpha) * float(p)
+                            for c, p in zip(box, pb))
+                used.add(best)
+            out.append((box, name, getattr(d, "conf", 0.0)))
+        self._prev_boxes = out
+        return out
+
     def _draw(self, image: np.ndarray, dets, frame_idx, cam_id) -> np.ndarray:
+        # 先做跨帧平滑，再画。把平滑后的框包成和 Detection 同构的对象，
+        # 这样下面所有绘制/统计代码不用改结构。
+        class _S:
+            __slots__ = ("xyxy", "cls_id", "cls_name", "conf", "area")
+            def __init__(self, box, name, conf, cid):
+                self.xyxy = box if box is not None else (0, 0, 0, 0)
+                self.cls_name = name
+                self.conf = conf
+                self.cls_id = cid
+                self.area = max(0.0, self.xyxy[2] - self.xyxy[0]) * max(0.0, self.xyxy[3] - self.xyxy[1])
+
+        _raw = list(dets or [])
+        _sm = self._smooth(_raw)
+        dets = [_S(b, n, c, getattr(_raw[i], "cls_id", -1) if i < len(_raw) else -1)
+                for i, (b, n, c) in enumerate(_sm)]
         img = image.copy()
         h, w = img.shape[:2]
         placed: list[tuple[int, int, int, int]] = []   # 已占用的标签区域，防重叠

@@ -1188,29 +1188,6 @@ class Pipeline:
             draw_dets.append(Detection(_t.cls_id, _t.cls_name,
                                        float(_t.samples[-1].conf), _t.last_box))
 
-        # ⚠️ 关键补充：把"还没建立轨迹"的原始检测也画出来。
-        #
-        # 轨迹需要连续命中几帧才会建立（防抖）。在那之前，模型明明检出了
-        # 目标，画面上却什么都没有 —— 用户举着烟、底部显示"检测 0 个目标"，
-        # 就是这么来的。实测模型对实时帧是能检出 3 个目标的，全被这层吃掉了。
-        #
-        # 所以：tracks 提供平滑后的稳定框，dets 提供"刚出现还在观察"的框，
-        # 两者合并才是完整的"系统看到了什么"。
-        def _iou(a, b) -> float:
-            ax1, ay1, ax2, ay2 = a
-            bx1, by1, bx2, by2 = b
-            ix = max(0.0, min(ax2, bx2) - max(ax1, bx1))
-            iy = max(0.0, min(ay2, by2) - max(ay1, by1))
-            inter = ix * iy
-            union = ((ax2 - ax1) * (ay2 - ay1)
-                     + (bx2 - bx1) * (by2 - by1) - inter)
-            return inter / union if union > 0 else 0.0
-
-        for _d in dets:
-            if any(_iou(_d.xyxy, (_t.xyxy if hasattr(_t, 'xyxy') else _t.bounds)) > 0.5
-                        for _t in draw_dets):
-                continue          # 已被某条轨迹覆盖，不重复画
-            draw_dets.append(_d)
         # 光敏引擎降频：每 2 帧跑一次。
         # 它只回答"哪里有亮光"，亮光不会在 33ms 内出现又消失，
         # 逐帧跑纯属浪费 GIL —— 而 GIL 正是画面卡顿的元凶。
