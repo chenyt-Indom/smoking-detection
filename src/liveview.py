@@ -161,9 +161,15 @@ class LiveView:
         img = image.copy()
         h, w = img.shape[:2]
         placed: list[tuple[int, int, int, int]] = []   # 已占用的标签区域，防重叠
-        # 灰框限量：未达彩色阈值的框最多画这么多个
-        _cand_limit = 8
+        # 灰框显示规则（三段收紧，专治"满屏框"）：
+        #   ① 最多画 2 个 —— 之前 8 个，屏幕上十几个标签糊成一片
+        #   ② 面积必须 >= 画面 0.6% —— 小噪点（脸上的、墙上的几十像素块）
+        #      对值班员没有信息量，只会干扰
+        #   ③ 按置信度从高到低取前 2 个
+        # 灰框的价值只有"这里可能有问题"这一句话，说两遍就够了。
+        _cand_limit = 2
         _cand_drawn = 0
+        _cand_min_area = h * w * 0.006
 
         def collides(box) -> bool:
             x1, y1, x2, y2 = box
@@ -191,8 +197,11 @@ class LiveView:
             # 灰框限量：未达阈值的框最多画 N 个（按置信度从高到低）。
             # 阈值降到 0.08 后画面里能冒出几十个灰框，满屏标签反而什么都看不清 ——
             # 它们的信息量本来就只有"这里有东西"这一点，留前几个足够提示了。
-            if conf < alarm_thr and _cand_drawn >= _cand_limit:
-                continue
+            if conf < alarm_thr:
+                _bw = max(1.0, x2 - x1)
+                _bh = max(1.0, y2 - y1)
+                if _cand_drawn >= _cand_limit or _bw * _bh < _cand_min_area:
+                    continue
             if conf >= alarm_thr:
                 if "cig" in str(getattr(d, "cls_name", "")).lower():
                     color = CIG_COLOR
