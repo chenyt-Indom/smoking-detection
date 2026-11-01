@@ -82,6 +82,10 @@ SYSTEM = (
     "- 灰/黑色翻滚上升、贴天花板横向扩散、地面黑色堆积 → smoke，风险高\n"
     "- 香烟/烟头/卷烟：**正在燃烧的香烟端头有红点或细烟缕 → smoke**，风险中；"
     "只是夹在指间没点燃、或躺在烟灰缸里没火 → other（说明理由：未点燃）\n"
+    "- ⚠️ **香烟要判 cigarette，不是 smoke**：画面里是白色/褐色细长条、"
+    "被手指夹着、端头可能有红点或褐色燃点，但**没有向外扩散的烟云** → "
+    "label 填 **cigarette**。只有出现成片向外翻滚扩散的烟气时才判 smoke。"
+    "这样系统才能把「抽烟」和「着火冒烟」分开报。\n"
     "- ⚠️⚠️ **判 fire 的唯一标准是「画面里有没有看得见的明火」，"
     "不是「会不会造成火灾」。** 打火机、蜡烛、火柴、灶火、酒精灯、焊接火 —— "
     "只要是橙黄/蓝黄的会飘动的火苗，一律判 **fire**。风险等级可以给 low/medium，"
@@ -100,7 +104,7 @@ SYSTEM = (
     "  · 你看不清、或者看到了但没有把握 → uncertain\n"
     "  不要把'看清楚了但没危险'答成 uncertain，那会让系统一直请你复核。\n\n"
     "只输出一个 JSON，不要任何解释文字，不要 markdown 代码块：\n"
-    '{"label":"fire|smoke|steam|light|other|uncertain",'
+    '{"label":"fire|smoke|cigarette|steam|light|other|uncertain",'
     '"risk":"high|medium|low","confidence":0.0-1.0,'
     '"reason":"20字以内，必须指出画面里的具体依据"}'
 )
@@ -146,7 +150,7 @@ def load_dotenv(path: str | Path | None = None) -> None:
 class ArbiterResult:
     """一次裁决的结论。属性和 Verdict2 有意保持一致，便于互换。"""
 
-    label: str                     # fire / smoke / steam / light / other / uncertain
+    label: str                     # fire / smoke / cigarette / steam / light / other / uncertain
     risk: str = "low"              # high / medium / low
     confidence: float = 0.0
     reason: str = ""
@@ -627,7 +631,8 @@ class LlmArbiter:
 
     def _to_result(self, d: dict, latency: float) -> ArbiterResult:
         label = str(d.get("label", "uncertain")).strip().lower()
-        if label not in ("fire", "smoke", "steam", "light", "other", "uncertain"):
+        if label not in ("fire", "smoke", "cigarette", "steam", "light",
+                         "other", "uncertain"):
             label = "uncertain"
         risk = str(d.get("risk", "low")).strip().lower()
         if risk not in ("high", "medium", "low"):

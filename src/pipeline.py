@@ -933,7 +933,24 @@ class Pipeline:
                                "llm_source": res.source,
                                "llm_latency": round(res.latency_s, 2),
                                "dismissed": True})
-        if res.label in ("fire", "smoke"):
+        # ── 事件类别以 LLM 的判定为准，不再沿用检测类别 ──────────
+        #
+        # 用户的截图暴露了这个问题：LLM 明明判了 smoke（理由写得很准——
+        # "手指夹白色卷烟，端头有褐色燃点，没有飘动火苗"），事件标签却还是
+        # "火情"。因为 kind 一直用的是检测类别（主模型把香烟误检成 fire），
+        # LLM 的结论只影响了 level，没影响 kind。
+        #
+        # 现在的规则：
+        #   LLM 判 fire    -> kind 一定是 fire
+        #   LLM 判 smoke   -> 保留检测给出的细分（cigarette 的还是 cigarette，
+        #                     否则是 smoke）。这样香烟仍然显示"香烟"而不是"烟情"。
+        #   其它（light/other/steam/uncertain）-> 保持原类别，只影响降级逻辑
+        if res.label in ("fire", "smoke", "cigarette"):
+            kind_out = res.label          # LLM 说了算，它现在能直接判 cigarette
+        else:
+            kind_out = info.kind
+
+        if res.label in ("fire", "smoke", "cigarette"):
             level = "alarm" if res.risk == "high" else "warning"
         else:                                  # uncertain → 不硬判，推给人看
             level = "notice"
@@ -942,7 +959,7 @@ class Pipeline:
         if level != "notice" and not self._can_alarm(info.kind, info.tid, now_ts, info.box)[0]:
             return None
 
-        ev = Event(kind=info.kind, level=level, cam_id=info.cam_id, track_id=info.tid,
+        ev = Event(kind=kind_out, level=level, cam_id=info.cam_id, track_id=info.tid,
                    frame_idx=info.frame_idx, t_first=info.t_first,
                    # 用**裁决生效时刻**而不是送审时刻：否则"确认延迟"会把等 LLM 的
                    # 那一两秒吞掉，数字看着漂亮但不符合实际

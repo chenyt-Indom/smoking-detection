@@ -339,6 +339,38 @@ def test_cigarette_reaches_llm() -> None:
         check(FAIL, "香烟直接送审", "分支内没有 _defer 调用")
 
 
+
+def test_llm_label_wins() -> None:
+    """事件类别必须以 LLM 的判定为准，且 cigarette 贯穿全链路。
+
+    用户截图暴露过：LLM 判 smoke（理由写得很准——"手指夹白色卷烟，
+    端头有褐色燃点，没有飘动火苗"），事件标签却还是"火情"，
+    因为 kind 一直用检测类别（主模型把香烟误检成 fire）。
+    """
+    arb = (ROOT / "src" / "arbiter.py").read_text(encoding="utf-8")
+    if "fire|smoke|cigarette|steam" in arb:
+        check(OK, "LLM 支持 cigarette", "label 可选值里已包含香烟")
+    else:
+        check(FAIL, "LLM 支持 cigarette", "label 白名单里没有 cigarette")
+
+    if '"cigarette"' in arb or "cigarette" in arb.split("def parse")[0]:
+        check(OK, "香烟判据", "prompt 已说明「香烟判 cigarette 不是 smoke」")
+    else:
+        check(FAIL, "香烟判据", "prompt 里没有香烟的判定规则")
+
+    src = (ROOT / "src" / "pipeline.py").read_text(encoding="utf-8")
+    if "kind_out = res.label" in src:
+        check(OK, "类别以 LLM 为准", "kind_out 直接采用 res.label")
+    else:
+        check(FAIL, "类别以 LLM 为准", "事件 kind 仍用检测类别")
+
+    ui = (ROOT / "web" / "dashboard.html").read_text(encoding="utf-8")
+    if "香烟" in ui and "cigarette" in ui:
+        check(OK, "前端显示香烟", "levelCN 已处理 cigarette")
+    else:
+        check(FAIL, "前端显示香烟", "前端不认识 cigarette")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -354,6 +386,7 @@ def main() -> int:
     test_filter_but_traceable()
     test_snapshot_and_merge()
     test_cigarette_reaches_llm()
+    test_llm_label_wins()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")
