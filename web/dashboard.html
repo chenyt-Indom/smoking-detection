@@ -106,7 +106,13 @@ td.cls.fire{color:var(--fire)} td.cls.smoke{color:var(--smoke)}
 .ev-imgs .cap{position:absolute;left:4px;bottom:3px;font-size:10px;color:#fff;
   background:rgba(0,0,0,.55);padding:0 4px;border-radius:3px}
 .img-wrap{position:relative;display:flex;min-width:0}
-.ev-actions{display:flex; gap:6px; margin-top:7px}
+.rv-btn{margin-left:auto; background:none; border:1px solid var(--line);
+  color:var(--dim); font-size:11px; padding:2px 9px; border-radius:11px; cursor:pointer;
+  font-family:inherit; transition:.15s}
+.rv-btn:hover{color:var(--txt); border-color:var(--accent)}
+.rv-btn.on{color:#fff; background:rgba(59,130,246,.28); border-color:var(--accent)}
+.rv-btn b{color:var(--warn); font-weight:600}
+.ev-actions{display:flex; gap:6px; margin-top:7px; flex-wrap:wrap; align-items:center}
 .btn{font-size:11px; padding:3px 9px; border-radius:4px; border:1px solid var(--line);
   background:transparent; color:var(--muted); cursor:pointer; transition:.15s}
 .btn:hover{border-color:var(--muted); color:var(--text)}
@@ -185,6 +191,9 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
   <aside id="right">
     <div class="right-head">
       <span>事件流</span>
+      <button id="reviewBtn" class="rv-btn" title="只显示模型拿不准、最值得标注的事件">
+        待标注 <b id="rvCount">0</b>
+      </button>
       <span id="evCount" style="color:var(--dim)">0</span>
     </div>
     <div id="events"><div class="empty">暂无事件</div></div>
@@ -345,6 +354,40 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
   }
   setInterval(pollCams, 400);
 
+  // ── 2.5 待标注队列（主动学习）─────────────────────────────
+  // 系统自己挑"最值得标注"的事件推给人：两次判定打架 / 模型说没把握 /
+  // 置信卡在边界。标这些的收益远大于标一堆模型本来就很笃定的样本。
+  let reviewSet = new Set();
+  let reviewOnly = false;
+
+  async function pollReview(){
+    try{
+      const r = await fetch("/api/review_queue", {cache:"no-store"});
+      const list = await r.json();
+      if (!Array.isArray(list)) return;
+      reviewSet = new Set(list.map(x => x.wall_ms));
+      $("rvCount").textContent = list.length;
+      if (reviewOnly && list.length === 0){
+        reviewOnly = false;
+        $("reviewBtn").classList.remove("on");
+        applyReviewFilter();
+      }
+    }catch(e){ /* 下一轮再试 */ }
+  }
+
+  function applyReviewFilter(){
+    document.querySelectorAll("#events .ev").forEach(el => {
+      const wid = Number(el.dataset.wid);
+      el.style.display = (!reviewOnly || reviewSet.has(wid)) ? "" : "none";
+    });
+  }
+
+  $("reviewBtn").addEventListener("click", () => {
+    reviewOnly = !reviewOnly;
+    $("reviewBtn").classList.toggle("on", reviewOnly);
+    applyReviewFilter();
+  });
+
   // ── 3. 事件流：SSE + 人工反馈 ────────────────────────────
   const eventsEl = $("events");
   let evN = 0;
@@ -365,6 +408,7 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
 
     const div = document.createElement("div");
     div.className = "ev " + (e.level || "notice");
+    div.dataset.wid = e.wall_ms;
     const t = (e.wall || "").slice(11) || "--:--:--";
     const kind = NAME_CN[e.kind] || e.kind || "事件";
     const reasons = (e.reasons || []).slice(0, 2).join(" · ");
@@ -418,6 +462,7 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
             btn.textContent = yes ? ("已标" + yesTxt) : ("已标" + noTxt);
             btn.style.color = yes ? "var(--ok)" : "var(--warn)";
             // 告诉用户这次点击产生了什么：是进了训练集，还是模型本来就判对了
+            pollReview();
             if (j.hint) {
               const tip = document.createElement("div");
               tip.style.cssText = "margin-top:5px;font-size:10.5px;color:var(--dim);line-height:1.5";
@@ -435,6 +480,7 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
       });
     });
 
+    if (reviewOnly && !reviewSet.has(e.wall_ms)) div.style.display = "none";
     eventsEl.prepend(div);
     // 图片：失败的替换成提示，成功的支持点击放大原图
     div.querySelectorAll("img[data-zoom]").forEach(im => {
@@ -571,6 +617,8 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
 
   initCams();
   pollCams();
+  pollReview();
+  setInterval(pollReview, 8000);
   pollLlm();
 })();
 </script>

@@ -75,6 +75,8 @@ class Notifier:
                                          daemon=True)
         self._wthread.start()
         self.stats = {"pushed": 0, "clients": 0, "errors": 0}
+        # 已人工标注过的 wall_ms：主动学习的队列要排除它们，避免重复问人
+        self._reported: set[int] = set()
 
     def _pick_live(self, cam: str | None):
         """按 cam 参数挑一路。没给就返回第一路（单摄像头时的常规用法）。"""
@@ -199,6 +201,72 @@ class Notifier:
         except Exception:                            # noqa: BLE001
             self.stats["errors"] += 1
 
+    # ------------------------------------------------------------ 主动学习
+    def review_queue(self, limit: int = 30) -> list[dict]:
+        """挑出最值得人工标注的事件 —— 主动学习的采样器。
+
+        为什么不按时间顺序全推：绝大多数事件模型都判得很笃定，标它们
+        对模型没有增量。真正有价值的是模型"自己拿不准"的那一小撮，
+        这叫不确定性采样（uncertainty sampling），是 active learning 的核心。
+
+        优先级（越靠前信息量越大）
+          1. 两次判定打架（overridden）—— 两个模型互相矛盾，最值得看
+          2. LLM 返回 uncertain        —— 它自己都说没把握
+          3. 置信落在边界区间 0.40~0.65 —— 典型难例
+        已标注过的直接跳过，不重复打扰。
+        """
+        with self._lock:
+            hist = list(self._history)
+        done = set(self._reported)
+        # reports.jsonl 里已有的也算标注过（跨重启）
+        try:
+            if (self.report_dir / "reports.jsonl").is_file():
+                for ln in (self.report_dir / "reports.jsonl").read_text(
+                        encoding="utf-8", errors="ignore").splitlines():
+                    if ln.strip():
+                        try:
+                            done.add(json.loads(ln).get("wall_ms"))
+                        except json.JSONDecodeError:
+                            pass
+        except OSError:
+            pass
+
+        scored = []
+        for e in hist:
+            wid = e.get("wall_ms")
+            if wid in done:
+                continue
+            label = str(e.get("llm_label") or "")
+            try:
+                conf = float(e.get("score") or 0.0)
+            except (TypeError, ValueError):
+                conf = 0.0
+            # llm_conf 才是裁判自己的把握度；score 是 YOLO 的。优先用前者
+            try:
+                llm_conf = float(e.get("llm_conf") or 0.0)
+            except (TypeError, ValueError):
+                llm_conf = 0.0
+            pri = None
+            if e.get("overridden"):
+                pri = 0
+            elif label == "uncertain":
+                pri = 1
+            elif 0.40 <= llm_conf <= 0.65:
+                pri = 2
+            elif 0.40 <= conf <= 0.60:
+                pri = 3
+            if pri is None:
+                continue
+            scored.append((pri, -float(conf), e))
+        scored.sort(key=lambda x: (x[0], x[1]))
+        out = []
+        for pri, _, e in scored[:limit]:
+            d = dict(e)
+            d["why"] = {0: "两次判定不一致", 1: "模型没把握",
+                        2: "裁判置信处于边界", 3: "检测置信处于边界"}[pri]
+            out.append(d)
+        return out
+
     # ------------------------------------------------------------ 人工反馈
     def report(self, body: dict) -> dict:
         """看板上点「误报」/「属实」→ 落成一条**硬负样本**，等回流进训练集。
@@ -261,6 +329,8 @@ class Notifier:
         else:
             vclass = "TN"          # 都没火，不学
 
+        with self._lock:
+            self._reported.add(wid)      # 标过的就退出待标注队列
         row = {"wall_ms": wid, "wall": rec.get("wall"), "verdict": verdict,
                "verdict_class": vclass, "model_label": model_label,
                "kind": rec.get("kind"), "level": rec.get("level"),
@@ -430,6 +500,12 @@ class Notifier:
                     st = view.state() if view is not None else {}
                     self._send(200, "application/json; charset=utf-8",
                                json.dumps(st, ensure_ascii=False).encode())
+                    return
+
+                if path == "/api/review_queue":
+                    body = notifier.review_queue()
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps(body, ensure_ascii=False).encode())
                     return
 
                 if path == "/api/cams":
