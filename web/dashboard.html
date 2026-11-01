@@ -390,8 +390,8 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
       html += '</div>';
     }
     html += '<div class="ev-actions">'
-      + '<button class="btn" data-fb="false_alarm">误报</button>'
-      + '<button class="btn" data-fb="true_alarm">属实</button>'
+      + '<button class="btn btn-fire" data-fb="fire">有火</button>'
+      + '<button class="btn btn-nofire" data-fb="no_fire">无火</button>'
       + '</div>';
     div.innerHTML = html;
 
@@ -409,8 +409,15 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
           if (j.ok){
             FB[e.wall_ms] = verdict;
             div.querySelectorAll("[data-fb]").forEach(b => { b.disabled = true; });
-            btn.textContent = verdict === "false_alarm" ? "已标误报" : "已确认";
-            btn.style.color = verdict === "false_alarm" ? "var(--warn)" : "var(--ok)";
+            btn.textContent = verdict === "fire" ? "已标有火" : "已标无火";
+            btn.style.color = verdict === "fire" ? "var(--ok)" : "var(--warn)";
+            // 告诉用户这次点击产生了什么：是进了训练集，还是模型本来就判对了
+            if (j.hint) {
+              const tip = document.createElement("div");
+              tip.style.cssText = "margin-top:5px;font-size:10.5px;color:var(--dim);line-height:1.5";
+              tip.textContent = j.hint;
+              div.querySelector(".ev-actions").appendChild(tip);
+            }
           }else{
             btn.disabled = false;
             alert("提交失败：" + (j.error || "未知错误"));

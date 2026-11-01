@@ -558,7 +558,10 @@ class Pipeline:
                    frame_idx=pkt.idx, t_first=t.first_t, t_alarm=pkt.ts,
                    score=float(score), box=tuple(float(v) for v in box),
                    reasons=list(reasons), snapshot=snap, snapshot_full=full,
-                   meta={"hits": t.hits, "n_samples": len(t.samples)})
+                   meta={"hits": t.hits, "n_samples": len(t.samples),
+                         # 原图尺寸：导出正样本时要把像素框换算成 YOLO 归一化坐标
+                         "img_w": int(pkt.image.shape[1]),
+                         "img_h": int(pkt.image.shape[0])})
         if level in ("warning", "alarm"):        # notice / cleared 不算告警，别污染统计
             self.stats[f"{kind}_alarms"] += 1
         return ev

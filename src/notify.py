@@ -221,8 +221,12 @@ class Notifier:
         reports.jsonl 里的一行，不会在训练集里塞 50 张一样的图。
         """
         verdict = str(body.get("verdict") or "")
-        if verdict not in ("false_alarm", "true_alarm"):
-            return {"ok": False, "error": "verdict 只能是 false_alarm / true_alarm"}
+        # 前端按钮语义：有火 / 无火。旧的 false_alarm / true_alarm 仍然兼容，
+        # 免得已打开的旧页面点不了。
+        alias = {"true_alarm": "fire", "false_alarm": "no_fire"}
+        verdict = alias.get(verdict, verdict)
+        if verdict not in ("fire", "no_fire"):
+            return {"ok": False, "error": "verdict 只能是 fire / no_fire"}
 
         wid = body.get("wall_ms")
         with self._lock:
@@ -231,7 +235,32 @@ class Notifier:
         if rec is None:
             return {"ok": False, "error": "找不到这条事件（可能已滚出历史，刷新页面重试）"}
 
+        # ── 四类归类：人工判定 × 模型判定 ─────────────────────
+        # 这是主动学习的分拣台。只有两类值得进训练集：
+        #   人工说有火、模型说没有 → 假阴性（漏报），要正样本
+        #   人工说无火、模型说有   → 假阳性（误报），要负样本
+        # 两边一致的说明模型已经会了，再喂一遍没有增量。
+        # 注意：Event.to_dict() 把 meta 用 ** 展开了，所以 llm_label / img_w
+        # 这些都是**顶层字段**，不是嵌在 rec["meta"] 里。
+        model_label = str(rec.get("llm_label") or "")
+        if not model_label:
+            # 没有 LLM 结论时用事件级别兜底推断
+            lv = rec.get("level")
+            model_label = "fire" if lv in ("alarm", "warning") else (
+                "other" if lv == "cleared" else "uncertain")
+        model_says_fire = model_label in ("fire", "smoke")
+        human_says_fire = verdict == "fire"
+        if human_says_fire and model_says_fire:
+            vclass = "TP"          # 都对，不学
+        elif human_says_fire and not model_says_fire:
+            vclass = "FN"          # 模型漏报 → 正样本
+        elif not human_says_fire and model_says_fire:
+            vclass = "FP"          # 模型误报 → 负样本
+        else:
+            vclass = "TN"          # 都没火，不学
+
         row = {"wall_ms": wid, "wall": rec.get("wall"), "verdict": verdict,
+               "verdict_class": vclass, "model_label": model_label,
                "kind": rec.get("kind"), "level": rec.get("level"),
                "cam": rec.get("cam"), "score": rec.get("score"),
                "reasons": (rec.get("reasons") or [])[:2],
@@ -240,28 +269,43 @@ class Notifier:
         saved = None
         note_extra = ""
 
-        if verdict == "false_alarm":
-            snap = rec.get("snapshot") or ""
+        # ── 只有 FP / FN 才值得进训练集 ──────────────────────
+        # FP（误报）→ 负样本：空标注，教模型"这张图里没有火"
+        # FN（漏报）→ 正样本：保留 YOLO 当时的框当伪标注，教模型"这里有火"
+        # TP/TN 说明两边判断一致，再喂一遍没有增量，只记流水不存图。
+        if vclass in ("FP", "FN"):
+            key = "snapshot_full" if vclass == "FN" else "snapshot"
+            snap = rec.get(key) or ""
             src = self.out_dir / unquote(snap[len("/snapshots/"):]) \
                 if snap.startswith("/snapshots/") else None
             if src is None or not src.is_file():
-                # 截图缺失时不阻断反馈。
-                # 反馈本身（哪条告警被判成误报）对统计误报率有价值，
-                # 硬负样本图只是它的附加产物 —— 缺图就跳过存图这一步。
-                note_extra = " [截图缺失，未生成负样本]"
+                # 缺图不阻断反馈：流水本身（哪条判错）对统计准确率有价值。
+                note_extra = " [截图缺失，未生成样本]"
                 self.stats["missing_snapshot"] = self.stats.get("missing_snapshot", 0) + 1
             else:
-                img_dir = self.report_dir / "images"
-                lbl_dir = self.report_dir / "labels"
+                # 负样本用 ROI（信息密度高、直接是待判别的区域）
+                # 正样本用全图（要保留空间关系，且框坐标本来就是相对全图的）
+                sub = "positives" if vclass == "FN" else ""
+                img_dir = self.report_dir / sub / "images" if sub else self.report_dir / "images"
+                lbl_dir = self.report_dir / sub / "labels" if sub else self.report_dir / "labels"
                 img_dir.mkdir(parents=True, exist_ok=True)
                 lbl_dir.mkdir(parents=True, exist_ok=True)
-                stem = f"hn_{wid}_{rec.get('cam')}_{rec.get('kind')}"
-                # 去重：同一 wall_ms 已经存过就不覆盖（人工可能补点 note）
+                stem = (f"hp_{wid}_{rec.get('cam')}_{rec.get('kind')}" if vclass == "FN"
+                        else f"hn_{wid}_{rec.get('cam')}_{rec.get('kind')}")
                 if not (img_dir / f"{stem}.jpg").exists():
                     (img_dir / f"{stem}.jpg").write_bytes(src.read_bytes())
-                    (lbl_dir / f"{stem}.txt").write_text("", encoding="utf-8")
+                    if vclass == "FP":
+                        # 空标注 = 这张图没有任何目标
+                        (lbl_dir / f"{stem}.txt").write_text("", encoding="utf-8")
+                    else:
+                        # 正样本的框在 reports.jsonl 里（box + 原图尺寸），
+                        # 由 scripts/export_training.py 换算成 YOLO 归一化坐标。
+                        (lbl_dir / f"{stem}.txt").write_text(
+                            "# pending: 由 export_training.py 依据 reports.jsonl 生成\n",
+                            encoding="utf-8")
                 saved = str(img_dir / f"{stem}.jpg")
-                self.stats["hard_negatives"] = self.stats.get("hard_negatives", 0) + 1
+                k = "hard_positives" if vclass == "FN" else "hard_negatives"
+                self.stats[k] = self.stats.get(k, 0) + 1
 
         # 反馈流水账：既做留证，也算"人工复核后确认率"
         try:
@@ -273,7 +317,8 @@ class Notifier:
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
         except OSError:
             self.stats["errors"] += 1
-        res = {"ok": True, "verdict": verdict, "saved": saved}
+        res = {"ok": True, "verdict": verdict, "verdict_class": vclass,
+               "model_label": model_label, "saved": saved}
         if note_extra:
             res["warning"] = "截图缺失，已记录反馈但未生成负样本"
         return res
