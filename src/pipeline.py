@@ -996,6 +996,13 @@ class Pipeline:
                                       w_img, h_img, cfg)
             if not shape_ok:
                 self.stats["shape_flagged"] = self.stats.get("shape_flagged", 0) + 1
+                # 形态不符的对象**不送 LLM**（省配额、压误报），
+                # 但也**不静默丢弃**：
+                #   · 它仍然留在 tracks 里 -> 画面照样画灰框，人看得见
+                #   · 计入 shape_flagged 统计 -> 事后能查"今天挡了多少"
+                #   · 一旦特征变化（变长/变细/面积涨）下一帧就会重新走完整流程
+                # 这就是"过滤但不瞒报"：系统不替谁下结论，只是不花 LLM 的钱。
+                continue
             conf = t.samples[-1].conf
 
             # ── 火：快路径，但必过一道「闪烁闸」────────────────

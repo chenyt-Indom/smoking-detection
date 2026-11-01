@@ -249,18 +249,27 @@ class LlmArbiter:
         不送 LLM 了"，而且完全静默 —— 值班员不知道裁判那段时间缺席。
         对安全系统来说这是最不该有的行为：漏报的代价远高于几次 API 费用。
 
-        现在配额只是成本提醒，照样送审。
+        配额耗尽时降级为规则层，但**必须打日志** —— 静默降级等于
+        让人以为系统一直在判。检测、画框、报警都不受影响，只是这条
+        不再花 LLM 的钱复核。
         """
         now = time.time()
         with self._lock:
             self._calls = [t for t in self._calls if now - t < 3600]
             used = len(self._calls)
         limit = int(self.cfg["hourly_limit"])
-        if used >= limit and not getattr(self, "_quota_warned", False):
-            self._quota_warned = True
-            print(f"[warn] LLM 配额已达 {used}/{limit} 次/小时，"
-                  f"按配置**继续送审**（不漏报优先），请留意成本。", flush=True)
-        elif used < limit * 0.5:
+        if used >= limit:
+            # 配额耗尽 -> 降级到规则层。这不是"不报"，而是"这条不再花钱请
+            # LLM 看第二眼"：检测照跑、框照画、事件照推，只是定级由规则层做。
+            # 关键是**必须留痕** —— 静默降级等于让人以为系统一直在判。
+            self.stats_quota_hit = getattr(self, "stats_quota_hit", 0) + 1
+            if not getattr(self, "_quota_warned", False):
+                self._quota_warned = True
+                print(f"[warn] LLM 配额已达 {used}/{limit} 次/小时，"
+                      f"后续目标降级为规则层判定（仍在检测、仍会报警，"
+                      f"只是不再送 LLM 复核）。建议检查误报量。", flush=True)
+            return False
+        if used < limit * 0.5:
             self._quota_warned = False
         return True
 

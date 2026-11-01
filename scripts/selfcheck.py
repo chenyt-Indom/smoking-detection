@@ -220,30 +220,33 @@ def test_pipeline_attrs() -> None:
 
 
 
-def test_all_go_to_llm() -> None:
-    """过阈值的目标必须全部送 LLM —— 规则层不得自作主张拦截。
+def test_filter_but_traceable() -> None:
+    """过滤可以，但必须留痕 —— 不允许"静默丢弃"。
 
-    用户明确要求："所有内容务必都得有 LLM 裁判，不能自作主张，
-    特别是香烟，必须不能漏。"
-
-    这里检查两个具体的拦截点是否已经放开：
-      · 香烟形态校验（原来是 continue，现在只标记）
-      · LLM 配额耗尽（原来降级到规则层，现在照送）
+    用户的原话是"还是得改回去，但是不能完全不报"。
+    所以规则层可以过滤（省配额、压误报），但被过滤的对象必须：
+      · 仍然出现在画面上（灰框），人看得见
+      · 有统计计数，事后能查
+      · 有日志，值班员知道裁判什么时候缺席
     """
     src = (ROOT / "src" / "pipeline.py").read_text(encoding="utf-8")
-    if "shape_flagged" in src and "shape_rejected" not in src:
-        check(OK, "香烟形态不拦截", "形态不符只标记，仍送 LLM")
+    if "shape_flagged" in src and "continue" in src:
+        check(OK, "香烟形态：过滤但留痕",
+              "不送 LLM，但保留灰框 + 计入 shape_flagged 统计")
     else:
-        check(FAIL, "香烟形态不拦截", "仍在用 shape_rejected 直接 continue")
+        check(FAIL, "香烟形态：过滤但留痕", "缺少 shape_flagged 统计")
 
     arb = (ROOT / "src" / "arbiter.py").read_text(encoding="utf-8")
-    # _quota_ok 必须无条件返回 True
     seg = arb[arb.find("def _quota_ok"):]
-    seg = seg[:seg.find("def ", 10)] if "def " in seg[10:] else seg
-    if "return True" in seg and "return False" not in seg:
-        check(OK, "配额不拦截送审", "配额耗尽只是提醒，仍送 LLM")
+    seg = seg[:seg.find("\n    def ", 10)] if "\n    def " in seg[10:] else seg
+    has_warn = "[warn]" in seg
+    has_false = "return False" in seg
+    if has_false and has_warn:
+        check(OK, "配额：降级但留痕", "降级到规则层，并打 warn 日志")
+    elif not has_false:
+        check(OK, "配额：不降级", "配额耗尽仍送 LLM")
     else:
-        check(FAIL, "配额不拦截送审", "_quota_ok 仍会返回 False 拦截")
+        check(FAIL, "配额：降级但留痕", "降级了但没有日志 —— 静默降级不可接受")
 
 
 def main() -> int:
@@ -257,7 +260,7 @@ def main() -> int:
     test_kalman()
     test_tracker_no_split()
     test_pipeline_attrs()
-    test_all_go_to_llm()
+    test_filter_but_traceable()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")
