@@ -120,6 +120,10 @@ class Detector:
         # 检测帧率从 16 拖到 8.7。而香烟是慢过程（点烟、抽烟都在秒级），
         # 每 3 帧看一次完全够，中间复用上次结果。
         self.extra_every = 2
+        # 切片频率：整图每帧跑（响应快），切片每 N 帧补一次（小目标召回）
+        self.slice_every = 3
+        self._slice_n = 0
+        self._slice_cache: list[Detection] = []
         self._extra_n = 0
         self._extra_cache: list[Detection] = []
 
