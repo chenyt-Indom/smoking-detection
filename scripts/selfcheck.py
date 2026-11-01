@@ -371,6 +371,28 @@ def test_llm_label_wins() -> None:
         check(FAIL, "前端显示香烟", "前端不认识 cigarette")
 
 
+
+def test_cigarette_gate() -> None:
+    """香烟的置信度闸门必须用自己的门槛，不能套通用 0.50。
+
+    用户截图：两条 cigarette 事件都是"裁判不可用，请人工确认"，
+    置信度只有 0.13 / 0.21。原因是 _defer 里那道通用闸门
+        low = llm_min_conf (0.50)
+    —— 香烟模型对真实香烟给的分常在 0.1~0.3，永远过不了 0.50，
+    于是每一条都被挡回规则层。
+    """
+    src = (ROOT / "src" / "pipeline.py").read_text(encoding="utf-8")
+    i = src.find("② 置信度闸门")
+    if i < 0:
+        check(WARN, "香烟置信度闸门", "没找到闸门代码")
+        return
+    seg = src[i:i + 1200]
+    if 'kind == "cigarette"' in seg and "cigarette_conf" in seg:
+        check(OK, "香烟置信度闸门", "香烟走 0.03~0.95，不套通用 0.50")
+    else:
+        check(FAIL, "香烟置信度闸门", "香烟仍在用通用门槛，会被 0.50 挡住")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -387,6 +409,7 @@ def main() -> int:
     test_snapshot_and_merge()
     test_cigarette_reaches_llm()
     test_llm_label_wins()
+    test_cigarette_gate()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")

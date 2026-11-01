@@ -823,8 +823,19 @@ class Pipeline:
             return False
 
         # ② 置信度闸门（省钱的核心）：只在规则拿不准的区间才花钱
-        sure = float(self.cfg.get("llm_sure_conf", 0.85))
-        low = float(self.cfg.get("llm_min_conf", 0.50))
+        #
+        # ⚠️ 香烟必须走自己的上下限。
+        # 通用闸门是 [0.50, 0.85)：低于 0.50 认为"根本没检出"不值得花钱。
+        # 但香烟模型对真实香烟给出的置信度常在 0.1~0.3 —— 它目标太小、
+        # 分数天然低，用 0.50 当底线等于永远不送审。
+        # 用户看到的两条"裁判不可用，请人工确认"就是这么来的：
+        # conf 0.13 / 0.21 全被闸门挡回规则层。
+        if kind == "cigarette":
+            sure = float(self.cfg.get("llm_sure_conf_cig", 0.95))
+            low = float(self.cfg.get("cigarette_conf", 0.03))
+        else:
+            sure = float(self.cfg.get("llm_sure_conf", 0.85))
+            low = float(self.cfg.get("llm_min_conf", 0.50))
         if score >= sure or score < low:
             self.stats["llm_gated"] = self.stats.get("llm_gated", 0) + 1
             return False          # 交回规则层，一次 API 都不花
