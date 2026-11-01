@@ -134,7 +134,18 @@ class Detector:
         # 香烟改成每帧跑之后，切片通道让一让：3 -> 4。
         # 切片是主模型的补充通道（放大找小目标），4 帧一次够用，
         # 省下的算力给香烟模型，让它能每帧出框。
-        self.slice_every = 4
+        # 切片 2x2 -> 3x3，每帧的放大倍数从 1.5x 提到 2.25x。
+        #
+        # 关键认知：**切片不等于放大**。2x2 切出来每块 640x360，
+        # 送进 imgsz=960 只放大 1.5 倍 —— 一支 26x43 的香烟在切片里
+        # 仍然只有 39x65，模型照样看不清。3x3 每块约 426x240，
+        # 放大到 960 是 2.25 倍，香烟变成 58x97，这才进入"能认"的量级。
+        # 切片 imgsz 从 1280 回落到 1024：
+        # 实测 3x3 + 1280 时检测只有 11fps（cam_1 从 18 掉到 11），
+        # 追踪开始断续。1024 仍能把 3x3 的块放大 2.4x（426x240 -> 1024），
+        # 香烟约 62x103，够认；速度能回到 15 上下。
+        self.tile_imgsz = 1024
+        self.slice_every = 3
         self._slice_n = 0
         self._slice_cache: list[Detection] = []
         self._extra_n = 0
@@ -207,8 +218,11 @@ class Detector:
             return []
         if len(imgs) == 1:
             return self._predict(imgs[0], offsets[0])
+        # 切片块本身小，用更高的 imgsz 才能把里面的小目标放大到"能认"的尺寸。
+        # 整图仍用 self.imgsz（960）保速度，切片单独用 tile_imgsz（1280）。
         rs = self.model.predict(
-            list(imgs), imgsz=self.imgsz, conf=self.conf, iou=self.iou,
+            list(imgs), imgsz=getattr(self, "tile_imgsz", self.imgsz),
+            conf=self.conf, iou=self.iou,
             device=self.device, classes=self.classes, verbose=False,
         )
         out = []
@@ -238,8 +252,8 @@ class Detector:
         self,
         image: np.ndarray,
         sliced: bool = False,
-        tile_grid: int = 2,
-        overlap: float = 0.25,
+        tile_grid: int = 3,
+        overlap: float = 0.3,
         keep_full_frame: bool = True,
         batched: bool = False,
     ) -> list[Detection]:
@@ -284,9 +298,9 @@ class Detector:
     def detect_auto(
         self,
         image: np.ndarray,
-        trigger_conf: float = 0.08,
-        tile_grid: int = 2,
-        overlap: float = 0.25,
+        trigger_conf: float = 0.03,
+        tile_grid: int = 3,
+        overlap: float = 0.3,
     ) -> list[Detection]:
         """分级检测：先粗筛一帧，**只有粗筛出了东西才切片**。
 
