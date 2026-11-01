@@ -128,7 +128,10 @@ DEFAULTS = {
     # 规则层置信度高于此值时，LLM 判"非风险"也**只能降级为待确认，不能直接排除**。
     # 依据：实测出现过 YOLO 给 0.95、LLM 一句 "light" 就把它抹掉的情况，
     # 而画面里确实有火 —— 两个信号冲突时应该交给人看，不该由模型单方面裁决。
-    "llm_override_conf": 0.85,
+    # 规则层置信达到这个值、而 LLM 判非火时，才升级成"待确认"交人。
+    # 0.85 太低：实测开思考后 LLM 的理由相当扎实（"头发反光""无火苗轮廓"），
+    # 这时还把结论推回给人重判一遍，等于裁判白请了。
+    "llm_override_conf": 0.95,
     # 置信度高于此值时，即使该区域刚被判过"非火"也重新送审（防区域静音误伤真火）
     "llm_mute_bypass_conf": 0.80,
     # 固定光源预筛（纯本地、免费）。设为 False 则所有目标都送审，更准但更贵。
@@ -373,6 +376,10 @@ class Pipeline:
         self._steam_noticed: set[int] = set()  # 已推过"降级为蒸汽"提示的轨迹
         self._static_noticed: set[int] = set() # 已推过"疑似灯光"提示的轨迹
         self._recheck_done: set[int] = set()   # 已对被判降级却久不消散的目标叫过人
+        # 被"固定光源预筛"拦下的轨迹：不送审、也不推事件。
+        # 这类目标已满足"稳定 >8s + 面积不涨 + 亮度不抖 + 边缘稳定"，
+        # 是典型的灯具/反光/手电筒常亮，再弹一条"待确认"纯属噪音。
+        self._prefiltered: set[int] = set()
         self._fired: set[int] = set()        # 已报过的轨迹（同一条火只报一次）
         self._recent_alarms: list[tuple[float, str, tuple, int]] = []   # (t, kind, box, tid)
         self._recent_notices: list[tuple[float, tuple]] = []             # (t, box)
@@ -548,6 +555,7 @@ class Pipeline:
         self._static_noticed &= live
         self._saved_tids &= live
         self._recheck_done &= live
+        self._prefiltered &= live
         for k in [k for k in self._arbiter_done if k.rsplit(":", 1)[-1].isdigit()
                   and int(k.rsplit(":", 1)[-1]) not in live]:
             self._arbiter_done.pop(k, None)
@@ -690,6 +698,7 @@ class Pipeline:
                 and score < float(self.cfg.get("llm_sure_conf", 0.92))
                 and self._looks_static_light(extract_features(t.samples))):
             self.stats["static_prefiltered"] = self.stats.get("static_prefiltered", 0) + 1
+            self._prefiltered.add(tid)
             return False
 
         # ② 置信度闸门（省钱的核心）：只在规则拿不准的区间才花钱
@@ -939,17 +948,21 @@ class Pipeline:
                         # 按 ID 记账就是几十张卡片 —— 用户原话"不要多次上报"。
                         # `_can_notice` 命中同区域会续期，所以"这块地方一直亮着"
                         # 只有一条；灯真灭了 30 秒之后才允许再提。
-                        if self._can_notice(pkt.ts, t.last_box):
+                        sent = self._defer("fire", t.tid, t, pkt, conf, t.last_box,
+                                           ["规则层疑为静态光源，请判断是火还是灯"])
+                        # 先送审、不提前发待确认：原来"发notice+同时送审"会让同一件事出两条卡片"
+                        # （先蓝的待确认、再绿的已排除），看起来就是通知满天飞。送审失败才退化成待确认。
+                        if not sent and self._can_notice(pkt.ts, t.last_box):
                             events.append(self._make_event(
                                 "fire", "notice", t.tid, t, pkt, conf, t.last_box,
-                                ["检出火焰但亮度恒定，疑似灯光/反光，已降级（**不是排除**），"
-                                 "已送人工复核"] + list(fv.reasons[:1])))
-                        self._defer("fire", t.tid, t, pkt, conf, t.last_box,
-                                    ["规则层疑为静态光源，请判断是火还是灯"])
-                    continue
-
+                                ["检出火焰但亮度恒定，疑似灯光/反光（裁判不可用，请人工确认）"] + list(fv.reasons[:1])))
+                    continue          # static 目标已送审，等裁决
                 if self._defer("fire", t.tid, t, pkt, conf, t.last_box, fire_reasons):
                     continue          # 已送审，等 LLM 裁决再定级
+                if t.tid in self._prefiltered:
+                    # 固定光源预筛拦下：静默跳过，不推"待确认"占事件流。
+                    # 检测和追踪照常，特征一变（面积涨/亮度抖）下次自动走完整流程。
+                    continue
                 events.append(self._make_event(
                     "fire", "alarm", t.tid, t, pkt, conf, t.last_box,
                     fire_reasons + ([] if (fv is None or fv.label != "fire")

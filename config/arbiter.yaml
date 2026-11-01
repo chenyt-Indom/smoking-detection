@@ -11,12 +11,8 @@ enabled: true
 dry_run: false                 # true = 不发请求，只验证接线
 
 # ── 接口 ──────────────────────────────────────────────────
-# 本地试运行：改回云端把下面两行换回
-#   url: https://api.deepseek.com/v1/chat/completions
-#   model: deepseek-flash
-# 原配置已备份到 config/arbiter.yaml.cloud.bak
-url: http://127.0.0.1:11434/v1/chat/completions
-model: qwen3-vl:8b             # 本地 Ollama，5.8GB 全量驻显卡
+url: https://api.deepseek.com/v1/chat/completions
+model: deepseek-flash          # DeepSeek-V4.1-Flash，原生多模态（支持 JPEG/PNG/WebP）
 api_key_env: DEEPSEEK_KEY      # 系统环境变量名，不写具体值
 
 # 旧配置（天翼云星辰 TokenHub），换回来时改上面三行：
@@ -34,7 +30,7 @@ api_key_env: DEEPSEEK_KEY      # 系统环境变量名，不写具体值
 # 凭一眼印象作答 —— 而"火苗 vs 手电筒 vs 打火机 vs 反光"恰恰需要它在心里
 # 比对形状、梯度、色温这些细节。关掉思考后这类细粒度判别明显变差。
 # 正确做法是开着思考 + 给足输出预算，而不是关掉它。
-thinking: enabled              # 本地模型自带推理，这个开关只影响请求参数
+thinking: enabled              # disabled / enabled
 temperature: 0.1
 # 开思考后输出预算要够：推理链本身就可能几百到上千 token。
 # 512 会让它思考到一半被截断，content 返回空 —— 那正是当初关思考的原因。
