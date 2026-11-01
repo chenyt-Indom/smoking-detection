@@ -808,7 +808,17 @@ class Pipeline:
 
         # ① 固定光源预筛：纯本地、零成本。命中就交回规则层（最多到"待确认"），
         #    既不花钱，也不会把目标从屏幕上抹掉。
-        if (self.cfg.get("static_prefilter", True)
+        # ⚠️ 香烟**豁免**这道预筛。
+        #
+        # 静态预筛的初衷是"墙上那块不动的白斑不值得花钱问 LLM"，
+        # 判据是面积/亮度/边缘稳定。但**手持香烟本来就几乎不动** ——
+        # 用户夹着烟举在胸前，画面里那块区域是静止的，于是被判成
+        # "固定光源"，直接 return False -> 界面显示"裁判不可用，请人工确认"，
+        # 耗时 0.3 秒（根本没调 LLM）。
+        #
+        # 香烟是**明确违规行为**，哪怕它静止不动也必须让 LLM 看一眼。
+        if (kind != "cigarette"
+                and self.cfg.get("static_prefilter", True)
                 and score < float(self.cfg.get("llm_sure_conf", 0.92))
                 and self._looks_static_light(extract_features(t.samples))):
             self.stats["static_prefiltered"] = self.stats.get("static_prefiltered", 0) + 1

@@ -413,10 +413,16 @@ def test_cigarette_confirm_frames() -> None:
     import yaml
     c = yaml.safe_load(cfg) or {}
     tc = float((c.get("thresholds") or {}).get("cigarette_conf", 0))
-    if tc >= 0.06:
-        check(OK, "香烟检测门限", f"{tc} 已离开噪声区")
+    # 策略变了：现在香烟是"极低门槛收候选 + 全量送 LLM 裁决"，
+    # 门限低是**故意的**。只要它 <= det_conf 就说得通 ——
+    # 真正的把关在 LLM 那一层，不在检测层。
+    det_c = float((c.get("thresholds") or {}).get("det_conf", 1))
+    # 正确关系：类别门槛 >= 总门槛（总门槛是"什么都要过"的那道粗筛，
+    # 类别门槛是"这一类至少要多可信"）。写反过一次，自检自己报的错。
+    if tc >= det_c:
+        check(OK, "香烟检测门限", f"{tc} >= det_conf {det_c}，不会被总门槛先滤掉")
     else:
-        check(FAIL, "香烟检测门限", f"{tc} 太低，全是噪声")
+        check(FAIL, "香烟检测门限", f"{tc} < det_conf {det_c}，目标会被总门槛滤掉")
 
 
 
@@ -561,6 +567,28 @@ def test_parse_with_thinking() -> None:
         check(OK, "思考链下的解析", "答案在分析之后也能取出（取最后一个 JSON）")
 
 
+
+def test_cigarette_skips_static_prefilter() -> None:
+    """香烟必须豁免"静态光源预筛"。
+
+    用户截图：一条 cigarette 事件显示"裁判不可用，请人工确认"，耗时 0.3s
+    —— 0.3 秒说明 LLM 根本没被调用。
+
+    原因：手持香烟本来就几乎不动，被 _looks_static_light 判成"固定光源"，
+    直接 return False。可香烟是明确违规行为，哪怕静止也必须让 LLM 看。
+    """
+    src = (ROOT / "src" / "pipeline.py").read_text(encoding="utf-8")
+    i = src.find("① 固定光源预筛")
+    if i < 0:
+        check(WARN, "香烟豁免静态预筛", "没找到预筛代码")
+        return
+    seg = src[i:i + 900]
+    if 'kind != "cigarette"' in seg:
+        check(OK, "香烟豁免静态预筛", "手持香烟静止不动也会送 LLM")
+    else:
+        check(FAIL, "香烟豁免静态预筛", "香烟静止时仍会被判成光源、不送审")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -584,6 +612,7 @@ def main() -> int:
     test_ui_and_prompt_fixes()
     test_floor_order()
     test_parse_with_thinking()
+    test_cigarette_skips_static_prefilter()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")
