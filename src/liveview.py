@@ -173,6 +173,73 @@ class LiveView:
         union = ((ax2 - ax1) * (ay2 - ay1) + (bx2 - bx1) * (by2 - by1) - inter)
         return inter / union if union > 0 else 0.0
 
+    def _smooth(self, dets, alpha: float = 0.45):
+        """跨帧框平滑：同类别 + IOU 匹配 → 指数滑动平均。
+
+        alpha 是基准权重（0.45）。实际使用时按每帧位移自适应：
+          静止  -> 约 0.45，重在历史，压抖动
+          移动快 -> 最高 0.9，重在观测，不拖影
+        框的宽高也各自独立平滑，避免尺寸忽大忽小。
+        """
+        prev = self._prev_boxes
+        used = set()
+        out = []
+        for d in dets:
+            box = getattr(d, "xyxy", None)
+            if box is None:
+                out.append((None, getattr(d, "cls_name", ""), getattr(d, "conf", 0.0)))
+                continue
+            name = str(getattr(d, "cls_name", ""))
+            best, best_iou = -1, 0.25
+            for i, (pb, pn, _pc) in enumerate(prev):
+                if i in used or pn != name or pb is None:
+                    continue
+                v = self._iou(pb, box)
+                if v > best_iou:
+                    best, best_iou = i, v
+            if best >= 0:
+                pb = prev[best][0]
+                # 自适应 alpha：按"这一帧移动了多少"动态调整历史权重。
+                #   目标基本不动 -> 重在历史（更稳，压下抖动）
+                #   目标快速移动 -> 重在观测（跟手，避免拖影和滞后）
+                # 移动量用两框中心的位移 / 框对角线长度衡量，做归一化。
+                _mx = (float(box[0] + box[2]) - float(pb[0] + pb[2])) / 2.0
+                _my = (float(box[1] + box[3]) - float(pb[1] + pb[3])) / 2.0
+                _diag = max(1.0, ((float(pb[2] - pb[0])) ** 2
+                                  + (float(pb[3] - pb[1])) ** 2) ** 0.5)
+                _shift = (_mx * _mx + _my * _my) ** 0.5 / _diag
+
+                # ── 基准 alpha 按**目标特性**分，不是照搬头部追踪的 0.45 ──
+                # 头部追踪那套是为"大目标、平缓移动"调的。现在这三类完全不一样：
+                #
+                #   火苗  20~40px，**剧烈抖动 + 闪烁**，帧间位置能跳十几像素
+                #         -> 基准要压得更低（0.28），重在历史，否则框跟着火苗乱跳
+                #   香烟  12~40px，手持、移动慢但检测分数低、偶尔漏帧
+                #         -> 0.30，压抖为主，慢移动时不会拖影
+                #   烟    通常 60~200px，缓慢扩散
+                #         -> 0.45（原来的基准），形态变化本来就是它的特征
+                #
+                # 另外**小目标整体再压一档**：小目标上同样的像素抖动
+                # 占框比例大得多，同样的 alpha 视觉上就是"更抖"。
+                _w = abs(float(box[2]) - float(box[0]))
+                _h = abs(float(box[3]) - float(box[1]))
+                _base = {"fire": 0.28, "cigarette": 0.30, "smoke": 0.45}.get(name, 0.40)
+                if min(_w, _h) < 48:          # 小目标：再重一点历史
+                    _base *= 0.78
+                elif min(_w, _h) > 160:       # 大目标：可以更信任观测
+                    _base = min(0.5, _base * 1.15)
+
+                # 位移增益 1.4 也按目标大小调：小目标归一化位移天然更大，
+                # 用同样的增益会让"稍微动一下"就跳到 0.9，等于没平滑。
+                _gain = 0.9 if min(_w, _h) < 48 else 1.4
+                _a = min(0.9, max(0.20, _base + _shift * _gain))
+                box = tuple(_a * float(c) + (1.0 - _a) * float(p)
+                            for c, p in zip(box, pb))
+                used.add(best)
+            out.append((box, name, getattr(d, "conf", 0.0)))
+        self._prev_boxes = out
+        return out
+
     def _draw(self, image: np.ndarray, dets, frame_idx, cam_id) -> np.ndarray:
         # 先做跨帧平滑，再画。把平滑后的框包成和 Detection 同构的对象，
         # 这样下面所有绘制/统计代码不用改结构。
@@ -185,13 +252,23 @@ class LiveView:
                 self.cls_id = cid
                 self.area = max(0.0, self.xyxy[2] - self.xyxy[0]) * max(0.0, self.xyxy[3] - self.xyxy[1])
 
-        # 不再做 EMA 平滑 —— 上游 Kalman 已经把位置和尺寸都滤过了，
-        # 这里再平滑一次等于串联两个低通滤波器，只会引入额外滞后，
-        # 让框"追不上手"。之前担心的跨轨迹跳变，现在由"只画本帧
-        # 匹配上的轨迹"解决了：轨迹一断框就消失，不存在新旧交替的中间态。
-        dets = [_S(getattr(d, "xyxy", None), str(getattr(d, "cls_name", "")),
-                   float(getattr(d, "conf", 0.0)), int(getattr(d, "cls_id", -1)))
-                for d in (dets or [])]
+        # 恢复**自适应 EMA 平滑**。
+        #
+        # 之前我判断"Kalman 已经平滑过，这里再平滑是重复"，把它删了 ——
+        # 这个判断是错的，删完之后框开始跳，用户明确反馈"以前头部追踪
+        # 可以精准丝滑不偏离，现在越来越糟"。
+        #
+        # 两者根本不重复，负责的事不同：
+        #   Kalman  预测下一帧在哪 + 用检测校正（处理**移动**）
+        #   EMA     跨帧压抖动、尺寸不忽大忽小（处理**抖动**）
+        # 而且这里的 EMA 是**自适应**的：alpha = clamp(0.45 + 位移比*1.4, 0.25, 0.9)
+        #   静止   -> 0.25~0.45，重在历史，压抖动
+        #   快速移动 -> 最高 0.9，重在观测，不拖影
+        # 所以它不会像固定 EMA 那样引入滞后。
+        _raw = list(dets or [])
+        _sm = self._smooth(_raw)
+        dets = [_S(b, n, c, getattr(_raw[i], "cls_id", -1) if i < len(_raw) else -1)
+                for i, (b, n, c) in enumerate(_sm)]
         img = image.copy()
         h, w = img.shape[:2]
         placed: list[tuple[int, int, int, int]] = []   # 已占用的标签区域，防重叠
