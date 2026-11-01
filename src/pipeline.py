@@ -487,12 +487,14 @@ class Pipeline:
         area_pct = (w * h) / max(1.0, img_w * img_h)
         if kind == "cigarette":
             ar = max(w, h) / min(w, h)
-            lo = float(cfg.get("cig_aspect_min", 2.0))
-            hi = float(cfg.get("cig_aspect_max", 12.0))
+            # 放宽到 1.5~15：原来 2.0 会把"侧对镜头、几乎成一条线"的烟
+            # 以及"正对镜头、看起来偏方"的烟头挡掉。交付场景宁可多放进来。
+            lo = float(cfg.get("cig_aspect_min", 1.5))
+            hi = float(cfg.get("cig_aspect_max", 15.0))
             if not (lo <= ar <= hi):
                 return False
-            if not (float(cfg.get("cig_area_min", 0.0001))
-                    <= area_pct <= float(cfg.get("cig_area_max", 0.02))):
+            if not (float(cfg.get("cig_area_min", 0.00002))
+                    <= area_pct <= float(cfg.get("cig_area_max", 0.05))):
                 return False
         return True
 
