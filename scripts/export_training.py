@@ -111,6 +111,9 @@ def main() -> int:
         for d in (img_tr, lbl_tr):
             d.mkdir(parents=True, exist_ok=True)
 
+    # 目录按类别分开了（images/fire、images/smoke），统计也分开看
+    stat = {"fire": [0, 0], "smoke": [0, 0]}     # [正样本, 负样本]
+
     n_pos = n_neg = 0
     for r in rows:
         vc = r.get("verdict_class")
@@ -122,6 +125,10 @@ def main() -> int:
         src = Path(saved)
         if not src.is_file():
             continue
+        kind = str(r.get("kind") or "fire").lower()
+        if kind not in ("fire", "smoke"):
+            kind = "fire"
+
         if vc == "FP":
             # 负样本：空标注 = "这张图里没有目标"
             stem = f"neg_{r['wall_ms']}_{r.get('cam','')}"
@@ -129,6 +136,7 @@ def main() -> int:
                 shutil.copy2(src, img_tr / f"{stem}.jpg")
                 (lbl_tr / f"{stem}.txt").write_text("", encoding="utf-8")
             n_neg += 1
+            stat[kind][1] += 1
         else:
             # 正样本：用 YOLO 当时的框当伪标注
             img = imread_cn(src)
@@ -140,16 +148,20 @@ def main() -> int:
             box = r.get("box")
             if not box or len(box) != 4:
                 continue
-            cls_id = CLS_ID.get(str(r.get("kind") or ""), 0)
+            cls_id = CLS_ID.get(kind, 0)
             line = yolo_line(box, iw, ih, cls_id, ow / iw, oh / ih, ow, oh)
             stem = f"pos_{r['wall_ms']}_{r.get('cam','')}"
             if not a.dry:
                 shutil.copy2(src, img_tr / f"{stem}.jpg")
                 (lbl_tr / f"{stem}.txt").write_text(line + "\n", encoding="utf-8")
             n_pos += 1
+            stat[kind][0] += 1
 
     print(f"\n导出：正样本 {n_pos} 张，负样本 {n_neg} 张"
           + ("（dry-run，未写文件）" if a.dry else f" → {out}"))
+    for k, (pp, nn) in stat.items():
+        if pp or nn:
+            print(f"  {k:6s} 正 {pp:3d}  负 {nn:3d}")
 
     if not a.dry and (n_pos or n_neg):
         # 顺手生成一份 data.yaml，可以直接交给 ultralytics

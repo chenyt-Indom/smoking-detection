@@ -221,12 +221,14 @@ class Notifier:
         reports.jsonl 里的一行，不会在训练集里塞 50 张一样的图。
         """
         verdict = str(body.get("verdict") or "")
-        # 前端按钮语义：有火 / 无火。旧的 false_alarm / true_alarm 仍然兼容，
-        # 免得已打开的旧页面点不了。
-        alias = {"true_alarm": "fire", "false_alarm": "no_fire"}
+        # 语义统一成「有没有这个目标」，具体是火还是烟由事件的 kind 决定：
+        #   火事件 -> 有火 / 无火 ；烟事件 -> 有烟 / 无烟
+        # 这样同一套接口能同时服务两类事件，前端只换文案。
+        alias = {"true_alarm": "present", "false_alarm": "absent",
+                 "fire": "present", "no_fire": "absent"}
         verdict = alias.get(verdict, verdict)
-        if verdict not in ("fire", "no_fire"):
-            return {"ok": False, "error": "verdict 只能是 fire / no_fire"}
+        if verdict not in ("present", "absent"):
+            return {"ok": False, "error": "verdict 只能是 present / absent"}
 
         wid = body.get("wall_ms")
         with self._lock:
@@ -249,7 +251,7 @@ class Notifier:
             model_label = "fire" if lv in ("alarm", "warning") else (
                 "other" if lv == "cleared" else "uncertain")
         model_says_fire = model_label in ("fire", "smoke")
-        human_says_fire = verdict == "fire"
+        human_says_fire = verdict == "present"
         if human_says_fire and model_says_fire:
             vclass = "TP"          # 都对，不学
         elif human_says_fire and not model_says_fire:
@@ -285,9 +287,14 @@ class Notifier:
             else:
                 # 负样本用 ROI（信息密度高、直接是待判别的区域）
                 # 正样本用全图（要保留空间关系，且框坐标本来就是相对全图的）
-                sub = "positives" if vclass == "FN" else ""
-                img_dir = self.report_dir / sub / "images" if sub else self.report_dir / "images"
-                lbl_dir = self.report_dir / sub / "labels" if sub else self.report_dir / "labels"
+                # 按类别分子目录：火的误报和烟的误报是两回事，
+                # 训练时也得分开放（负样本可以混，正样本的类别必须对）。
+                kind_dir = str(rec.get("kind") or "fire").lower()
+                if kind_dir not in ("fire", "smoke"):
+                    kind_dir = "fire"
+                base = self.report_dir / "positives" if vclass == "FN" else self.report_dir
+                img_dir = base / "images" / kind_dir
+                lbl_dir = base / "labels" / kind_dir
                 img_dir.mkdir(parents=True, exist_ok=True)
                 lbl_dir.mkdir(parents=True, exist_ok=True)
                 stem = (f"hp_{wid}_{rec.get('cam')}_{rec.get('kind')}" if vclass == "FN"
