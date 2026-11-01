@@ -69,13 +69,16 @@ SYSTEM = (
     "任务：判断这个可疑目标是否构成火灾风险。\n\n"
     "判据：\n"
     "- 厨房灶台、焊接工位、排气口、水壶上方的白色羽流 → 水汽/工艺气，风险低\n"
-    "- 天花板常亮光斑、灯具、反光 → 灯光，风险低\n"
+    "- ⚠️ 先看这条再看灯光：**打火机、蜡烛、酒精灯、火柴、灶火，"
+    "哪怕只有一个指甲盖大，也是 fire**。判据是「有没有一小片橙黄/蓝黄渐变、"
+    "边缘会飘动的火苗」—— 手指或金属物件上出现这种小亮点，基本就是打火机，"
+    "不要因为面积小、没有烟、没有烧到别的东西就判成 light\n"
     "- 有明火舌、根部明亮、火光映在墙面、焦黑痕迹 → fire，风险高\n"
-    "- 手机手电筒、补光灯、屏幕高光：圆形或方形的**均匀**亮斑，边缘锐利、"
+    "- 天花板常亮光斑、灯具、反光：大面积、边缘柔和、位置固定 → light，风险低\n"
+    "- 手机手电筒、补光灯：圆形或方形**均匀**亮斑，边缘锐利、"
     "内部没有明暗梯度、色温偏白或偏蓝 → light，风险低\n"
-    "- **打火机、蜡烛、酒精灯、火柴这类小型明火同样是 fire**，"
-    "不要因为面积小、四周没有烟就判成 light；"
-    "灯是没有轮廓的弥散光斑，火苗有明确的舌状轮廓和亮黄-橙色核心\n"
+    "- ⚠️ 分不清是「一小团会飘的火苗」还是「均匀的圆形光斑」时，"
+    "选 uncertain 而不是 light —— 宁可请人看一眼，也别把火排掉\n"
     "- 灰/黑色翻滚上升、贴天花板横向扩散、地面黑色堆积 → smoke，风险高\n"
     "- 人手/手指/衣物/家具/宠物/屏幕画面等**明确不是火的东西** → other，风险低\n"
     "- 图片太糊、太小、被遮挡，确实无法判断 → uncertain，confidence 给低\n"
@@ -489,7 +492,53 @@ class LlmArbiter:
                 self.stats["error"] += 1
                 return self._fallback(rule_label, rule_score, "返回不是合法 JSON", latency)
             self.stats["llm"] += 1
-            return self._to_result(parsed, latency)
+            res = self._to_result(parsed, latency)
+
+            # ── 二次验证：判"非火"时再问一遍 ─────────────────────
+            # 用户的原话是"不要急于求成，最好多次验证"。实测出现过打火机的
+            # 火苗被判 light → 系统直接"已排除"，等于把真火静默掉。
+            # 这类错误方向上是**危险的**（漏报），比误报更需要防。
+            #
+            # 只对"排除性结论"复核：判 fire/smoke 不重复（多花一次钱且没有
+            # 安全争议），判 light/other/steam 且置信不足时才再问。
+            # 两次都说不是火 → 采信；两次打架 → 交人，不擅自排除。
+            thr = float(cfg.get("verify_dismiss_conf", 0.85))
+            if (cfg.get("verify_dismiss", True) and res.is_dismiss
+                    and float(res.confidence) < thr):
+                body2 = dict(body)
+                body2["temperature"] = float(cfg.get("verify_temperature", 0.35))
+                try:
+                    r2 = requests.post(cfg["url"], json=body2,
+                                       timeout=float(cfg["timeout_s"]),
+                                       headers={"Authorization": f"Bearer {self.api_key}",
+                                                "Content-Type": "application/json",
+                                                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"})
+                    self._mark_call()
+                    self.stats["verify_runs"] = self.stats.get("verify_runs", 0) + 1
+                    if r2.status_code < 400:
+                        m2 = r2.json().get("choices", [{}])[0].get("message", {})
+                        p2 = _parse_json((m2.get("content") or "").strip())
+                        if p2:
+                            res2 = self._to_result(p2, time.time() - t0)
+                            if not res2.is_dismiss:
+                                # 两次结论相反 → 不擅自排除，交人看
+                                self.stats["verify_conflict"] = \
+                                    self.stats.get("verify_conflict", 0) + 1
+                                return ArbiterResult(
+                                    "uncertain", "medium",
+                                    min(float(res.confidence), float(res2.confidence)),
+                                    f"两次判定不一致（{res.label} vs {res2.label}），"
+                                    f"已转人工确认",
+                                    "llm", time.time() - t0,
+                                    {"first": res.label, "second": res2.label})
+                            # 两次都说不是火 → 取更确信的那一次
+                            if float(res2.confidence) > float(res.confidence):
+                                res = res2
+                except Exception:                    # noqa: BLE001
+                    # 复核失败不影响第一次结论，但记一笔便于排查
+                    self.stats["verify_error"] = self.stats.get("verify_error", 0) + 1
+
+            return res
         except Exception as exc:                          # noqa: BLE001
             self.stats["timeout"] += 1
             return self._fallback(rule_label, rule_score,

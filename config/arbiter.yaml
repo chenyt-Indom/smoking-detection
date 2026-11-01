@@ -51,6 +51,16 @@ hourly_limit: 300              # 每小时调用上限，超了自动降级到�
 dedup_seconds: 180             # 同一目标 3 分钟内只审一次
 accept_conf: 0.55              # 采信门限
 
+# ── 二次验证（防"把真火判成灯光"这类漏报）──────────────
+# 判 light/other/steam 且置信低于 verify_dismiss_conf 时，换一个温度再问一遍。
+#   两次都说不是火 -> 采信
+#   两次打架       -> 转 uncertain 交人工，不擅自排除
+# 判 fire/smoke 不重复问（没有安全争议，多花一次钱不值）。
+# 代价：约 1.2~1.5 倍调用量，换来的是"危险方向的错误"被拦住。
+verify_dismiss: true
+verify_dismiss_conf: 0.85      # 置信 >= 此值就不复核了（模型很笃定）
+verify_temperature: 0.35       # 复核用的温度，比主判定的 0.1 高，制造判断多样性
+
 # ── 看板 ──────────────────────────────────────────────────
 # 「充值」按钮跳转地址，改完刷新看板即生效（前端从 /api/llm 读这个字段）
 recharge_url: https://platform.deepseek.com/top_up
