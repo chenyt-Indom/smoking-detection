@@ -538,6 +538,29 @@ def test_floor_order() -> None:
         check(OK, "检测层门槛次序", detail)
 
 
+
+def test_parse_with_thinking() -> None:
+    """开了思考链之后，答案前面会有一大段分析，解析必须能穿透。
+
+    实测日志：
+      [llm] 解析失败，原始返回：'让我仔细看看这两张图片。图1：整幅画面。
+      一个人戴着大耳机，手里拿着手机…他嘴里似乎叼着什么东西…'
+    —— 模型在正文里写了长篇分析，真正的 JSON 还没开始输出就被截断了。
+    """
+    sys.path.insert(0, str(ROOT))
+    from src.arbiter import _parse_json
+    cases = [
+        ("思考在前", '让我看看图1。图1是一个人。\n{"label":"cigarette","confidence":0.62}'),
+        ("思考带花括号", '分析{a}和{b}后：{"label":"other","confidence":0.9}'),
+        ("纯 JSON", '{"label":"fire","confidence":0.8}'),
+    ]
+    bad = [n for n, t in cases if not (_parse_json(t) or {}).get("label")]
+    if bad:
+        check(FAIL, "思考链下的解析", "穿透失败 -> " + "、".join(bad))
+    else:
+        check(OK, "思考链下的解析", "答案在分析之后也能取出（取最后一个 JSON）")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--strict", action="store_true", help="有 FAIL 时返回非零")
@@ -560,6 +583,7 @@ def main() -> int:
     test_json_parse()
     test_ui_and_prompt_fixes()
     test_floor_order()
+    test_parse_with_thinking()
 
     print("\n" + "=" * 62)
     print(f"{'结果':6s}{'检查项':26s}说明")

@@ -34,7 +34,7 @@ thinking: enabled              # disabled / enabled
 temperature: 0.1
 # 开思考后输出预算要够：推理链本身就可能几百到上千 token。
 # 512 会让它思考到一半被截断，content 返回空 —— 那正是当初关思考的原因。
-max_tokens: 2048
+max_tokens: 4096
 timeout_s: 35                  # 开思考后明显变慢，20 秒不够；超时会退回规则层
 
 # 图片参数：ROI 放大看细节，整幅图看环境。长边压小是为了省 token，不是为了省流量

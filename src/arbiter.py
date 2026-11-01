@@ -140,6 +140,8 @@ SYSTEM = (
     "  不要把'看清楚了但没危险'答成 uncertain，那会让系统一直请你复核。\n\n"
     "只输出一个 JSON，不要任何解释文字，不要 markdown 代码块：\n"
     '"reason":"一句话，不超过 40 字",\n'
+    '⚠️ 直接输出 JSON，不要写"让我看看""图1是…"这类分析过程。\n'
+    'reason 一句话不超过 40 字。可以先在心里判断，但最终只输出那一个 JSON 对象。\n\n'
     '{"label":"fire|smoke|cigarette|steam|light|other|uncertain",'
     '"risk":"high|medium|low","confidence":0.0-1.0,'
     '"reason":"20字以内，必须指出画面里的具体依据"}'
@@ -233,7 +235,11 @@ def _parse_json(text: str) -> dict | None:
         t = t.split("\n", 1)[-1]
         if t.rstrip().endswith("```"):
             t = t.rstrip()[:-3]
-    i, j = t.find("{"), t.rfind("}")
+    # 取**最后一个** { 开始的那段。
+    # 开了思考链之后，模型前面会写一大段"让我看看图1…图2…"的分析，
+    # 里面偶尔会带 { } 举例。真正的答案永远在最后 ——
+    # 取第一个 { 会把分析过程当成 JSON。
+    i, j = t.rfind("{"), t.rfind("}")
     if i < 0:
         return None
     # j <= i 说明**没有右括号** —— 这恰恰是「输出被截断」的典型形态
@@ -241,6 +247,10 @@ def _parse_json(text: str) -> dict | None:
     # 之前这里直接 return None，等于把本来能救回来的结果扔了。
     # 现在改成取到末尾，后面再补全。
     frag = t[i:j + 1] if j > i else t[i:]
+    if not frag.lstrip().startswith("{"):
+        _f = t.find("{")
+        if _f >= 0:
+            frag = t[_f:j + 1] if j > _f else t[_f:]
     # 中文引号（模型偶尔把英文引号写成 “ ” ‘ ’）。
     # 用 chr() 而不是字面量，避免源码经过几层替换后转义失效。
     _cn = frag
