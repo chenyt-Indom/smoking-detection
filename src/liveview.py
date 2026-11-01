@@ -169,7 +169,13 @@ class LiveView:
         # 灰框的价值只有"这里可能有问题"这一句话，说两遍就够了。
         _cand_limit = 2
         _cand_drawn = 0
-        _cand_min_area = h * w * 0.006
+        # 面积门槛必须按类别分开：
+        #   火/烟 是成片的东西，小于画面 0.6% 的基本是噪点
+        #   香烟 本身就是细长小目标，一支烟在 960x540 里通常只有几百像素
+        #        （约 0.06%）。之前统一用 0.6%，等于把香烟全挡掉了 ——
+        #        用户举着烟却"检测 0 个目标"就是这么来的。
+        _cand_min_area = h * w * 0.006      # 火/烟
+        _cand_min_area_cig = h * w * 0.00015  # 香烟：约 78 像素起
 
         def collides(box) -> bool:
             x1, y1, x2, y2 = box
@@ -200,7 +206,9 @@ class LiveView:
             if conf < alarm_thr:
                 _bw = max(1.0, x2 - x1)
                 _bh = max(1.0, y2 - y1)
-                if _cand_drawn >= _cand_limit or _bw * _bh < _cand_min_area:
+                _is_cig = "cig" in str(getattr(d, "cls_name", "")).lower()
+                _need = _cand_min_area_cig if _is_cig else _cand_min_area
+                if _cand_drawn >= _cand_limit or _bw * _bh < _need:
                     continue
             if conf >= alarm_thr:
                 if "cig" in str(getattr(d, "cls_name", "")).lower():
