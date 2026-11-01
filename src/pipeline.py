@@ -1181,8 +1181,19 @@ class Pipeline:
         # 本来就已经算好了，只是之前画的是原始框没用上。
         #
         # 顺带一个好处：轨迹有 coasting，目标被短暂遮挡时框不会立刻消失。
+        # 只画**本帧匹配上**的轨迹（misses == 0）。
+        #
+        # 这是"框分裂"的彻底解法。原来把所有存活轨迹都画出来 —— 包括
+        # 这一帧没匹配上的旧轨迹（它还要活 0.25 秒）和刚建立的新轨迹，
+        # 于是屏幕上同时出现"停在原地的旧框"和"跟着目标走的新框"。
+        #
+        # 只画本帧有检测支撑的轨迹，屏幕上任何时刻一条轨迹最多一个框，
+        # 物理上不可能分裂。代价是目标短暂丢失时框会立刻消失 ——
+        # 对监控来说这比"两个框"更可接受（消失说明真的没看见）。
         draw_dets: list[Detection] = []
         for _t in tracks:
+            if _t.misses != 0:
+                continue                 # 本帧没匹配上，不画
             if _t.last_box is None or not _t.samples:
                 continue
             draw_dets.append(Detection(_t.cls_id, _t.cls_name,

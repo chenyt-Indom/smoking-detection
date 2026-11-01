@@ -228,10 +228,13 @@ class LiveView:
                 self.cls_id = cid
                 self.area = max(0.0, self.xyxy[2] - self.xyxy[0]) * max(0.0, self.xyxy[3] - self.xyxy[1])
 
-        _raw = list(dets or [])
-        _sm = self._smooth(_raw)
-        dets = [_S(b, n, c, getattr(_raw[i], "cls_id", -1) if i < len(_raw) else -1)
-                for i, (b, n, c) in enumerate(_sm)]
+        # 不再做 EMA 平滑 —— 上游 Kalman 已经把位置和尺寸都滤过了，
+        # 这里再平滑一次等于串联两个低通滤波器，只会引入额外滞后，
+        # 让框"追不上手"。之前担心的跨轨迹跳变，现在由"只画本帧
+        # 匹配上的轨迹"解决了：轨迹一断框就消失，不存在新旧交替的中间态。
+        dets = [_S(getattr(d, "xyxy", None), str(getattr(d, "cls_name", "")),
+                   float(getattr(d, "conf", 0.0)), int(getattr(d, "cls_id", -1)))
+                for d in (dets or [])]
         img = image.copy()
         h, w = img.shape[:2]
         placed: list[tuple[int, int, int, int]] = []   # 已占用的标签区域，防重叠
