@@ -466,6 +466,36 @@ class Pipeline:
             return "smoke"
         return "fire" if cls_id == 0 else "smoke"
 
+    @staticmethod
+    def _shape_ok(box, kind: str, img_w: int, img_h: int,
+                  cfg: dict) -> bool:
+        """按目标形态做物理约束 —— 专门用来挡"看起来像但物理上不可能"的框。
+
+        为什么需要这一层
+        ----------------
+        香烟模型对白衣服、手指、窗帘边缘都会给 0.3~0.5 的置信度，
+        光靠阈值压不干净（真烟的置信度也就 0.5 上下，压过头就漏了）。
+        但香烟有确定的长宽比和尺寸范围：
+          · 是细长条，长宽比 2~12
+          · 一支烟在画面里占比很小（0.01%~2%）
+        不符合这两条的，无论置信度多高都不可能是香烟。
+        这是用物理常识补模型精度，比硬调阈值划算得多。
+        """
+        x1, y1, x2, y2 = (float(v) for v in box)
+        w = max(1.0, x2 - x1)
+        h = max(1.0, y2 - y1)
+        area_pct = (w * h) / max(1.0, img_w * img_h)
+        if kind == "cigarette":
+            ar = max(w, h) / min(w, h)
+            lo = float(cfg.get("cig_aspect_min", 2.0))
+            hi = float(cfg.get("cig_aspect_max", 12.0))
+            if not (lo <= ar <= hi):
+                return False
+            if not (float(cfg.get("cig_area_min", 0.0001))
+                    <= area_pct <= float(cfg.get("cig_area_max", 0.02))):
+                return False
+        return True
+
     def _fire_nearby(self, smoke_box, fire_dets: list[Detection]) -> tuple[bool, list[str]]:
         """烟框附近有没有火。这是时序判别里最强的先验，实现要对得起它的权重。"""
         grown = expand_box(smoke_box, self.cfg["fire_nearby_grow"])
@@ -951,6 +981,11 @@ class Pipeline:
             if t.last_t != pkt.ts or not t.samples:
                 continue                      # 本帧没匹配上，不推进判定
             kind = self._kind_of(t.cls_name, t.cls_id)
+            # 形态不合物理常识的直接丢（只有香烟有约束，火/烟原样通过）
+            h_img, w_img = pkt.image.shape[:2]
+            if not self._shape_ok(t.last_box or (0, 0, 1, 1), kind, w_img, h_img, cfg):
+                self.stats["shape_rejected"] = self.stats.get("shape_rejected", 0) + 1
+                continue
             conf = t.samples[-1].conf
 
             # ── 火：快路径，但必过一道「闪烁闸」────────────────

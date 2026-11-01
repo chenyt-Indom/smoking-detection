@@ -169,6 +169,11 @@ class LiveView:
             conf = float(getattr(d, "conf", 0.0))
             alarm_thr = self.alarm_confs.get(cid, 0.25)
             # 颜色只由「类别 + 是否达阈值」决定，不再分置信度档位
+            # 灰框限量：未达阈值的框最多画 N 个（按置信度从高到低）。
+            # 阈值降到 0.08 后画面里能冒出几十个灰框，满屏标签反而什么都看不清 ——
+            # 它们的信息量本来就只有"这里有东西"这一点，留前几个足够提示了。
+            if conf < alarm_thr and _cand_drawn >= _cand_limit:
+                continue
             if conf >= alarm_thr:
                 if "cig" in str(getattr(d, "cls_name", "")).lower():
                     color = CIG_COLOR
@@ -177,6 +182,7 @@ class LiveView:
                 thick, suffix = 2, ""
             else:
                 color, thick, suffix = CAND_COLOR, 1, " ?"
+                _cand_drawn += 1
             cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
 
             name = str(getattr(d, "cls_name", "obj")).upper()
