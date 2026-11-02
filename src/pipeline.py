@@ -1565,6 +1565,22 @@ class Pipeline:
                 if self.stats["lightspot_err"] in (1, 100):     # 只打第一次和第 100 次
                     print(f"[lightspot] 引擎异常：{type(_e).__name__}: {_e}", flush=True)
 
+        # ⚠️ 跨类别抑制：同一位置同时有 cigarette 和 fire/smoke 时，
+        # 只保留 cigarette。这是"白色香烟被判成火"的根因解法 ——
+        # 主模型（fire/smoke）和香烟模型（cigarette）是分开跑的，
+        # 主模型会把"白色烟杆 + 手部暖色"误判成 fire 0.77，
+        # 而香烟模型对同一只手正确给出 cigarette 0.88。
+        # 香烟模型是专门为香烟训的，同一位置更可信，用它压掉 fire。
+        _cigs = [d for d in draw_dets if str(d.cls_name).lower() == "cigarette"]
+        if _cigs:
+            _keep = []
+            for _d in draw_dets:
+                if str(_d.cls_name).lower() in ("fire", "smoke"):
+                    if any(iou(_d.xyxy, _c.xyxy) >= 0.5 for _c in _cigs):
+                        continue          # 和香烟框重叠的火/烟，压掉
+                _keep.append(_d)
+            draw_dets = _keep
+
         return FrameResult(pkt.idx, pkt.ts, draw_dets, tracks, verdicts, events,
                            frozen=False, nearby=nearby_map)
 
