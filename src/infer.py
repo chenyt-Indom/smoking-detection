@@ -76,7 +76,25 @@ def nms(dets: Iterable[Detection], iou_thr: float = 0.5) -> list[Detection]:
         group = sorted(group, key=lambda d: -d.conf)
         keep: list[Detection] = []
         for d in group:
-            if all(iou(d.xyxy, k.xyxy) < iou_thr for k in keep):
+            drop = False
+            for k in keep:
+                # ⚠️ 只用 IOU 会漏掉"小框整个包在大框里"的情况。
+                # 一支烟的框 26x43 被另一个 40x70 的框整个罩住时，
+                # 交集=26x43、并集=40x70，IOU 只有 ~0.35；若两个框尺寸差更多，
+                # IOU 会掉到 0.2 以下 —— 低于 0.25 的门槛就不会被压掉，
+                # 画面上就成了"同一支烟两个框"（用户截图里的 0.41 和 0.18）。
+                #
+                # 所以除了 IOU，还要看**包含比**：交集占较小框面积的比例。
+                # 小框有 70% 以上落在大框里，就是重复检测，删掉小的那个。
+                a = d.area
+                b = k.area
+                inter = max(0.0, min(d.xyxy[2], k.xyxy[2]) - max(d.xyxy[0], k.xyxy[0])) * \
+                        max(0.0, min(d.xyxy[3], k.xyxy[3]) - max(d.xyxy[1], k.xyxy[1]))
+                contain = inter / max(1.0, min(a, b))
+                if iou(d.xyxy, k.xyxy) >= iou_thr or contain >= 0.70:
+                    drop = True
+                    break
+            if not drop:
                 keep.append(d)
         out.extend(keep)
     return sorted(out, key=lambda d: -d.conf)
