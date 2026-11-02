@@ -471,7 +471,7 @@ class Pipeline:
                 iou_thr=float(self.cfg["light_memory_iou"]),
                 area_tol=float(self.cfg["light_memory_area_tol"]),
                 ttl=float(self.cfg["light_memory_ttl"]))
-        self._region_judged: list[tuple[str, tuple, float]] = []   # (cam, box_n, ts)
+        self._region_judged: list[tuple[str, tuple, float, float]] = []   # (cam, box_n, ts, score)
         self._saved_tids: set[int] = set()   # 已计过"省一次调用"的轨迹，别按帧重复计
         self._mem_saved_ts = 0.0
 
@@ -671,23 +671,33 @@ class Pipeline:
         nb = (x1 / w, y1 / h, x2 / w, y2 / h)
         return nb, max(0.0, (nb[2] - nb[0]) * (nb[3] - nb[1]))
 
-    def _region_muted(self, cam: str, box_n, ts: float) -> bool:
+    def _region_muted(self, cam: str, box_n, ts: float, cur_score: float = 0.0) -> bool:
         """同一块地方刚被裁判判过吗？
 
         键必须是**区域**而不是轨迹 ID：路灯会被遮挡/失配切成一段段新轨迹，
         按 ID 去重等于没去重 —— 每段都重新问一次 LLM，一夜几十次。
+
+        但纯区域去重有个反例：灯光反光（稳定）判过 light 之后，
+        同一块地方突然冒出真火 —— 如果只看区域，真火会被"刚判过"挡掉。
+        所以加**分数跳升绕过**：当前分数比上次判的时候高出 jump 以上，
+        说明"东西变了"，即便区域相同也重新问一次。
         """
         mute = float(self.cfg["llm_region_mute_sec"])
+        jump = float(self.cfg.get("llm_region_jump", 0.25))
         if mute <= 0:
             return False
         keep = []
         hit = False
-        for c, b, t in self._region_judged:
+        for c, b, t, sc in self._region_judged:
             if ts - t > mute:
                 continue                     # 过期，顺手清掉
-            keep.append((c, b, t))
+            keep.append((c, b, t, sc))
             if not hit and c == cam and iou(b, box_n) >= 0.5:
-                hit = True
+                # 分数显著跳升 → 视为"新东西"，不静音，重新问
+                if cur_score - sc >= jump:
+                    hit = False
+                else:
+                    hit = True
         self._region_judged = keep
         return hit
 
@@ -796,7 +806,7 @@ class Pipeline:
         # 同一块地方刚才可能只是在墙上反光被判过 light，随后真火出现在同一位置
         # 就会被一起静音 —— 那是实打实的漏报。置信度够高就重新问一次。
         high_bypass = float(self.cfg.get("llm_mute_bypass_conf", 0.80))
-        if score < high_bypass and self._region_muted(pkt.cam_id, box_n, pkt.ts):
+        if score < high_bypass and self._region_muted(pkt.cam_id, box_n, pkt.ts, score):
             self._count_saved(tid)
             return True
 
@@ -941,7 +951,7 @@ class Pipeline:
         self.stats["llm_reviews"] += 1
         self._arbiter_done[key] = info.ts     # 这个目标从此由裁判说了算
         # 记住"这块地方刚判过"（区域键，跨轨迹有效）
-        self._region_judged.append((info.cam_id, info.box_n, info.ts))
+        self._region_judged.append((info.cam_id, info.box_n, info.ts, float(info.score)))
         if len(self._region_judged) > 200:
             self._region_judged = self._region_judged[-200:]
         # 判"不是火/烟"的，落盘记住这块地方：下次同位置的轨迹直接跳过 LLM
