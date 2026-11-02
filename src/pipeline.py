@@ -1442,7 +1442,7 @@ class Pipeline:
             # 诊断日志实测：tracks={'cigarette':3} 但 draw={'光:白光':3}，
             # 轨迹明明还在，画面上什么都不显示。
             # 取 5 帧（约 0.25 秒）覆盖所有降频组合，又不至于让旧框赖着不走。
-            if _t.misses > 5:
+            if _t.misses > 10:
                 continue
             if _t.last_box is None or not _t.samples:
                 continue
