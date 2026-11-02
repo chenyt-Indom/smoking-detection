@@ -37,6 +37,10 @@ class Detection:
     cls_name: str
     conf: float
     xyxy: tuple[float, float, float, float]
+    # 轨迹 ID（-1 = 还没分配）。画框时显示成 #12 这种，
+    # 方便肉眼确认"这是不是同一个目标"——用户提的需求：
+    # "给方框一个id，不要因为中间断过几帧就更换ID"。
+    tid: int = -1
 
     @property
     def area(self) -> float:

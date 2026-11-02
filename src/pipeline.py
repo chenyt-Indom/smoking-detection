@@ -1229,6 +1229,12 @@ class Pipeline:
             # 正确做法：香烟过门槛就直接交给 LLM —— 它判断"这是香烟还是
             # 别的细长物"靠的是截图里的视觉形态，不需要时序统计量。
             if kind == "cigarette":
+                # 用户要求"香烟不用"：只画框、不产生事件、不调 LLM。
+                # 用**独立开关**而不是把 cigarette_conf 调大 —— 后者会连推理门槛
+                # 一起抬高（run_multi 拿它当 extra_conf），导致模型连框都不输出。
+                if not cfg.get("cigarette_alert", True):
+                    self._smoke_streak[t.tid] = 0
+                    continue
                 if conf < cfg.get("cigarette_conf", 0.03):
                     self._smoke_streak[t.tid] = 0
                     continue
@@ -1395,7 +1401,36 @@ class Pipeline:
         #  香烟到灰框进行阈值分析"，说的就是这个：检出了却没画出来。
         #
         # 现在改成：这一帧检出什么就画什么（dets），轨迹只用来补漏。
-        draw_dets: list[Detection] = list(dets)
+        # 画框用的 Detection 带上轨迹 ID —— 界面显示成 #12，
+        # 这样能肉眼判断"断了之后回来的是不是同一个目标"。
+        _tid_of = {}
+        for _t in tracks:
+            _b = getattr(_t, "last_box", None)
+            if _b:
+                _tid_of[(round(float(_b[0])), round(float(_b[1])),
+                         round(float(_b[2])), round(float(_b[3])))] = _t.tid
+        draw_dets: list[Detection] = []
+        for _d in dets:
+            _k = (round(float(_d.xyxy[0])), round(float(_d.xyxy[1])),
+                  round(float(_d.xyxy[2])), round(float(_d.xyxy[3])))
+            _tid = _tid_of.get(_k, -1)
+            if _tid < 0:
+                # 坐标被平滑过就对不上，退化成"找最近的轨迹"
+                _cx = (float(_d.xyxy[0]) + float(_d.xyxy[2])) / 2
+                _cy = (float(_d.xyxy[1]) + float(_d.xyxy[3])) / 2
+                _best, _bd = -1, 1e9
+                for _t in tracks:
+                    _b = getattr(_t, "last_box", None)
+                    if not _b:
+                        continue
+                    _d2 = ((float(_b[0]) + float(_b[2])) / 2 - _cx) ** 2 + \
+                          ((float(_b[1]) + float(_b[3])) / 2 - _cy) ** 2
+                    if _d2 < _bd:
+                        _best, _bd = _t.tid, _d2
+                if _bd < 60 ** 2:          # 中心距离 60px 内才认
+                    _tid = _best
+            draw_dets.append(Detection(_d.cls_id, _d.cls_name, _d.conf,
+                                       _d.xyxy, _tid))
         for _t in tracks:
             # 允许刚好 1 帧没匹配上仍然画出来。
             #

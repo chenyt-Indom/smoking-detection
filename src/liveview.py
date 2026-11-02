@@ -99,11 +99,18 @@ class LiveView:
         self._n_pub = 0
         self._t_first = time.time()
         self.llm = None                      # 由外部注入 LlmArbiter，供 /api/llm 用
+        self.last_frame = None               # 最近一帧原图（存训练样本用）
+        self.last_dets = []                  # 最近一帧的检测（做预标注用）
 
     # ------------------------------------------------------------ 写入
     def publish(self, image: np.ndarray, dets, *, frame_idx: int | None = None,
                 cam_id: str = "", fps: float = 0.0, extra: dict | None = None) -> bool:
         """由 pipeline 每帧调用。返回本次是否真的编码了一帧（被限流时为 False）。"""
+        # 存一份**原始帧 + 本帧检测**，供"存样本"用。
+        # 放在限流判断**之前**：限流是给推流用的，存样本不受它影响。
+        # 存的是没画框的 image，训练素材必须是干净画面。
+        self.last_frame = image
+        self.last_dets = list(dets or [])
         now = time.time()
         if now - self._last_pub < self.min_interval:
             return False
@@ -333,8 +340,14 @@ class LiveView:
             cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
 
             name = str(getattr(d, "cls_name", "obj")).upper()
+            # 带上轨迹 ID，格式 FIRE #12 0.34
+            # 用户要这个是为了肉眼确认"断了之后回来的是不是同一个目标" ——
+            # 只有带着 ID 才能判断一次抖动到底换了几个轨迹。
+            _tid = int(getattr(d, "tid", -1))
+            _id_txt = f" #{_tid}" if _tid >= 0 else ""
             # 光敏引擎的框 conf=0，显示 "0.00" 没意义，只留颜色名
-            label = name if conf <= 0.0 else f"{name} {conf:.2f}{suffix}"
+            label = (f"{name}{_id_txt}" if conf <= 0.0
+                     else f"{name}{_id_txt} {conf:.2f}{suffix}")
             (tw, th), base = cv2.getTextSize(label, FONT, 0.5, 1)
             bh = th + base + 4
 
