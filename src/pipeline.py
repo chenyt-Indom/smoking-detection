@@ -252,13 +252,23 @@ def crop_box(image: np.ndarray, box, margin: float, max_side: int,
     """
     h, w = image.shape[:2]
     x1, y1, x2, y2 = expand_box(box, margin)
-    # 太小就围绕中心继续外扩，直到达到最小边长（受画面边界限制）
+
+    # ⚠️ 裁成**正方形**，不是"把短边拉到 min_side"。
+    #
+    # 原来的写法：k = max(min_side/cw, min_side/ch)，然后宽高各乘 k。
+    # 细长框会炸开：框 260x43、min_side=220 时
+    #     k = max(220/260, 220/43) = 5.12
+    #     宽 260 -> 1331，高 43 -> 220
+    # 结果是一张 1331x220 的超宽长条，前端缩到卡片宽度后就是"只剩一条"，
+    # 用户看到的"截图只有一半"（甚至更少）就是这个。
+    #
+    # 正方形能保证：不管框多细长，四周都留出等量的上下文，
+    # 而且放大后长宽比一致，不会被压扁成一条。
     cw, ch = max(1.0, x2 - x1), max(1.0, y2 - y1)
-    if min(cw, ch) < min_side:
-        k = max(min_side / cw, min_side / ch)
-        cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
-        x1, x2 = cx - cw * k / 2.0, cx + cw * k / 2.0
-        y1, y2 = cy - ch * k / 2.0, cy + ch * k / 2.0
+    cx, cy = (x1 + x2) / 2.0, (y1 + y2) / 2.0
+    side = max(cw, ch, float(min_side))
+    x1, x2 = cx - side / 2.0, cx + side / 2.0
+    y1, y2 = cy - side / 2.0, cy + side / 2.0
     x1 = int(max(0, min(w - 1, x1)))
     y1 = int(max(0, min(h - 1, y1)))
     x2 = int(max(x1 + 1, min(w, x2)))
@@ -1409,28 +1419,14 @@ class Pipeline:
             if _b:
                 _tid_of[(round(float(_b[0])), round(float(_b[1])),
                          round(float(_b[2])), round(float(_b[3])))] = _t.tid
+        # ⚠️ 只画**轨迹框**，不再画原始检测框。
+        #
+        # 之前是两路都画：检测框（dets）画一遍，轨迹框（tracks）又画一遍，
+        # 同一个目标就有两个框叠在一起 —— 这就是"双方框重叠"的来源。
+        # 而且检测框每一帧是独立的（NMS 之后仍然会跳），画出来就是
+        # "跳动/抖动"。轨迹框经过 Kalman + EMA，位置是跨帧平滑过的，
+        # 天然更稳。
         draw_dets: list[Detection] = []
-        for _d in dets:
-            _k = (round(float(_d.xyxy[0])), round(float(_d.xyxy[1])),
-                  round(float(_d.xyxy[2])), round(float(_d.xyxy[3])))
-            _tid = _tid_of.get(_k, -1)
-            if _tid < 0:
-                # 坐标被平滑过就对不上，退化成"找最近的轨迹"
-                _cx = (float(_d.xyxy[0]) + float(_d.xyxy[2])) / 2
-                _cy = (float(_d.xyxy[1]) + float(_d.xyxy[3])) / 2
-                _best, _bd = -1, 1e9
-                for _t in tracks:
-                    _b = getattr(_t, "last_box", None)
-                    if not _b:
-                        continue
-                    _d2 = ((float(_b[0]) + float(_b[2])) / 2 - _cx) ** 2 + \
-                          ((float(_b[1]) + float(_b[3])) / 2 - _cy) ** 2
-                    if _d2 < _bd:
-                        _best, _bd = _t.tid, _d2
-                if _bd < 60 ** 2:          # 中心距离 60px 内才认
-                    _tid = _best
-            draw_dets.append(Detection(_d.cls_id, _d.cls_name, _d.conf,
-                                       _d.xyxy, _tid))
         for _t in tracks:
             # 允许刚好 1 帧没匹配上仍然画出来。
             #
@@ -1451,7 +1447,8 @@ class Pipeline:
             if _t.last_box is None or not _t.samples:
                 continue
             draw_dets.append(Detection(_t.cls_id, _t.cls_name,
-                                       float(_t.samples[-1].conf), _t.last_box))
+                                       float(_t.samples[-1].conf), _t.last_box,
+                                       _t.tid))
 
         # ── 细长物候选通道（补充）────────────────────────────
         # 香烟模型对非标准形态（通体白色、一端尖锐、竖直举着）响应很低，
