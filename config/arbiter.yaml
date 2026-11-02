@@ -43,7 +43,7 @@ max_tokens: 700              # 短 JSON 用不了多少，给太多纯拖慢
 timeout_s: 35                  # 开思考后明显变慢，20 秒不够；超时会退回规则层
 
 # 图片参数：ROI 放大看细节，整幅图看环境。长边压小是为了省 token，不是为了省流量
-roi_max_side: 640          # ROI 放大到 640 长边：512 时白烟细节糊成一片，模型容易只凭颜色猜
+roi_max_side: 480
 full_max_side: 1100
 jpeg_quality: 82
 

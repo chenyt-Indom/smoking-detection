@@ -56,7 +56,7 @@ DEFAULTS = {
     "timeout_s": 8,
     "roi_max_side": 512,           # ROI 放大后的长边
     "full_max_side": 768,          # 整幅图的长边（太大既慢又贵）
-    "jpeg_quality": 82,
+    "jpeg_quality": 72,
     "max_workers": 2,              # 并发上限。别调高：并发多了反而被限流
     "queue_limit": 8,              # 排队超过这个数就跳过（宁可少审也别堆积）
     "hourly_limit": 300,           # 每小时调用上限，超了自动降级
