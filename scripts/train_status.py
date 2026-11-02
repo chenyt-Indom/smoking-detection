@@ -95,10 +95,24 @@ def snapshot(project: str, name: str, log: str) -> str:
         txt = lp.read_text(encoding="utf-8", errors="ignore")
         # 进度条被 \r 挤在一起，取最后一段
         tail = txt[-4000:].replace("\r", "\n")
-        m = re.findall(r"(\d+)/(\d+)\s+([\d.]+)s/it", tail)
+        # ultralytics 的进度条有两种速度写法：`5.2it/s` 和 `0.19s/it`，
+        # 只匹配后者会漏（实测日志里是 it/s）。
+        m = re.findall(r"(\d+)/(\d+)\s+[^0-9]*([\d.]+)\s*(?:it/s|s/it)", tail)
         if m:
             i, n, s = m[-1]
-            lines.append(f"  当前batch {i}/{n}   {s}s/it")
+            bi, bn = int(i), int(n)
+            # 把 batch 换算成"第几张图"——用户要看的是这个，不是 batch 序号
+            bs = 8
+            ay = run / "args.yaml"
+            if ay.is_file():
+                mb = re.search(r"^batch://s*(//d+)", ay.read_text(encoding="utf-8", errors="ignore"), re.M)
+                if mb:
+                    bs = int(mb.group(1))
+            done_img = bi * bs
+            tot_img = bn * bs
+            pct = (bi / bn * 100) if bn else 0
+            lines.append(f"  本轮进度  第 {done_img}/{tot_img} 张  ({pct:.1f}%)")
+            lines.append(f"  速度      {s} batch/s（1 batch = {bs} 张）")
         if "OOM" in tail or "out of memory" in tail.lower():
             lines.append("  ⚠️ 显存不足")
         if "Traceback" in tail:

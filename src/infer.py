@@ -174,7 +174,7 @@ class Detector:
         # 1280x720 切成 3x3 每块约 426x240，送到 1152 是 2.7 倍放大 ——
         # 一个 10x15 像素的远处小火苗会变成 27x40，进入"能认"的量级。
         # 香烟模型关掉后腾出的算力正好给这里。
-        self.tile_imgsz = 1152
+        self.tile_imgsz = 960
         self.slice_every = 2
         self._slice_n = 0
         self._slice_cache: list[Detection] = []
@@ -328,9 +328,9 @@ class Detector:
     def detect_auto(
         self,
         image: np.ndarray,
-        trigger_conf: float = 0.02,
-        tile_grid: int = 3,
-        overlap: float = 0.3,
+        trigger_conf: float = 0.03,
+        tile_grid: int = 2,
+        overlap: float = 0.25,
     ) -> list[Detection]:
         """分级检测：先粗筛一帧，**只有粗筛出了东西才切片**。
 

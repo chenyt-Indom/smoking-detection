@@ -647,5 +647,27 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
      font:11px/1.4 ui-monospace,monospace;color:#8a8fa3;background:rgba(0,0,0,.55);
      padding:3px 7px;border-radius:5px;pointer-events:none"></div>
 <script>document.getElementById("buildTag").textContent="build " + BUILD;</script>
+<button id="snapBtn" style="position:fixed;right:14px;bottom:44px;z-index:9998;
+  padding:8px 14px;border-radius:8px;border:1px solid #3b4a6b;background:#1b2740;
+  color:#cfe0ff;font:13px/1.2 system-ui;cursor:pointer">存样本</button>
+<script>
+(function(){
+  const b = document.getElementById("snapBtn");
+  if(!b) return;
+  b.addEventListener("click", async () => {
+    const cam = (new URLSearchParams(location.search).get("cam")) || "cam_1";
+    const old = b.textContent;
+    b.textContent = "保存中…"; b.disabled = true;
+    try {
+      const r = await fetch("/api/snap?cam=" + encodeURIComponent(cam), {method:"POST"});
+      const j = await r.json();
+      b.textContent = j.ok ? ("已存 " + j.prelabels + " 框") : ("失败");
+    } catch (e) {
+      b.textContent = "失败";
+    }
+    setTimeout(() => { b.textContent = old; b.disabled = false; }, 1400);
+  });
+})();
+</script>
 </body>
 </html>

@@ -592,6 +592,45 @@ class Notifier:
                 path = parsed.path
                 cam = (parse_qs(parsed.query).get("cam") or [None])[0]
 
+                if path == "/api/snap":
+                    # 存当前帧做训练素材：点一下按钮就把画面落盘，
+                    # 同时把当前检测框写成 YOLO 预标注 —— 标注时只需修正，
+                    # 不用从零画框，300 张的工作量能省一半以上。
+                    view = notifier._pick_live(cam)
+                    frame = getattr(view, "last_frame", None) if view else None
+                    if frame is None:
+                        self._send(503, "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"没有可用画面\"}".encode())
+                        return
+                    import time as _t
+                    root = Path(notifier.report_dir).parent / "dataset_raw"
+                    (root / "images").mkdir(parents=True, exist_ok=True)
+                    (root / "labels").mkdir(parents=True, exist_ok=True)
+                    stem = f"{cam or 'cam'}_{int(_t.time()*1000)}"
+                    ok, buf = cv2.imencode(".jpg", frame, [int(cv2.IMWRITE_JPEG_QUALITY), 95])
+                    if not ok:
+                        self._send(500, "application/json; charset=utf-8",
+                                   "{\"ok\":false,\"error\":\"编码失败\"}".encode())
+                        return
+                    (root / "images" / f"{stem}.jpg").write_bytes(buf.tobytes())
+                    # 预标注：只写 cigarette 类，且只写合理的框（去掉过大的误检框）
+                    H, W = frame.shape[:2]
+                    lines = []
+                    dets = getattr(view, "last_dets", None) or []
+                    for d in dets:
+                        if str(getattr(d, "cls_name", "")) != "cigarette":
+                            continue
+                        x1, y1, x2, y2 = [float(v) for v in d.xyxy]
+                        bw, bh = (x2 - x1) / W, (y2 - y1) / H
+                        if bw <= 0 or bh <= 0 or bw * bh > 0.15:
+                            continue
+                        lines.append(f"0 {(x1+x2)/2/W:.6f} {(y1+y2)/2/H:.6f} {bw:.6f} {bh:.6f}")
+                    (root / "labels" / f"{stem}.txt").write_text(
+                        "\n".join(lines), encoding="utf-8")
+                    body = ('{"ok":true,"file":"%s.jpg","prelabels":%d}' % (stem, len(lines))).encode()
+                    self._send(200, "application/json; charset=utf-8", body)
+                    return
+
                 if path == "/api/llm/test":
                     llm = getattr(notifier.live, "llm", None) if notifier.live else None
                     if llm is None:
