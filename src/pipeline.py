@@ -1041,7 +1041,7 @@ class Pipeline:
             self._fired.add(info.tid)
             self._recent_alarms.append((info.ts, info.kind, info.box, info.tid))
             self.stats["llm_alarms"] += 1
-            self.stats[f"{info.kind}_alarms"] += 1
+            self.stats[f"{info.kind}_alarms"] = self.stats.get(f"{info.kind}_alarms", 0) + 1
         else:
             self._recent_notices.append((info.ts, info.box))
         return ev
