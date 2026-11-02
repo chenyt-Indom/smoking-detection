@@ -44,6 +44,8 @@ from pathlib import Path
 import cv2
 import numpy as np
 
+from .paths import resource_root
+
 # ---------------------------------------------------------------- 配置
 DEFAULTS = {
     "enabled": True,
@@ -88,7 +90,7 @@ SYSTEM = (
 def load_config(path: str | Path | None = None) -> dict:
     """读 config/arbiter.yaml，缺的用 DEFAULTS 补。"""
     cfg = dict(DEFAULTS)
-    p = Path(path) if path else Path(__file__).resolve().parent.parent / "config" / "arbiter.yaml"
+    p = Path(path) if path else resource_root() / "config" / "arbiter.yaml"
     if p.exists():
         try:
             import yaml
@@ -104,7 +106,7 @@ def load_dotenv(path: str | Path | None = None) -> None:
 
     只支持最简单的 KEY=VALUE，不引 python-dotenv —— 少一个依赖少一个部署坑。
     """
-    p = Path(path) if path else Path(__file__).resolve().parent.parent / ".env"
+    p = Path(path) if path else resource_root() / ".env"
     if not p.exists():
         return
     try:
@@ -305,6 +307,11 @@ class LlmArbiter:
         # 最近若干次裁决的流水，只给前端 LLM 面板展示用。
         # 不落盘：它是"此刻连没连上、快不快"的实时证据，不是审计日志。
         self._history: list[dict] = []
+
+    def set_api_key(self, key: str) -> None:
+        """动态更新 API Key（前端「填入 key」输入框写入）。线程安全。"""
+        with self._lock:
+            self.api_key = (key or "").strip()
 
     def _is_local(self) -> bool:
         """端点是不是本机（Ollama / vLLM / LM Studio 之类）。

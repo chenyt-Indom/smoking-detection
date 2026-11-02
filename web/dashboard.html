@@ -165,6 +165,15 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
   <div class="chip">检测 <b id="detFps">0</b> fps</div>
   <div class="chip">火 <b id="nFire" style="color:var(--fire)">0</b> · 烟 <b id="nSmoke" style="color:var(--smoke)">0</b></div>
   <div class="spacer"></div>
+  <div class="chip" id="boxChip" style="cursor:pointer" title="点击显示/隐藏 YOLO 检测框">
+    <span class="dot on" id="boxDot"></span>框 <b id="boxState">开</b>
+  </div>
+  <div class="chip" id="mainChip" style="cursor:pointer" title="点击开关主模型（火/烟检测）">
+    <span class="dot on" id="mainDot"></span>火/烟 <b id="mainState">开</b>
+  </div>
+  <div class="chip" id="extraChip" style="cursor:pointer" title="点击开关香烟模型">
+    <span class="dot on" id="extraDot"></span>香烟 <b id="extraState">开</b>
+  </div>
   <div class="chip" id="llmChip"><span class="dot" id="llmDot"></span>LLM <b id="llmState">检查中</b></div>
   <button class="btn" id="btnTopUp">
     <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -217,6 +226,14 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
       <div class="field"><span>接口地址</span><b class="mono" id="lUrl">—</b></div>
       <div class="field"><span>模型</span><b class="mono" id="lModel">—</b></div>
       <div class="field"><span>API Key</span><b class="mono" id="lKey">—</b></div>
+      <div class="field" style="align-items:center;gap:8px">
+        <span>填入 Key</span>
+        <input id="apiKeyInput" type="password" autocomplete="off" placeholder="sk-..."
+               style="flex:1;min-width:0;background:var(--panel2);border:1px solid var(--line);
+                      border-radius:5px;padding:5px 8px;color:var(--text);
+                      font-family:ui-monospace,Consolas,monospace;font-size:11px">
+        <button class="btn pri" id="btnSaveKey" style="flex-shrink:0">保存</button>
+      </div>
       <div class="field"><span>本轮小时配额</span><b id="lQuota">—</b></div>
       <div class="bar"><i id="lQuotaBar" style="width:0%"></i></div>
       <div class="field" style="margin-top:10px"><span>累计调用</span><b id="lStats">—</b></div>
@@ -633,6 +650,78 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
       pollLlm();
     }
   });
+
+  // API Key 输入框：加载时从 localStorage 回填，保存时 POST 到后端动态写入
+  const savedKey = localStorage.getItem("llm_api_key") || "";
+  if (savedKey) $("apiKeyInput").value = savedKey;
+  $("btnSaveKey").addEventListener("click", async (e) => {
+    const btn = e.currentTarget;
+    const key = $("apiKeyInput").value.trim();
+    btn.disabled = true; btn.textContent = "保存中…";
+    try{
+      const r = await fetch("/api/llm/key", {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({api_key: key})
+      });
+      const j = await r.json();
+      if (j.ok){
+        localStorage.setItem("llm_api_key", key);
+        $("lNotice").style.color = "var(--ok)";
+        $("lNotice").textContent = key ? "Key 已保存并生效" : "已清空 Key";
+      }else{
+        $("lNotice").style.color = "var(--err)";
+        $("lNotice").textContent = "保存失败：" + (j.error || "未知错误");
+      }
+    }catch(err){
+      $("lNotice").style.color = "var(--err)";
+      $("lNotice").textContent = "请求失败：" + err.message;
+    }finally{
+      btn.disabled = false; btn.textContent = "保存";
+      pollLlm();
+    }
+  });
+
+  // 框显示 + 模型开关
+  function setChip(dotId, stateId, on){
+    $(dotId).className = "dot " + (on ? "on" : "off");
+    $(stateId).textContent = on ? "开" : "关";
+  }
+  async function refreshViewAndModels(){
+    try{
+      const [mb, vb] = await Promise.all([
+        fetch("/api/models", {cache:"no-store"}).then(r=>r.json()),
+        fetch("/api/view/boxes", {cache:"no-store"}).then(r=>r.json())
+      ]);
+      setChip("mainDot", "mainState", mb.main);
+      setChip("extraDot", "extraState", mb.extra);
+      setChip("boxDot", "boxState", vb.show_boxes);
+    }catch(e){}
+  }
+  $("boxChip").addEventListener("click", async () => {
+    try{
+      const cur = await fetch("/api/view/boxes", {cache:"no-store"}).then(r=>r.json());
+      const next = !cur.show_boxes;
+      await fetch("/api/view/boxes", {method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({show_boxes: next})});
+      setChip("boxDot", "boxState", next);
+    }catch(e){}
+  });
+  async function toggleModel(which){
+    try{
+      const cur = await fetch("/api/models", {cache:"no-store"}).then(r=>r.json());
+      const body = which === "main" ? {main: !cur.main} : {extra: !cur.extra};
+      const j = await fetch("/api/models", {method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify(body)}).then(r=>r.json());
+      setChip("mainDot", "mainState", j.main);
+      setChip("extraDot", "extraState", j.extra);
+    }catch(e){}
+  }
+  $("mainChip").addEventListener("click", () => toggleModel("main"));
+  $("extraChip").addEventListener("click", () => toggleModel("extra"));
+  refreshViewAndModels();
 
   function topUp(){ window.open(RECHARGE_URL, "_blank", "noopener"); }
   $("btnTopUp").addEventListener("click", topUp);

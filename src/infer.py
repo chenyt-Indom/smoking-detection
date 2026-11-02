@@ -184,6 +184,9 @@ class Detector:
         self._slice_cache: dict = {}
         self._extra_n: dict = {}
         self._extra_cache: dict = {}
+        # 模型开关（前端可自主切换）：主模型=火/烟，香烟模型=cigarette
+        self.enable_main = True
+        self.enable_extra = True
 
     # ---------------------------------------------------------------- 内部
     def _predict(self, img: np.ndarray, offset: tuple[int, int] = (0, 0),
@@ -361,7 +364,7 @@ class Detector:
         越不容易把该切的帧漏掉 —— 而代价只是更多帧走慢路径。
         """
         h, w = image.shape[:2]
-        coarse = self._predict(image, conf=trigger_conf)
+        coarse = self._predict(image, conf=trigger_conf) if self.enable_main else []
 
         # ⚠️ **不再因为粗筛为空就跳过切片** —— 这是个死循环。
         #
@@ -382,12 +385,13 @@ class Detector:
 
         crops: list[np.ndarray] = []
         offs: list[tuple[int, int]] = []
-        for x0, y0, x1, y1 in self._tiles(h, w, tile_grid, overlap):
-            crop = image[y0:y1, x0:x1]
-            if crop.size == 0:
-                continue
-            crops.append(crop)
-            offs.append((x0, y0))
+        if self.enable_main:
+            for x0, y0, x1, y1 in self._tiles(h, w, tile_grid, overlap):
+                crop = image[y0:y1, x0:x1]
+                if crop.size == 0:
+                    continue
+                crops.append(crop)
+                offs.append((x0, y0))
         # 粗筛那一帧就是"整图"那一路，别重复跑
         kept = [d for d in coarse if d.conf >= self.conf]
 
@@ -399,15 +403,17 @@ class Detector:
         # 平均耗时从 51ms 降到 11 + 40/N，N=3 时约 24ms，检测频率翻倍。
         self._slice_n[cache_key] = self._slice_n.get(cache_key, 0) + 1
         dets = list(kept)
-        if self._slice_n[cache_key] % int(self.slice_every) == 0:
-            dets += self._predict_batch(crops, offs)
-            self._slice_cache[cache_key] = [d for d in dets if d not in kept]
-        else:
-            # 不切片的帧沿用上一次的切片结果（框位置由追踪器平滑，不会跳）
-            dets += list(self._slice_cache.get(cache_key, []))
+        if self.enable_main:
+            if self._slice_n[cache_key] % int(self.slice_every) == 0:
+                dets += self._predict_batch(crops, offs)
+                self._slice_cache[cache_key] = [d for d in dets if d not in kept]
+            else:
+                # 不切片的帧沿用上一次的切片结果（框位置由追踪器平滑，不会跳）
+                dets += list(self._slice_cache.get(cache_key, []))
 
         # 香烟模型：整图 + 复用切片（它自己有降频）
-        dets += self._predict_extra(image, crops, offs, cache_key=cache_key)
+        if self.enable_extra:
+            dets += self._predict_extra(image, crops, offs, cache_key=cache_key)
 
         # ⚠️ 合并后必须做**更严格的**二级 NMS（0.25，而不是 0.5）。
         #

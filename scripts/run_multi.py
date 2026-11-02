@@ -24,7 +24,9 @@ from pathlib import Path
 import cv2
 import yaml
 
-ROOT = Path(__file__).resolve().parents[1]
+# 资源根目录：源码运行 = 项目根（scripts 的上一级）；PyInstaller 打包 = exe 所在目录
+ROOT = (Path(sys.executable).resolve().parent if getattr(sys, "frozen", False)
+        else Path(__file__).resolve().parents[1])
 sys.path.insert(0, str(ROOT))
 
 from src.arbiter import LlmArbiter, load_dotenv                    # noqa: E402
@@ -261,6 +263,7 @@ def main() -> int:
                   host=a.host or ui_cfg.get("host", "127.0.0.1"),
                   port=int(a.port or ui_cfg.get("port", 5050)),
                   lives=views)
+    nf.detector = detector                  # 供 /api/models 切换模型开关
     url = nf.start()
 
     # ── 每路独立流水线 ──

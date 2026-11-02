@@ -31,6 +31,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import cv2
 
+from .paths import resource_root
+
 # 告警级别 → 前端配色语义（前端只认这四种）
 LEVELS = ("alarm", "warning", "notice", "cleared")
 
@@ -50,7 +52,7 @@ class Notifier:
         self.webhook_url = webhook_url
         self.max_history = max_history
         self.dashboard = Path(dashboard) if dashboard else (
-            Path(__file__).resolve().parent.parent / "web" / "dashboard.html")
+            resource_root() / "web" / "dashboard.html")
         # 人工标注的误报落在这里，等 scripts/merge_hard_negatives.py 回流进训练集
         self.report_dir = Path(report_dir) if report_dir else (
             self.out_dir.parent / "hard_negatives")
@@ -535,6 +537,24 @@ class Notifier:
                                json.dumps(st, ensure_ascii=False).encode())
                     return
 
+                if path == "/api/models":
+                    det = getattr(notifier, "detector", None)
+                    st = {
+                        "main": bool(getattr(det, "enable_main", True)),
+                        "extra": bool(getattr(det, "enable_extra", True)),
+                    }
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps(st, ensure_ascii=False).encode())
+                    return
+
+                if path == "/api/view/boxes":
+                    view = notifier._pick_live(cam)
+                    show = bool(getattr(view, "show_boxes", True)) if view else True
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps({"show_boxes": show},
+                                          ensure_ascii=False).encode())
+                    return
+
                 if path == "/events":
                     # SSE：先补发最近历史，再持续推新事件
                     self.send_response(200)
@@ -644,6 +664,70 @@ class Notifier:
                     self._send(200 if res.get("ok") else 502,
                                "application/json; charset=utf-8",
                                json.dumps(res, ensure_ascii=False).encode())
+                    return
+
+                if path == "/api/llm/key":
+                    # 前端「填入 API Key」输入框：动态写入裁判的 key，其他用户可自行配置。
+                    llm = getattr(notifier.live, "llm", None) if notifier.live else None
+                    if llm is None:
+                        self._send(503, "application/json; charset=utf-8",
+                                   b'{"ok":false,"error":"\\u672a\\u542f\\u7528 LLM"}')
+                        return
+                    key = ""
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                        body = json.loads(self.rfile.read(n) or b"{}")
+                        key = str(body.get("api_key") or "").strip()
+                    except (ValueError, OSError):
+                        pass
+                    llm.set_api_key(key)
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps({"ok": True, "has_key": bool(key),
+                                           "key_hint": (key[:4] + "…" + key[-4:])
+                                           if len(key) > 8 else (key or "")},
+                                          ensure_ascii=False).encode())
+                    return
+
+                if path == "/api/models":
+                    det = getattr(notifier, "detector", None)
+                    if det is None:
+                        self._send(503, "application/json; charset=utf-8",
+                                   b'{"ok":false,"error":"detector not set"}')
+                        return
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                        body = json.loads(self.rfile.read(n) or b"{}")
+                    except (ValueError, OSError):
+                        body = {}
+                    if "main" in body:
+                        det.enable_main = bool(body["main"])
+                    if "extra" in body:
+                        det.enable_extra = bool(body["extra"])
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps({"ok": True, "main": det.enable_main,
+                                           "extra": det.enable_extra},
+                                          ensure_ascii=False).encode())
+                    return
+
+                if path == "/api/view/boxes":
+                    view = notifier._pick_live(cam)
+                    if view is None:
+                        self._send(503, "application/json; charset=utf-8",
+                                   b'{"ok":false,"error":"view not set"}')
+                        return
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                        body = json.loads(self.rfile.read(n) or b"{}")
+                    except (ValueError, OSError):
+                        body = {}
+                    if "show_boxes" in body:
+                        view.show_boxes = bool(body["show_boxes"])
+                        for _v in notifier.lives.values():   # 多路同步
+                            _v.show_boxes = view.show_boxes
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps({"ok": True,
+                                           "show_boxes": view.show_boxes},
+                                          ensure_ascii=False).encode())
                     return
 
                 if path != "/api/report":

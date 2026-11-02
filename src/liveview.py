@@ -101,6 +101,7 @@ class LiveView:
         self.llm = None                      # 由外部注入 LlmArbiter，供 /api/llm 用
         self.last_frame = None               # 最近一帧原图（存训练样本用）
         self.last_dets = []                  # 最近一帧的检测（做预标注用）
+        self.show_boxes = True               # 前端开关：是否在画面上画检测框
 
     # ------------------------------------------------------------ 写入
     def publish(self, image: np.ndarray, dets, *, frame_idx: int | None = None,
@@ -117,7 +118,7 @@ class LiveView:
         self._last_pub = now
 
         try:
-            drawn = self._draw(image, dets, frame_idx, cam_id)
+            drawn = self._draw(image, dets, frame_idx, cam_id) if self.show_boxes else image
             ok, buf = cv2.imencode(".jpg", drawn,
                                    [int(cv2.IMWRITE_JPEG_QUALITY), self.jpeg_quality])
             if not ok:
