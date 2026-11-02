@@ -633,7 +633,7 @@ class Pipeline:
                          "img_w": int(pkt.image.shape[1]),
                          "img_h": int(pkt.image.shape[0])})
         if level in ("warning", "alarm"):        # notice / cleared 不算告警，别污染统计
-            self.stats[f"{kind}_alarms"] += 1
+            self.stats[f"{kind}_alarms"] = self.stats.get(f"{kind}_alarms", 0) + 1
         return ev
 
     def _prune(self) -> None:
