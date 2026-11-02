@@ -174,6 +174,9 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
   <div class="chip" id="extraChip" style="cursor:pointer" title="点击开关香烟模型">
     <span class="dot on" id="extraDot"></span>香烟 <b id="extraState">开</b>
   </div>
+  <div class="chip" id="devChip" style="cursor:pointer" title="点击切换 CPU/GPU 推理">
+    <span class="dot on" id="devDot"></span><b id="devState">GPU</b>
+  </div>
   <div class="chip" id="llmChip"><span class="dot" id="llmDot"></span>LLM <b id="llmState">检查中</b></div>
   <button class="btn" id="btnTopUp">
     <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2">
@@ -689,15 +692,32 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
   }
   async function refreshViewAndModels(){
     try{
-      const [mb, vb] = await Promise.all([
+      const [mb, vb, dv] = await Promise.all([
         fetch("/api/models", {cache:"no-store"}).then(r=>r.json()),
-        fetch("/api/view/boxes", {cache:"no-store"}).then(r=>r.json())
+        fetch("/api/view/boxes", {cache:"no-store"}).then(r=>r.json()),
+        fetch("/api/device", {cache:"no-store"}).then(r=>r.json())
       ]);
       setChip("mainDot", "mainState", mb.main);
       setChip("extraDot", "extraState", mb.extra);
       setChip("boxDot", "boxState", vb.show_boxes);
+      setDeviceChip(dv.device);
     }catch(e){}
   }
+  function setDeviceChip(dev){
+    const cpu = dev === "cpu";
+    $("devDot").className = "dot " + (cpu ? "warn" : "on");
+    $("devState").textContent = cpu ? "CPU" : "GPU";
+  }
+  $("devChip").addEventListener("click", async () => {
+    try{
+      const cur = await fetch("/api/device", {cache:"no-store"}).then(r=>r.json());
+      const next = cur.device === "cpu" ? "gpu" : "cpu";
+      const j = await fetch("/api/device", {method:"POST",
+        headers:{"Content-Type":"application/json"},
+        body: JSON.stringify({device: next})}).then(r=>r.json());
+      setDeviceChip(j.device);
+    }catch(e){}
+  });
   $("boxChip").addEventListener("click", async () => {
     try{
       const cur = await fetch("/api/view/boxes", {cache:"no-store"}).then(r=>r.json());

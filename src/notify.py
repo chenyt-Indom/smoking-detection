@@ -547,6 +547,15 @@ class Notifier:
                                json.dumps(st, ensure_ascii=False).encode())
                     return
 
+                if path == "/api/device":
+                    det = getattr(notifier, "detector", None)
+                    dev = getattr(det, "device", 0)
+                    is_cpu = (dev == "cpu")
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps({"device": "cpu" if is_cpu else "gpu"},
+                                          ensure_ascii=False).encode())
+                    return
+
                 if path == "/api/view/boxes":
                     view = notifier._pick_live(cam)
                     show = bool(getattr(view, "show_boxes", True)) if view else True
@@ -706,6 +715,29 @@ class Notifier:
                     self._send(200, "application/json; charset=utf-8",
                                json.dumps({"ok": True, "main": det.enable_main,
                                            "extra": det.enable_extra},
+                                          ensure_ascii=False).encode())
+                    return
+
+                if path == "/api/device":
+                    det = getattr(notifier, "detector", None)
+                    if det is None:
+                        self._send(503, "application/json; charset=utf-8",
+                                   b'{"ok":false,"error":"detector not set"}')
+                        return
+                    try:
+                        n = int(self.headers.get("Content-Length") or 0)
+                        body = json.loads(self.rfile.read(n) or b"{}")
+                    except (ValueError, OSError):
+                        body = {}
+                    dev = str(body.get("device") or "").lower()
+                    if dev == "cpu":
+                        det.set_device("cpu")
+                    elif dev == "gpu":
+                        det.set_device(0)
+                    is_cpu = (getattr(det, "device", 0) == "cpu")
+                    self._send(200, "application/json; charset=utf-8",
+                               json.dumps({"ok": True,
+                                           "device": "cpu" if is_cpu else "gpu"},
                                           ensure_ascii=False).encode())
                     return
 

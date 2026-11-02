@@ -188,6 +188,10 @@ class Detector:
         self.enable_main = True
         self.enable_extra = True
 
+    def set_device(self, device: str | int) -> None:
+        """切换推理设备：0/'' = GPU(cuda)，'cpu' = CPU。前端 CPU/GPU 开关用。"""
+        self.device = device
+
     # ---------------------------------------------------------------- 内部
     def _predict(self, img: np.ndarray, offset: tuple[int, int] = (0, 0),
                  conf: float | None = None) -> list[Detection]:

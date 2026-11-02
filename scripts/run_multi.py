@@ -224,8 +224,13 @@ def main() -> int:
         else:
             print(f"[warn] 香烟模型不存在，跳过：{cand}", flush=True)
 
+    _device = det_cfg.get("device", 0)
+    if _device == "cpu":
+        _device = "cpu"
+    elif not _device or _device == "auto":
+        _device = 0          # 默认 GPU(cuda:0)
     detector = Detector(str(WEIGHTS), conf=float(thr.get("det_conf", 0.20)),
-                        imgsz=int(det_cfg.get("imgsz", 640)), device=0,
+                        imgsz=int(det_cfg.get("imgsz", 640)), device=_device,
                         extra_weights=extra_path,
                         extra_conf=float(thr.get("cigarette_conf", 0.20)))
 
