@@ -139,7 +139,7 @@ DEFAULTS = {
     # 这时还把结论推回给人重判一遍，等于裁判白请了。
     "llm_override_conf": 0.95,
     # 置信度高于此值时，即使该区域刚被判过"非火"也重新送审（防区域静音误伤真火）
-    "llm_mute_bypass_conf": 0.80,
+    "llm_mute_bypass_conf": 0.92,
     # 固定光源预筛（纯本地、免费）。设为 False 则所有目标都送审，更准但更贵。
     "static_prefilter": True,
     # 光敏引擎：找出画面里所有亮斑，用灰框标出来（不参与追踪和告警）。
@@ -683,7 +683,7 @@ class Pipeline:
         说明"东西变了"，即便区域相同也重新问一次。
         """
         mute = float(self.cfg["llm_region_mute_sec"])
-        jump = float(self.cfg.get("llm_region_jump", 0.25))
+        jump = float(self.cfg.get("llm_region_jump", 0.40))
         if mute <= 0:
             return False
         keep = []
