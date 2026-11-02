@@ -890,7 +890,7 @@ class Pipeline:
 
         ok, _why = self.arbiter.submit(
             key, pkt.image, box, rule_label=kind, rule_score=score,
-            context=(f"检测器报告这块区域可疑（conf {t.samples[-1].conf:.2f}，已持续 {t.hits} 帧）。请注意：检测器给的类别仅供参考，请你看图自己判断它到底是什么。")
+            context=(f"检测器报告这块区域可疑（conf {t.samples[-1].conf:.2f}，已持续 {t.hits} 帧）。请注意：检测器给的类别仅供参考，请你看图自己判断它到底是什么。"),
             feat=extract_features(t.samples))
         if not ok:
             self._defer_why = f"送审未成功（{_why}），本轮按规则层处理"
