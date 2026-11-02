@@ -209,6 +209,37 @@ def center_in(box, pt) -> bool:
     return x1 <= pt[0] <= x2 and y1 <= pt[1] <= y2
 
 
+def _cig_box_is_hand(image: np.ndarray, box, aspect_min: float = 1.6) -> bool:
+    """判断 cigarette 框是否更像"手/拳头"而非香烟。
+
+    香烟模型会把手指捏合的手势误检成 cigarette（用户截图 CIGARETTE 0.84
+    框住整只手掌）。手是宽大的，最小外接矩形长宽比 ~1~1.5；香烟是细长的。
+    用框内亮色像素的最小外接矩形长宽比来区分。
+    阈值 1.6：只拦明显的方形(手/拳头)，不误杀检测框偏方的真烟 ——
+    用户反馈"框歪、只框住过滤嘴"，说明真烟检测框有时偏方，2.4 太紧会误杀。
+    """
+    x1, y1, x2, y2 = (int(round(float(v))) for v in box)
+    h, w = image.shape[:2]
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(w, x2), min(h, y2)
+    if x2 - x1 < 4 or y2 - y1 < 4:
+        return False
+    crop = image[y1:y2, x1:x2]
+    if crop.size == 0:
+        return False
+    hsv = cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)
+    # 亮色像素（香烟白、手部肤色/高光）：只要大致框住目标即可，
+    # 判定靠的是 minAreaRect 的长宽比，不是颜色阈值本身。
+    mask = cv2.inRange(hsv, (0, 0, 90), (180, 160, 255))
+    if int(mask.sum()) < 20:
+        return False
+    pts = cv2.findNonZero(mask)
+    if pts is None:
+        return False
+    (_cx, _cy), (rw, rh), _ang = cv2.minAreaRect(pts)
+    return (max(rw, rh) / max(1.0, min(rw, rh))) < aspect_min
+
+
 def full_view(image: np.ndarray, box, max_side: int = 800):
     """全图缩略 + 把检测框标出来。
 
@@ -365,6 +396,7 @@ class _Pending:
     # 存像素坐标的话换分辨率整份记忆就废了。
     box_n: tuple[float, float, float, float] = (0.0, 0.0, 0.0, 0.0)
     area_n: float = 0.0
+    snapshot_full: np.ndarray | None = None   # 原图（带框），前端事件卡片主图
 
 
 # ------------------------------------------------------------------ 主类
@@ -911,6 +943,10 @@ class Pipeline:
             snapshot=crop_box(pkt.image, box, self.cfg["snapshot_margin"],
                               self.cfg["snapshot_max_side"],
                               int(self.cfg.get("snapshot_min_side", 220))),
+            # 原图（带框）：前端事件卡片的主图。之前只存 ROI 细节图，
+            # 前端"已排除"卡片就只剩一张裁切图，用户看不到整幅原图。
+            snapshot_full=full_view(pkt.image, box,
+                                    self.cfg["snapshot_full_max_side"]),
             score=float(score), reasons=list(reasons),
             hits=t.hits, n_samples=len(t.samples),
             box_n=box_n, area_n=area_n)
@@ -985,7 +1021,28 @@ class Pipeline:
                              score=float(info.score), box=info.box,
                              reasons=[f"LLM 判为{res.label}，但检测置信 {info.score:.2f} 很高，"
                                       f"冲突未决，请人工确认"] + info.reasons[:1],
-                             snapshot=info.snapshot,
+                             snapshot=info.snapshot, snapshot_full=info.snapshot_full,
+                             meta={"hits": info.hits, "n_samples": info.n_samples,
+                                   "llm_label": res.label, "llm_risk": res.risk,
+                                   "llm_source": res.source,
+                                   "llm_latency": round(res.latency_s, 2),
+                                   "overridden": True})
+            # 香烟保护：香烟模型（专门训的）检出 cigarette，LLM 却判 light/other，
+            # 两者矛盾。香烟目标小，LLM 只看原图容易看不清判成反光 ——
+            # 但香烟是明确违规行为，漏报代价远高于误报。不静默排除，
+            # 降为"待确认"让人看，而不是"已排除"。
+            if info.kind == "cigarette" and res.label in ("light", "other"):
+                self.stats["cig_light_conflict"] = \
+                    self.stats.get("cig_light_conflict", 0) + 1
+                return Event(kind="cigarette", level="notice", cam_id=info.cam_id,
+                             track_id=info.tid, frame_idx=info.frame_idx,
+                             t_first=info.t_first,
+                             t_alarm=pkt.ts if pkt is not None else info.ts,
+                             score=float(info.score), box=info.box,
+                             reasons=[f"香烟模型检出 cigarette（conf {info.score:.2f}），"
+                                      f"LLM 判为{res.label}，两者矛盾，请人工确认是否抽烟"]
+                                      + info.reasons[:1],
+                             snapshot=info.snapshot, snapshot_full=info.snapshot_full,
                              meta={"hits": info.hits, "n_samples": info.n_samples,
                                    "llm_label": res.label, "llm_risk": res.risk,
                                    "llm_source": res.source,
@@ -997,7 +1054,7 @@ class Pipeline:
                          t_alarm=pkt.ts if pkt is not None else info.ts,
                          score=float(res.confidence or info.score), box=info.box,
                          reasons=[f"LLM 判为{res.label}，已降级（非火灾风险）"] + info.reasons[:2],
-                         snapshot=info.snapshot,
+                         snapshot=info.snapshot, snapshot_full=info.snapshot_full,
                          meta={"hits": info.hits, "n_samples": info.n_samples,
                                "llm_label": res.label, "llm_risk": res.risk,
                                "llm_source": res.source,
@@ -1021,13 +1078,18 @@ class Pipeline:
             kind_out = info.kind
 
         if res.label == "cigarette":
-            # 香烟一旦被确认为香烟，就是**明确违规**（禁烟区抽烟），
-            # 不该因为 LLM 给的是 risk=medium 就只标黄。
-            # 用户的原话："为什么还是黄色，为什么不能确定为红色。"
-            # 黄=warning 是"疑似、需要关注"，红=alarm 是"确定有问题"。
-            # 判出 cigarette 本身就意味着"确定了"，所以直接 alarm。
+            # LLM 判 cigarette 就直接 alarm（红色）。
+            # 用户反馈：LLM 已判 cigarette（conf 0.72）却还是"待确认"蓝色，
+            # 不合理 —— LLM 说了是烟就该告警。之前加 confidence 门槛是为防
+            # "笔误检"，但现在已经让 LLM 对比细节图+全景图，判断更准，
+            # 不需要再用门槛压它的结论。真拿不准 LLM 会自己判 uncertain。
             level = "alarm"
-        elif res.label in ("fire", "smoke"):
+        elif res.label == "fire":
+            # LLM 判 fire 就直接 alarm（红色）—— 明火是最高优先级，
+            # 用户反馈"LLM 判断为火却还是黄色"不合理。LLM 说了是火就红警。
+            level = "alarm"
+        elif res.label == "smoke":
+            # 烟雾可能是真烟也可能是蒸汽，保留 risk 分级：high 才红色。
             level = "alarm" if res.risk == "high" else "warning"
         else:                                  # uncertain → 不硬判，推给人看
             level = "notice"
@@ -1043,6 +1105,7 @@ class Pipeline:
                    t_alarm=now_ts,
                    score=float(res.confidence or info.score), box=info.box,
                    reasons=reasons, snapshot=info.snapshot,
+                   snapshot_full=info.snapshot_full,
                    meta={"hits": info.hits, "n_samples": info.n_samples,
                          "llm_label": res.label, "llm_risk": res.risk,
                          "llm_source": res.source,
@@ -1057,27 +1120,96 @@ class Pipeline:
         return ev
 
     # ------------------------------------------------------------ 单帧
-    def _detect(self, image):
+    def _detect(self, image, cam_id: str = "default"):
         """按 detect_mode 选检测策略。
 
         · "auto"（默认）：先粗筛一帧，粗筛没东西就不切片。空白帧只花 10.7ms，
           可疑帧才付切片的钱 —— 真实枪机 99% 的帧是空的，省的就是这部分。
         · "slice"：每帧固定 2x2 切片，最稳但最贵（52ms/帧）。
         · "full"：不切片，最快（10.7ms）但小目标召回掉 13 个点，只用于排障对比。
+
+        ⚠️ cam_id 必须传给 detector 当 cache_key：Detector 是多路共享的，
+        切片/香烟缓存若不分路隔离，A 路的框会被 B 路复用（框乱跳、坐标错位）。
         """
         mode = self.cfg.get("detect_mode", "slice")
         if mode == "auto" and hasattr(self.detector, "detect_auto"):
-            return self.detector.detect_auto(
-                image, tile_grid=self.tile_grid, overlap=self.overlap)
-        return self.detector.detect(image, sliced=(mode == "slice"),
-                                    tile_grid=self.tile_grid, overlap=self.overlap)
+            dets = self.detector.detect_auto(
+                image, tile_grid=self.tile_grid, overlap=self.overlap,
+                cache_key=cam_id)
+        else:
+            dets = self.detector.detect(image, sliced=(mode == "slice"),
+                                        tile_grid=self.tile_grid, overlap=self.overlap,
+                                        cache_key=cam_id)
+        # 手误检香烟过滤：香烟模型会把整只手掌判成 cigarette，用几何长宽比
+        # 压掉宽大的"手"框，只保留细长的真烟。只对 cigarette 类，不影响火/烟。
+        dets = self._filter_cig_hand(dets, image)
+        # fire 反光/肤色抑制：主模型会把"手拿烟"的肤色、脸部油光误检成 fire。
+        # 在**检测阶段**就压掉，让它们不建轨迹、不送审、不画框 —— 彻底解决
+        # "框在脸上而不是香烟上"。真火橙黄 S>130、阴燃暗火亮度低，不会误伤。
+        return self._filter_fire_reflection(dets, image)
+
+    def _filter_cig_hand(self, dets, image):
+        """过滤掉"手/拳头被香烟模型误检成 cigarette"的框（几何校验）。"""
+        if not self.cfg.get("cig_hand_filter", True):
+            return dets
+        out = []
+        for d in dets:
+            if str(getattr(d, "cls_name", "")).lower() != "cigarette":
+                out.append(d)
+                continue
+            if _cig_box_is_hand(image, d.xyxy):
+                self.stats["cig_hand_filtered"] = \
+                    self.stats.get("cig_hand_filtered", 0) + 1
+                continue          # 宽大如手，不是细长的香烟，丢掉
+            out.append(d)
+        return out
+
+    def _filter_fire_reflection(self, dets, image):
+        """过滤掉"死白反光"和"身体/环境"被主模型误检成 fire 的框。
+
+        只拦两类：
+          · 死白反光：高亮(gray>=200) + 极低饱和(sat<=45)，如玻璃/镜面/油光；
+          · 身体/环境误检：**大框**(面积>=画面1.5%) + 低饱和(sat<=90)，
+            如人穿着浅色衣服被误判成火 —— 用户反馈"框偏到胸前"就是这类。
+        小火苗(面积小)、大火(面积大但橙黄高饱和 S>90)都不在这里，**不漏真火**。
+        """
+        if not self.cfg.get("fire_reflection_filter", True):
+            return dets
+        out = []
+        for d in dets:
+            if str(getattr(d, "cls_name", "")).lower() != "fire":
+                out.append(d)
+                continue
+            x1, y1, x2, y2 = (int(round(float(v))) for v in d.xyxy)
+            x1, y1 = max(0, x1), max(0, y1)
+            x2, y2 = min(image.shape[1], x2), min(image.shape[0], y2)
+            if x2 - x1 < 3 or y2 - y1 < 3:
+                out.append(d)
+                continue
+            crop = image[y1:y2, x1:x2]
+            _gray = float(cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY).mean())
+            _sat = float(cv2.cvtColor(crop, cv2.COLOR_BGR2HSV)[:, :, 1].mean())
+            _h, _w = image.shape[:2]
+            _area_ratio = (x2 - x1) * (y2 - y1) / max(1.0, _h * _w)
+            # ① 死白反光（小框高亮极低饱和）
+            if _gray >= 200.0 and _sat <= 45.0:
+                self.stats["fire_reflection_suppressed"] = \
+                    self.stats.get("fire_reflection_suppressed", 0) + 1
+                continue
+            # ② 身体/环境误检（大框 + 低饱和）
+            if _area_ratio >= 0.015 and _sat <= 90.0:
+                self.stats["fire_reflection_suppressed"] = \
+                    self.stats.get("fire_reflection_suppressed", 0) + 1
+                continue
+            out.append(d)
+        return out
 
     def process(self, pkt: FramePacket) -> FrameResult:
         """处理一帧。这是整条链路的唯一入口。"""
         cfg = self.cfg
 
         # ② detect —— 压低门限拿候选
-        dets = self._detect(pkt.image)
+        dets = self._detect(pkt.image, pkt.cam_id)
         h, w = pkt.image.shape[:2]
         min_area = cfg["min_box_pct"] * h * w
         dets = [d for d in dets if d.area >= min_area]
@@ -1451,16 +1583,36 @@ class Pipeline:
             # 在这条链上等于连续两个空帧就把轨迹藏起来 ——
             # 诊断日志实测：tracks={'cigarette':3} 但 draw={'光:白光':3}，
             # 轨迹明明还在，画面上什么都不显示。
-            # 取 5 帧（约 0.25 秒）覆盖所有降频组合，又不至于让旧框赖着不走。
-            if _t.misses > 15:
+            # 取 5 帧（约 0.15~0.5 秒）覆盖降频组合（切片 2 帧、香烟 1 帧），
+            # 又不让目标消失后旧框赖着不走 —— 用户反馈"香烟消失后框没立刻消失"。
+            if _t.misses > 5:
                 continue
             if _t.last_box is None or not _t.samples:
                 continue
             # ⚠️ 无中生有火框的根因：噪声轨迹 hits=1（只出现 1 帧）也画出来。
             # 真火和噪声的本质区别是"持续时间"：真火持续存在，噪声转瞬即逝。
             # 连续 5 帧（约 0.5 秒）才画，瞬时噪声框直接不出现。
-            if int(getattr(_t, "hits", 0)) < 5:
+            # 香烟例外：香烟目标小、分数天然低、检测波动大，5 帧门槛会让它
+            # "进画面等好久才出框"（用户反馈）。降到 2 帧更快出框，
+            # 噪声靠 NEW_TRACK_MIN_CONF 的 conf 门槛兜住。
+            _hit_min = 2 if str(_t.cls_name).lower() == "cigarette" else 5
+            if int(getattr(_t, "hits", 0)) < _hit_min:
                 continue
+            # ⚠️ fire 反光抑制：高亮 + 低饱和 = 死白反光，不是火。
+            # 主模型会把鼻梁油光、玻璃/镜面反光、皮肤高光误检成 fire
+            # （用户截图 FIRE 0.73 落在鼻梁上）。真火是橙黄/蓝焰，饱和度高；
+            # 反光是被强光冲淡的白色/肉色，饱和度极低、亮度很高。
+            # 只对 fire 类做，**不影响 smoke（白烟本就低饱和）和 cigarette**，
+            # 也不影响真火（橙黄 S>120）、蓝焰（S 高）、阴燃（亮度低）。
+            if str(_t.cls_name).lower() == "fire" and _t.samples:
+                _sat = float(_t.samples[-1].sat_mean)
+                _gray = float(_t.samples[-1].gray_mean)
+                # 双保险（检测阶段 _filter_fire_reflection 已拦）：只拦死白反光，
+                # 不误杀小火苗（用户反馈 det 0、画面没框）。
+                if _gray >= 200.0 and _sat <= 45.0:
+                    self.stats["fire_reflection_suppressed"] = \
+                        self.stats.get("fire_reflection_suppressed", 0) + 1
+                    continue          # 高亮死白反光，不画火框
             draw_dets.append(Detection(_t.cls_id, _t.cls_name,
                                        float(_t.samples[-1].conf), _t.last_box,
                                        _t.tid))

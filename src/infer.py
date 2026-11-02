@@ -176,10 +176,14 @@ class Detector:
         # 香烟模型关掉后腾出的算力正好给这里。
         self.tile_imgsz = 960
         self.slice_every = 2
-        self._slice_n = 0
-        self._slice_cache: list[Detection] = []
-        self._extra_n = 0
-        self._extra_cache: list[Detection] = []
+        # ⚠️ 这些缓存是**实例级状态**，而 Detector 在 run_multi 里是**多路共享**的
+        # （一块 GPU 只建一份模型）。多路轮流调 detect_auto 时，A 路的切片缓存
+        # 会被 B 路下一帧直接复用 —— 表现为 B 路上出现 A 路坐标的框、框乱跳。
+        # 改成按 cache_key（cam_id）隔离的字典，每路各自记自己的切片/香烟缓存。
+        self._slice_n: dict = {}
+        self._slice_cache: dict = {}
+        self._extra_n: dict = {}
+        self._extra_cache: dict = {}
 
     # ---------------------------------------------------------------- 内部
     def _predict(self, img: np.ndarray, offset: tuple[int, int] = (0, 0),
@@ -199,7 +203,8 @@ class Detector:
 
     def _predict_extra(self, image: np.ndarray,
                        crops: list[np.ndarray] | None = None,
-                       offs: list[tuple[int, int]] | None = None) -> list[Detection]:
+                       offs: list[tuple[int, int]] | None = None,
+                       cache_key: str = "default") -> list[Detection]:
         """第二个模型（香烟）。整图 + 复用主模型的切片一起跑。
 
         为什么香烟必须走切片
@@ -211,9 +216,9 @@ class Detector:
         """
         if self.extra is None:
             return []
-        self._extra_n += 1
-        if self._extra_n % self.extra_every != 0:
-            return list(self._extra_cache)      # 用上次的结果，不重复推理
+        self._extra_n[cache_key] = self._extra_n.get(cache_key, 0) + 1
+        if self._extra_n[cache_key] % self.extra_every != 0:
+            return list(self._extra_cache.get(cache_key, []))   # 用上次的结果，不重复推理
         out = []
 
         def _run(img, offset=(0, 0)):
@@ -237,7 +242,7 @@ class Detector:
         # 用户要求"检测帧率拉到最高"，这里是最划算的一刀 ——
         # 省掉 40ms/帧（总耗时的 40%），代价是远处极小的香烟可能漏。
         # 靠 cigarette_conf=0.03 的极低门限 + 每帧都检（every=1）来补偿。
-        self._extra_cache = out
+        self._extra_cache[cache_key] = out
         return out
 
     def _predict_batch(self, imgs: list[np.ndarray],
@@ -286,6 +291,7 @@ class Detector:
         overlap: float = 0.3,
         keep_full_frame: bool = True,
         batched: bool = False,
+        cache_key: str = "default",
     ) -> list[Detection]:
         """检测一帧。
 
@@ -323,7 +329,7 @@ class Detector:
         dets: list[Detection] = []
         for crop, off in zip(crops, offs):
             dets.extend(self._predict(crop, offset=off))
-        return nms(dets + self._predict_extra(image), 0.25)
+        return nms(dets + self._predict_extra(image, cache_key=cache_key), 0.25)
 
     def detect_auto(
         self,
@@ -331,6 +337,7 @@ class Detector:
         trigger_conf: float = 0.03,
         tile_grid: int = 2,
         overlap: float = 0.25,
+        cache_key: str = "default",
     ) -> list[Detection]:
         """分级检测：先粗筛一帧，**只有粗筛出了东西才切片**。
 
@@ -390,17 +397,17 @@ class Detector:
         #   · 整图每帧跑      -> 响应快，大目标不漏
         #   · 切片每 slice_every 帧跑 -> 小目标仍然有专门的放大通道
         # 平均耗时从 51ms 降到 11 + 40/N，N=3 时约 24ms，检测频率翻倍。
-        self._slice_n = getattr(self, "_slice_n", 0) + 1
+        self._slice_n[cache_key] = self._slice_n.get(cache_key, 0) + 1
         dets = list(kept)
-        if self._slice_n % int(self.slice_every) == 0:
+        if self._slice_n[cache_key] % int(self.slice_every) == 0:
             dets += self._predict_batch(crops, offs)
-            self._slice_cache = [d for d in dets if d not in kept]
+            self._slice_cache[cache_key] = [d for d in dets if d not in kept]
         else:
             # 不切片的帧沿用上一次的切片结果（框位置由追踪器平滑，不会跳）
-            dets += list(getattr(self, "_slice_cache", []))
+            dets += list(self._slice_cache.get(cache_key, []))
 
         # 香烟模型：整图 + 复用切片（它自己有降频）
-        dets += self._predict_extra(image, crops, offs)
+        dets += self._predict_extra(image, crops, offs, cache_key=cache_key)
 
         # ⚠️ 合并后必须做**更严格的**二级 NMS（0.25，而不是 0.5）。
         #

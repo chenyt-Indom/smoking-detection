@@ -438,12 +438,14 @@ svg.icon{width:13px;height:13px;vertical-align:-2px}
     if (reasons) html += '<div class="ev-meta" style="color:var(--dim)">' + esc(reasons) + '</div>';
     if (e.snapshot || e.snapshot_full) {
       html += '<div class="ev-imgs">';
+      // 原图（全景）放前面做主图：用户要求"直接推原图，不要局部截图"。
+      // LLM 看到的就是整幅原图，前端也应以原图为第一张，细节放大退到后面。
+      if (e.snapshot_full)
+        html += '<div class="img-wrap ev-full"><img src="' + esc(e.snapshot_full) +
+                '" loading="lazy" alt="原图" data-zoom><span class="cap">原图</span></div>';
       if (e.snapshot)
         html += '<div class="img-wrap ev-roi"><img src="' + esc(e.snapshot) +
                 '" loading="lazy" alt="细节放大" data-zoom><span class="cap">细节</span></div>';
-      if (e.snapshot_full)
-        html += '<div class="img-wrap ev-full"><img src="' + esc(e.snapshot_full) +
-                '" loading="lazy" alt="全景" data-zoom><span class="cap">全景</span></div>';
       html += '</div>';
     }
     // 按事件类别给按钮文案：烟的事件问"有没有烟"，火的事件问"有没有火"。

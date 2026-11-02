@@ -66,16 +66,17 @@ DEFAULTS = {
 
 SYSTEM = (
     "你是消防安防值班员，看一路监控画面。\n"
-    "图1 是整幅画面，图2 是可疑区域放大。只有一张图时那张就是整幅画面。\n"
-    "两张一起看：图1 看环境和人的动作，图2 看那块东西本身。\n"
-    "图上没有任何人工标注框，图2 已经是裁好的可疑区域。\n\n"
+    "我会给你两张图：图1 是整幅原图（看环境），图2 是可疑区域放大（看目标本身）。\n"
+    "请把两张图**对比着看**：图1 判断它在什么环境、人在做什么动作；\n"
+    "图2 看清目标本身**是什么物体**。\n"
+    "两张结合再下结论。图上没有任何人工标注框。\n\n"
 
     "判断这个可疑目标是什么，从下面六个里选一个：\n"
     "  fire      明火（会飘动的橙黄或蓝黄火苗）\n"
     "  smoke     向外翻滚扩散的烟气\n"
     "  cigarette 香烟、烟头一类的细长物\n"
-    "  light     灯具、光斑、反光、屏幕\n"
-    "  other     看清了，是别的东西\n"
+    "  light     灯具、光斑、反光（自身会发光/反光的东西）\n"
+    "  other     看清了，是别的东西（手机、笔、打火机等不发光的实物）\n"
     "  uncertain 画面糊到真的看不清\n\n"
 
     "输出一个 JSON，不要任何其他文字：\n"
@@ -546,11 +547,10 @@ class LlmArbiter:
                                  "high" if rule_label in ("fire", "smoke") else "low",
                                  max(rule_score, 0.6), "dry-run 假裁决", "dry_run", 0.05)
 
-        # ⚠️ 顺序必须与 SYSTEM 里的描述一致：图1 整幅画面、图2 可疑区域放大。
-        # 原来这里是 ROI 在前、全图在后，而 prompt 写的正好相反 ——
-        # 模型把裁剪图当成"整幅画面"去理解环境，把全图当成"放大细节"，
-        # 判断依据整个错位。这种错配比少给一张图更糟。
-        # 先看环境再看细节也是更自然的顺序。
+        # 传两张图：图1 整幅原图（看环境），图2 可疑区域放大（看目标本身）。
+        # 用户要求：让 LLM 把细节图和全景图仔细对比再判断，提高精度 ——
+        # 只传原图时香烟/火苗太小看不清，容易被判成笔/反光。
+        # 顺序必须与 SYSTEM 一致：先原图（环境），后细节（目标）。
         imgs = []
         imgs.append(_encode(frame, int(cfg["full_max_side"]), int(cfg["jpeg_quality"])))
         if roi is not None:
@@ -688,10 +688,9 @@ class LlmArbiter:
             lines.append(f"时序观测：已持续 {feat.duration:.1f}s，{g_txt}（{g:+.2f}/s），"
                          f"{j_txt}（亮度 {feat.gray_trend:+.1f}/s，"
                          f"清晰度 {feat.edge_trend:+.3f}/s）")
-            lines.append("参考：固定光源/反光通常面积与亮度都不变、边缘稳定；"
-                         "燃烧通常面积在涨、亮度或边缘有抖动。这只是参考，仍以画面为准。")
-        lines.append(f"第一遍检测给出：{context or '疑似火/烟'}")
-        lines.append("请判断是否有火灾风险。")
+            lines.append("以上时序统计仅作参考，最终仍以两张图片为准。")
+        lines.append(f"{context or '这块区域可疑，检测器给的类别仅供参考'}")
+        lines.append("请判断可疑目标到底是什么，给出你的结论。")
         return "\n".join(lines)
 
     def _to_result(self, d: dict, latency: float) -> ArbiterResult:
