@@ -57,7 +57,7 @@ DEFAULTS = {
     "roi_max_side": 512,           # ROI 放大后的长边
     "full_max_side": 768,          # 整幅图的长边（太大既慢又贵）
     "jpeg_quality": 72,
-    "max_workers": 2,              # 并发上限。别调高：并发多了反而被限流
+    "max_workers": 1,              # 并发上限。别调高：并发多了反而被限流
     "queue_limit": 8,              # 排队超过这个数就跳过（宁可少审也别堆积）
     "hourly_limit": 300,           # 每小时调用上限，超了自动降级
     "dedup_seconds": 180,          # 同一目标 3 分钟内只审一次
@@ -570,6 +570,9 @@ class LlmArbiter:
                          {"role": "user", "content": content}],
             "temperature": cfg["temperature"],
             "max_tokens": cfg["max_tokens"],
+            # Ollama 本地模型默认 5 分钟不调用就卸载，下次又冷启动 10 秒+
+            # 表现为"偶尔 LLM 不可用"。常驻 1 小时，减少冷启动抖动。
+            "keep_alive": "1h",
         }
         # DeepSeek 默认开思考模式（effort=high）。实测 max_tokens=512 时
         # 全部 token 都被 reasoning 吃掉、content 返回空串，JSON 解析必然失败。
