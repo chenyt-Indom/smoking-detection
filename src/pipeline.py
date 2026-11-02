@@ -755,7 +755,13 @@ class Pipeline:
           · 裁判拒收（没 Key / 超额 / 去重 / 排队满）
         否则 LLM 一挂告警就全停了 —— 这是最不能接受的事故。
         """
+        # 记录"为什么不送审"，好让调用方给出准确文案。
+        # 之前四个 return False 全被上层写成"裁判不可用"，用户看到后
+        # 以为是 LLM 挂了 —— 实际上 LLM 那会儿可能 120/120 全成功，
+        # 只是这条因为置信度不在区间/低于门槛而没送。
+        self._defer_why = ""
         if self.arbiter is None:
+            self._defer_why = "裁判未启用"
             return False
 
         # 已经被"合并送审"带走了 —— 不要再单独送一次
@@ -846,6 +852,7 @@ class Pipeline:
             if self.stats["below_floor_skipped"] in (1, 50, 200):
                 print(f"[defer] 门槛拦下 kind={kind} score={score:.3f} floor={floor}",
                       flush=True)
+            self._defer_why = f"conf {score:.2f} 低于 {kind} 门槛 {floor:.2f}，未送审"
             return False
 
         # ② 置信度闸门（省钱的核心）：只在规则拿不准的区间才花钱
@@ -867,6 +874,8 @@ class Pipeline:
             if self.stats["llm_gated"] in (1, 50, 200):
                 print(f"[defer] 闸门拦下 kind={kind} score={score:.3f} "
                       f"low={low} sure={sure}", flush=True)
+            self._defer_why = (f"conf {score:.2f} 不在送审区间 "
+                               f"[{low:.2f}, {sure:.2f})，规则层直接判")
             return False          # 交回规则层，一次 API 都不花
 
         ok, _why = self.arbiter.submit(
@@ -874,6 +883,7 @@ class Pipeline:
             context=f"{kind}，检测 conf {t.samples[-1].conf:.2f}，轨迹已命中 {t.hits} 帧",
             feat=extract_features(t.samples))
         if not ok:
+            self._defer_why = f"送审未成功（{_why}），本轮按规则层处理"
             return False
         self._pending[key] = _Pending(
             kind=kind, tid=tid, cam_id=pkt.cam_id, frame_idx=pkt.idx, ts=pkt.ts,
@@ -1246,7 +1256,8 @@ class Pipeline:
                     events.append(self._make_event(
                         kind, "notice", t.tid, t, pkt, conf, t.last_box,
                         [f"连续 {self._smoke_streak[t.tid]} 帧检出香烟"
-                         f"（conf {conf:.2f}），裁判不可用，请人工确认"]))
+                         f"（conf {conf:.2f}），"
+                         f"{getattr(self, '_defer_why', '') or '未送审'}"]))
                 continue
 
             # ── 烟：慢路径，必须先过时序判别 ────────────────────
