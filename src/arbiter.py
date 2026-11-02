@@ -573,6 +573,9 @@ class LlmArbiter:
             # Ollama 本地模型默认 5 分钟不调用就卸载，下次又冷启动 10 秒+
             # 表现为"偶尔 LLM 不可用"。常驻 1 小时，减少冷启动抖动。
             "keep_alive": "1h",
+            # Ollama 支持 format=json 强制输出合法 JSON（本地模型不强制的话
+            # 会带 ```json 代码块、缺 confidence 字段，解析失败）。
+            "format": "json",
         }
         # DeepSeek 默认开思考模式（effort=high）。实测 max_tokens=512 时
         # 全部 token 都被 reasoning 吃掉、content 返回空串，JSON 解析必然失败。

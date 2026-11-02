@@ -12,7 +12,7 @@ dry_run: false                 # true = 不发请求，只验证接线
 
 # ── 接口 ──────────────────────────────────────────────────
 url: http://127.0.0.1:11434/v1/chat/completions
-model: qwen2.5vl:3b
+model: qwen3-vl:8b
 api_key_env: DEEPSEEK_KEY      # 系统环境变量名，不写具体值
 
 # 旧配置（天翼云星辰 TokenHub），换回来时改上面三行：
@@ -40,7 +40,7 @@ temperature: 0.1
 # 开思考后输出预算要够：推理链本身就可能几百到上千 token。
 # 512 会让它思考到一半被截断，content 返回空 —— 那正是当初关思考的原因。
 max_tokens: 700              # 短 JSON 用不了多少，给太多纯拖慢
-timeout_s: 30
+timeout_s: 90              # 8B 冷启动 + 双图推理要更久
 
 # 图片参数：ROI 放大看细节，整幅图看环境。长边压小是为了省 token，不是为了省流量
 roi_max_side: 480
