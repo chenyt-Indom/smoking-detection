@@ -1456,6 +1456,11 @@ class Pipeline:
                 continue
             if _t.last_box is None or not _t.samples:
                 continue
+            # ⚠️ 无中生有火框的根因：噪声轨迹 hits=1（只出现 1 帧）也画出来。
+            # 真火和噪声的本质区别是"持续时间"：真火持续存在，噪声转瞬即逝。
+            # 连续 5 帧（约 0.5 秒）才画，瞬时噪声框直接不出现。
+            if int(getattr(_t, "hits", 0)) < 5:
+                continue
             draw_dets.append(Detection(_t.cls_id, _t.cls_name,
                                        float(_t.samples[-1].conf), _t.last_box,
                                        _t.tid))
