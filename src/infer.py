@@ -166,8 +166,12 @@ class Detector:
         #     640x360 的块 -> 960，放大 1.5x -> 香烟 39x62
         # 和训练的 20x32 在同一量级。原来 3x3+1024 会放大 4.27x（111x183），
         # 与训练尺度差 5 倍以上，是"训练完反而更差"的隐藏原因。
-        self.tile_imgsz = 960
-        self.slice_every = 3
+        # 远距离检测：切片从 2x2 + 960 提到 3x3 + 1152。
+        # 1280x720 切成 3x3 每块约 426x240，送到 1152 是 2.7 倍放大 ——
+        # 一个 10x15 像素的远处小火苗会变成 27x40，进入"能认"的量级。
+        # 香烟模型关掉后腾出的算力正好给这里。
+        self.tile_imgsz = 1152
+        self.slice_every = 2
         self._slice_n = 0
         self._slice_cache: list[Detection] = []
         self._extra_n = 0
@@ -320,9 +324,9 @@ class Detector:
     def detect_auto(
         self,
         image: np.ndarray,
-        trigger_conf: float = 0.03,
-        tile_grid: int = 2,
-        overlap: float = 0.25,
+        trigger_conf: float = 0.02,
+        tile_grid: int = 3,
+        overlap: float = 0.3,
     ) -> list[Detection]:
         """分级检测：先粗筛一帧，**只有粗筛出了东西才切片**。
 
