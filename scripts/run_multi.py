@@ -188,6 +188,8 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=None)
     ap.add_argument("--host", default=None)
     ap.add_argument("--llm", default="auto", choices=["auto", "off", "dry"])
+    ap.add_argument("--no-browser", action="store_true",
+                    help="启动后不自动打开浏览器看板")
     a = ap.parse_args()
 
     lock = acquire_lock()
@@ -313,6 +315,18 @@ def main() -> int:
           f"sliced={det_cfg.get('sliced', False)}  "
           f"阈值 fire={pipe_cfg['fire_conf']} smoke={pipe_cfg['smoke_conf']}")
     print("按 Ctrl+C 停止\n" + "-" * 70, flush=True)
+
+    # 自动打开浏览器看板（双击 exe 后无需手动输网址）。
+    # 用独立线程延迟 1.5s 打开，等端口就绪、模型加载完。
+    if not a.no_browser:
+        def _open_browser() -> None:
+            time.sleep(1.5)
+            try:
+                import webbrowser
+                webbrowser.open(url)
+            except Exception:               # noqa: BLE001
+                pass
+        threading.Thread(target=_open_browser, daemon=True).start()
 
     every = max(1, int(det_cfg.get("every", 2)))
 
