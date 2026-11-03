@@ -359,7 +359,9 @@ class IoUTracker:
             # vx 趋 0 框停住，移动目标 vx 推着框跟上）。
             if t.kf is not None and t.misses <= 5:
                 t.last_box = t.kf.predict()
-            if (ts - t.last_t) > self.max_miss_sec:
+            # 火苗闪烁漏帧，容忍更长（2秒），避免闪烁导致轨迹断裂。
+            _miss_sec = {"fire": 2.0}.get(t.cls_name, self.max_miss_sec)
+            if (ts - t.last_t) > _miss_sec:
                 self.tracks.pop(tid, None)
 
         # 未匹配的检测新建轨迹

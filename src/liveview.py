@@ -231,7 +231,9 @@ class LiveView:
                 # 占框比例大得多，同样的 alpha 视觉上就是"更抖"。
                 _w = abs(float(box[2]) - float(box[0]))
                 _h = abs(float(box[3]) - float(box[1]))
-                _base = {"fire": 0.28, "cigarette": 0.30, "smoke": 0.45}.get(name, 0.40)
+                # 火苗 base 压到 0.15：火苗闪烁抖动比香烟剧烈得多，同样的 alpha
+                # 视觉上就是"乱跳"。0.15 重历史 0.85，框非常稳（火焰蔓延慢，滞后可接受）。
+                _base = {"fire": 0.15, "cigarette": 0.35, "smoke": 0.45}.get(name, 0.40)
                 if min(_w, _h) < 48:          # 小目标：再重一点历史
                     _base *= 0.78
                 elif min(_w, _h) > 160:       # 大目标：可以更信任观测
@@ -243,7 +245,7 @@ class LiveView:
                 # 负增益会让真移动也跟不上（框滞后），正增益又跟着抖。
                 # 折中：fire 增益 0 —— alpha 恒定中等值，既不跟着抖、又能跟上
                 # 缓慢移动（滞后很小）。香烟手持移动、烟扩散保持正增益跟手。
-                _gain = {"fire": 0.0, "cigarette": 0.9, "smoke": 1.4}.get(name, 1.4)
+                _gain = {"fire": 0.0, "cigarette": 1.2, "smoke": 1.4}.get(name, 1.4)
                 if min(_w, _h) < 48:
                     _gain = 0.0 if name == "fire" else 0.9
                 _a = min(0.9, max(0.12, _base + _shift * _gain))

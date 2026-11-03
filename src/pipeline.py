@@ -415,7 +415,7 @@ class Pipeline:
         verifier=None,
         arbiter=None,
         sliced: bool | None = None,
-        tile_grid: int = 2,
+        tile_grid: int = 3,
         overlap: float = 0.25,
     ) -> None:
         self.detector = detector

@@ -27,6 +27,7 @@ from dataclasses import dataclass
 from typing import Iterable, Sequence
 
 import numpy as np
+import cv2
 
 
 @dataclass
@@ -175,7 +176,7 @@ class Detector:
         # 一个 10x15 像素的远处小火苗会变成 27x40，进入"能认"的量级。
         # 香烟模型关掉后腾出的算力正好给这里。
         self.tile_imgsz = 960
-        self.slice_every = 2
+        self.slice_every = 3
         # ⚠️ 这些缓存是**实例级状态**，而 Detector 在 run_multi 里是**多路共享**的
         # （一块 GPU 只建一份模型）。多路轮流调 detect_auto 时，A 路的切片缓存
         # 会被 B 路下一帧直接复用 —— 表现为 B 路上出现 A 路坐标的框、框乱跳。
@@ -286,6 +287,10 @@ class Detector:
             imgs = [images[i] for i in need_idx]
             rs = self.extra.predict(imgs, imgsz=self.imgsz, conf=self.extra_conf,
                                     iou=self.iou, device=self.device, verbose=False)
+            # 旋转 90° 再检一次（补横向香烟）：模型对横向香烟召回低，旋转后横向变纵向。
+            rot_imgs = [cv2.rotate(im, cv2.ROTATE_90_CLOCKWISE) for im in imgs]
+            rs_rot = self.extra.predict(rot_imgs, imgsz=self.imgsz, conf=self.extra_conf,
+                                        iou=self.iou, device=self.device, verbose=False)
             for j, i in enumerate(need_idx):
                 out = []
                 for b in rs[j].boxes:
@@ -293,6 +298,15 @@ class Detector:
                     cid = int(b.cls)
                     out.append(Detection(cid, self.extra_names.get(cid, "cigarette"),
                                          float(b.conf), (x1, y1, x2, y2)))
+                # 旋转检测结果坐标转回原图：90°顺时针 原图(x,y)->旋转图(h-1-y,x)
+                # 反推：旋转图(x',y') -> 原图(y', h-1-x')
+                h, w = imgs[j].shape[:2]
+                for b in rs_rot[j].boxes:
+                    x1, y1, x2, y2 = b.xyxy[0].tolist()
+                    cid = int(b.cls)
+                    out.append(Detection(cid, self.extra_names.get(cid, "cigarette"),
+                                         float(b.conf),
+                                         (y1, h - 1 - x2, y2, h - 1 - x1)))
                 self._extra_cache[cache_keys[i]] = out
                 results[i] = out
         return results
