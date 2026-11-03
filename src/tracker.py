@@ -320,7 +320,14 @@ class IoUTracker:
             if pb is None:
                 continue
             for di, d in enumerate(dets):
-                if d.cls_id != t.cls_id:
+                # ⚠️ 必须按**类名**判断同类，不能用 cls_id！
+                # 主模型是 {0: fire, 1: smoke}，香烟模型是 {0: cigarette} ——
+                # 火和香烟的 cls_id **都是 0**。之前用 `d.cls_id != t.cls_id`
+                # 过滤，等于把"火"和"香烟"当成同一类：火检测(0)能匹配到
+                # 香烟轨迹(0)、香烟检测(0)能匹配到火轨迹(0)，两条轨迹互抢、
+                # 框互相"吞"，画面就出现"香烟和火混在一起、几乎重合"。
+                # 这和 nms() 里"按类名分组"是同一个坑，这里漏改了。
+                if str(d.cls_name).lower() != str(t.cls_name).lower():
                     continue
                 v = _score(pb, d.xyxy)
                 if v > 0.0:
