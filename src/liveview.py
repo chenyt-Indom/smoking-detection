@@ -198,7 +198,7 @@ class LiveView:
                 out.append((None, getattr(d, "cls_name", ""), getattr(d, "conf", 0.0)))
                 continue
             name = str(getattr(d, "cls_name", ""))
-            best, best_iou = -1, 0.25
+            best, best_iou = -1, 0.12
             for i, (pb, pn, _pc) in enumerate(prev):
                 if i in used or pn != name or pb is None:
                     continue
@@ -239,8 +239,14 @@ class LiveView:
 
                 # 位移增益 1.4 也按目标大小调：小目标归一化位移天然更大，
                 # 用同样的增益会让"稍微动一下"就跳到 0.9，等于没平滑。
-                _gain = 0.9 if min(_w, _h) < 48 else 1.4
-                _a = min(0.9, max(0.20, _base + _shift * _gain))
+                # 位移增益按目标特性分：火苗的"位移"是闪烁抖动+可能蔓延移动，
+                # 负增益会让真移动也跟不上（框滞后），正增益又跟着抖。
+                # 折中：fire 增益 0 —— alpha 恒定中等值，既不跟着抖、又能跟上
+                # 缓慢移动（滞后很小）。香烟手持移动、烟扩散保持正增益跟手。
+                _gain = {"fire": 0.0, "cigarette": 0.9, "smoke": 1.4}.get(name, 1.4)
+                if min(_w, _h) < 48:
+                    _gain = 0.0 if name == "fire" else 0.9
+                _a = min(0.9, max(0.12, _base + _shift * _gain))
                 box = tuple(_a * float(c) + (1.0 - _a) * float(p)
                             for c, p in zip(box, pb))
                 used.add(best)

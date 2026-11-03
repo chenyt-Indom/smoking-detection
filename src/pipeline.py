@@ -1204,12 +1204,17 @@ class Pipeline:
             out.append(d)
         return out
 
-    def process(self, pkt: FramePacket) -> FrameResult:
-        """处理一帧。这是整条链路的唯一入口。"""
+    def process(self, pkt: FramePacket, dets: list | None = None) -> FrameResult:
+        """处理一帧。这是整条链路的唯一入口。
+
+        dets 可外部传入（多摄像头 batch 检测时，检测已在外层统一做完，
+        这里跳过 _detect 直接用）。None 则自己检测。
+        """
         cfg = self.cfg
 
         # ② detect —— 压低门限拿候选
-        dets = self._detect(pkt.image, pkt.cam_id)
+        if dets is None:
+            dets = self._detect(pkt.image, pkt.cam_id)
         h, w = pkt.image.shape[:2]
         min_area = cfg["min_box_pct"] * h * w
         dets = [d for d in dets if d.area >= min_area]

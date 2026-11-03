@@ -192,6 +192,21 @@ class Detector:
         """切换推理设备：0/'' = GPU(cuda)，'cpu' = CPU。前端 CPU/GPU 开关用。"""
         self.device = device
 
+    def _enhance(self, image: np.ndarray) -> np.ndarray:
+        """光线自适应：CLAHE 在 LAB 亮度通道做局部直方图均衡。
+
+        作用：压反光/过曝、提暗部，让模型在强光/逆光下也能看清目标。
+        火光本身是高亮，CLAHE 只均衡局部对比、不会把它抹掉（clipLimit 保守）。
+        """
+        try:
+            lab = cv2.cvtColor(image, cv2.COLOR_BGR2LAB)
+            l, a, b = cv2.split(lab)
+            clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+            l = clahe.apply(l)
+            return cv2.cvtColor(cv2.merge((l, a, b)), cv2.COLOR_LAB2BGR)
+        except Exception:                    # noqa: BLE001
+            return image
+
     # ---------------------------------------------------------------- 内部
     def _predict(self, img: np.ndarray, offset: tuple[int, int] = (0, 0),
                  conf: float | None = None) -> list[Detection]:
@@ -251,6 +266,36 @@ class Detector:
         # 靠 cigarette_conf=0.03 的极低门限 + 每帧都检（every=1）来补偿。
         self._extra_cache[cache_key] = out
         return out
+
+    def _predict_extra_batch(self, images: list[np.ndarray],
+                             cache_keys: list[str]) -> list[list[Detection]]:
+        """batch 香烟检测多路整图（多摄像头同时）。带降频 + 缓存，逻辑同单路版。"""
+        n = len(images)
+        if self.extra is None:
+            return [[] for _ in range(n)]
+        results: list = []
+        need_idx: list[int] = []
+        for i, ck in enumerate(cache_keys):
+            self._extra_n[ck] = self._extra_n.get(ck, 0) + 1
+            if self._extra_n[ck] % self.extra_every != 0:
+                results.append(list(self._extra_cache.get(ck, [])))
+            else:
+                results.append(None)          # 标记需要推理
+                need_idx.append(i)
+        if need_idx:
+            imgs = [images[i] for i in need_idx]
+            rs = self.extra.predict(imgs, imgsz=self.imgsz, conf=self.extra_conf,
+                                    iou=self.iou, device=self.device, verbose=False)
+            for j, i in enumerate(need_idx):
+                out = []
+                for b in rs[j].boxes:
+                    x1, y1, x2, y2 = b.xyxy[0].tolist()
+                    cid = int(b.cls)
+                    out.append(Detection(cid, self.extra_names.get(cid, "cigarette"),
+                                         float(b.conf), (x1, y1, x2, y2)))
+                self._extra_cache[cache_keys[i]] = out
+                results[i] = out
+        return results
 
     def _predict_batch(self, imgs: list[np.ndarray],
                        offsets: list[tuple[int, int]]) -> list[Detection]:
@@ -367,6 +412,7 @@ class Detector:
         所以压低门限不会多花一次前向。门限越低，"有东西"的判定越松，
         越不容易把该切的帧漏掉 —— 而代价只是更多帧走慢路径。
         """
+        image = self._enhance(image)          # 光线自适应（压反光/提暗部）
         h, w = image.shape[:2]
         coarse = self._predict(image, conf=trigger_conf) if self.enable_main else []
 
@@ -427,3 +473,67 @@ class Detector:
         # 0.25 能把这些跨通道的重复彻底合并，而真正的两个独立目标
         # （比如手和烟）IOU 远低于 0.25，不会被误合并。
         return nms(dets, 0.25)
+
+    def detect_auto_batch(
+        self,
+        images: list[np.ndarray],
+        cache_keys: list[str],
+        trigger_conf: float = 0.03,
+        tile_grid: int = 2,
+        overlap: float = 0.25,
+    ) -> list[list[Detection]]:
+        """多摄像头同时检测：batch 推理多路帧，一次前向喂所有路。
+
+        和 detect_auto 的区别：整图、香烟都合成 batch（GPU 一次前向跑多路），
+        切片仍按路独立（每路自己的 crops 合成 batch）。这样多路不再"交替"，
+        而是同一时刻一起检测。
+        """
+        n = len(images)
+        images = [self._enhance(im) for im in images]
+
+        # ── 1. 整图 batch（主模型粗筛）──
+        coarses: list[list] = [[] for _ in range(n)]
+        if self.enable_main:
+            rs = self.model.predict(
+                images, imgsz=self.imgsz, conf=trigger_conf, iou=self.iou,
+                device=self.device, classes=self.classes, verbose=False)
+            for i, r in enumerate(rs):
+                coarses[i] = [
+                    Detection(int(b.cls), self.names[int(b.cls)], float(b.conf),
+                              tuple(b.xyxy[0].tolist()))
+                    for b in r.boxes
+                ]
+
+        # ── 2. 切片 + 合并（每路独立，降频逻辑同 detect_auto）──
+        results: list[list] = []
+        for i in range(n):
+            dets = [d for d in coarses[i] if d.conf >= self.conf]
+            crops: list[np.ndarray] = []
+            offs: list[tuple[int, int]] = []
+            if self.enable_main:
+                h, w = images[i].shape[:2]
+                for x0, y0, x1, y1 in self._tiles(h, w, tile_grid, overlap):
+                    crop = images[i][y0:y1, x0:x1]
+                    if crop.size == 0:
+                        continue
+                    crops.append(crop)
+                    offs.append((x0, y0))
+            ck = cache_keys[i]
+            self._slice_n[ck] = self._slice_n.get(ck, 0) + 1
+            if self.enable_main:
+                if self._slice_n[ck] % int(self.slice_every) == 0:
+                    dets += self._predict_batch(crops, offs)
+                    self._slice_cache[ck] = [d for d in dets if d not in coarses[i]]
+                else:
+                    dets += list(self._slice_cache.get(ck, []))
+            results.append(dets)
+
+        # ── 3. 香烟 batch（多路整图）──
+        if self.enable_extra:
+            extra_per_cam = self._predict_extra_batch(images, cache_keys)
+            for i in range(n):
+                results[i] += extra_per_cam[i]
+
+        # ── 4. 每路二级 NMS ──
+        return [nms(r, 0.25) for r in results]
+

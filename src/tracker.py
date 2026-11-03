@@ -40,7 +40,7 @@ MATCH_IOU = 0.15        # 关联门限；烟框逐帧抖动大，不能设高。
 # 用户的原话："不要因为中间断过几帧就更换ID"。
 # 2 秒（约 20 帧）能扛住短时遮挡和检测抖动，同时又不至于让已经离开的
 # 目标一直占着 ID。
-MAX_MISS_SEC = 1.5
+MAX_MISS_SEC = 1.0
                         # 目标移动但检测漏帧/匹配失败时，旧轨迹还能活多久。
                         # 原来 3.0 秒：配合 miss 预测，框会停住/漂移很久，
                         # 用户反馈"框停原地 + 飘"。现在 miss 不再预测（框诚实停住），
@@ -302,7 +302,7 @@ class IoUTracker:
             # 每帧能跳几十像素，容差太小就匹配失败 → 另起新轨迹 → 分裂
             # （用户反馈"香烟离开后分裂出一个新框"）。放宽到 1.3 倍对角线，
             # 让移动中的香烟更容易接回旧轨迹、不换 ID。
-            tol = max(32.0, (pw * pw + ph * ph) ** 0.5 * 1.3)
+            tol = max(40.0, (pw * pw + ph * ph) ** 0.5 * 2.5)
             if dist <= tol:
                 return 0.1 * (1.0 - dist / tol)      # 0~0.1，永远低于 IOU 阈值
             return 0.0
@@ -354,12 +354,11 @@ class IoUTracker:
         for tid in list(unmatched):
             t = self.tracks[tid]
             t.misses += 1
-            # ⚠️ miss 时**不做 Kalman 预测推进**，框停在最后检测位置。
-            # 之前试过 3 帧预测（用户说"框停原地"）、8 帧预测（用户说"框飘、
-            # 往不同运动方向跑"）—— 根因是香烟/火苗这类小目标速度抖动大，
-            # Kalman 估计出的 vx/vy 是噪声，预测只会让框往错误方向漂。
-            # 正确做法：框诚实停住，靠「大匹配容差」让新检测接上、靠
-            # 「缩短生命周期」让停住的框快速消失，而不是靠"猜"去跟。
+            # miss 前 5 帧用 Kalman 预测推进（跟上移动，避免中断/分裂），
+            # 之后停住避免长时间飘。速度噪声已回 5，5 帧预测不飘（静止目标
+            # vx 趋 0 框停住，移动目标 vx 推着框跟上）。
+            if t.kf is not None and t.misses <= 5:
+                t.last_box = t.kf.predict()
             if (ts - t.last_t) > self.max_miss_sec:
                 self.tracks.pop(tid, None)
 

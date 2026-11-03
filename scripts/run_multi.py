@@ -141,28 +141,34 @@ class Worker:
                     pass
             time.sleep(0.004)
 
-    def step(self):
-        """主循环调用：有新帧就检测一次，返回事件列表。"""
+    def read_frame(self):
+        """读一帧（不检测）。返回 pkt 或 None（无新帧/重复帧）。"""
         pkt = self.src.read()
         if pkt is None:
-            if self._dbg < 2:
-                self._dbg += 1
-                print(f"[{self.id}] step: pkt 为 None（采集还没出帧）", flush=True)
-            return []
+            return None
         if pkt.idx == self.last_idx:
-            if self._dbg < 4:
-                self._dbg += 1
-                print(f"[{self.id}] step: 重复帧 idx={pkt.idx}", flush=True)
-            return []
-        if self._dbg < 2:
-            self._dbg += 1
-            print(f"[{self.id}] step: 首次检测 idx={pkt.idx} "
-                  f"shape={None if pkt.image is None else pkt.image.shape}", flush=True)
+            return None
         self.last_idx = pkt.idx
+        return pkt
+
+    def step_with(self, pkt, dets):
+        """用外部 batch 检测的结果处理一帧，返回事件列表。"""
+        res = self.pipe.process(pkt, dets)
+        self.pipe._last_dets = res.dets
+        self.pipe._det_ts.append(time.time())
+        if len(self.pipe._det_ts) >= 4:
+            span = self.pipe._det_ts[-1] - self.pipe._det_ts[0]
+            if span > 0:
+                self.pipe.det_fps = (len(self.pipe._det_ts) - 1) / span
+        return res.events
+
+    def step(self):
+        """单路检测（保留兼容）：读帧 → 检测 → 处理。"""
+        pkt = self.read_frame()
+        if pkt is None:
+            return []
         res = self.pipe.process(pkt)
         self.pipe._last_dets = res.dets
-        # det_fps 原本只在 Pipeline.run() 的循环里更新，这里直接调 process
-        # 绕过了那段，指标会永远显示 0 —— 自己补一份滑动窗口
         self.pipe._det_ts.append(time.time())
         if len(self.pipe._det_ts) >= 4:
             span = self.pipe._det_ts[-1] - self.pipe._det_ts[0]
@@ -339,22 +345,30 @@ def main() -> int:
 
     stop = threading.Event()
     tick = 0
+    _tile_grid = getattr(workers[0].pipe, "tile_grid", 2) if workers else 2
+    _overlap = getattr(workers[0].pipe, "overlap", 0.25) if workers else 0.25
     try:
         while not stop.is_set():
-            did = False
-            for i, w in enumerate(workers):
-                # 每路按 every 抽帧，且各路**错开相位**（加索引偏移），
-                # 避免同一轮里所有路一起抢 GPU
-                if (tick + i) % every != 0:
-                    continue
+            # ── 多摄像头同时检测：同一时刻收集所有路的帧，batch 一次推理 ──
+            pkts = [w.read_frame() for w in workers]
+            valid = [(i, pkt) for i, pkt in enumerate(pkts) if pkt is not None]
+            if valid:
+                images = [pkt.image for _, pkt in valid]
+                cache_keys = [workers[i].id for i, _ in valid]
                 try:
-                    for ev in w.step():
-                        on_event(ev, w.id)
-                        did = True
+                    dets_list = detector.detect_auto_batch(
+                        images, cache_keys, tile_grid=_tile_grid, overlap=_overlap)
                 except Exception as exc:          # noqa: BLE001
-                    print(f"[{w.id}] 处理异常 {type(exc).__name__}: {exc}", flush=True)
+                    print(f"[batch] 检测异常 {type(exc).__name__}: {exc}", flush=True)
+                    dets_list = [[] for _ in valid]
+                for (i, pkt), dets in zip(valid, dets_list):
+                    try:
+                        for ev in workers[i].step_with(pkt, dets):
+                            on_event(ev, workers[i].id)
+                    except Exception as exc:      # noqa: BLE001
+                        print(f"[{workers[i].id}] 处理异常 {type(exc).__name__}: {exc}", flush=True)
             tick += 1
-            if not did:
+            if not valid:
                 time.sleep(0.002)
     except KeyboardInterrupt:
         print("\n手动停止")
