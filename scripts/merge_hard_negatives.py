@@ -59,29 +59,38 @@ def main() -> int:
 
     hn = Path(a.hn)
     img_dir, lbl_dir = hn / "images", hn / "labels"
-    labels = sorted(lbl_dir.glob("*.txt")) if lbl_dir.is_dir() else []
-    imgs = sorted(img_dir.glob("*.jpg")) if img_dir.is_dir() else []
-    stems_l = {p.stem for p in labels}
-    stems_i = {p.stem for p in imgs}
-    paired = sorted(stems_i & stems_l)
+    # ⚠️ 必须**递归**。src/notify.py 会把样本按类别写进 images/fire/、
+    # images/smoke/、images/cigarette/ 子目录（火的误报和烟的误报是两回事，
+    # 训练时得分开放）。这里原来用非递归 glob("*.jpg")，一改成子目录就
+    # 再也扫不到任何样本 —— 表现为"明明标了几百条，脚本却说还没有任何误报"，
+    # 硬负样本池因此形同虚设。
+    # 配对基准改成**相对路径**（fire/x.jpg ↔ fire/x.txt），不是 stem，
+    # 否则不同类别下的同名文件会互相串。
+    imgs = sorted(img_dir.rglob("*.jpg")) if img_dir.is_dir() else []
+    labels = sorted(lbl_dir.rglob("*.txt")) if lbl_dir.is_dir() else []
+    rel_i = {p.relative_to(img_dir).with_suffix(""): p for p in imgs}
+    rel_l = {p.relative_to(lbl_dir).with_suffix(""): p for p in labels}
+    paired = sorted(set(rel_i) & set(rel_l))
 
     print(f"硬负样本目录 {hn}")
     print(f"  图片 {len(imgs)}  标注 {len(labels)}  成对 {len(paired)}")
-    missing_lbl = sorted(stems_i - stems_l)
-    missing_img = sorted(stems_l - stems_i)
+    missing_lbl = sorted(set(rel_i) - set(rel_l))
+    missing_img = sorted(set(rel_l) - set(rel_i))
     if missing_lbl:
         print(f"  ⚠️ {len(missing_lbl)} 张图没有标注文件，会被当**有目标但没框**，跳过："
-              f"{missing_lbl[:3]}")
+              f"{[str(x) for x in missing_lbl[:3]]}")
     if missing_img:
-        print(f"  ⚠️ {len(missing_img)} 个标注没有对应图，跳过：{missing_img[:3]}")
+        print(f"  ⚠️ {len(missing_img)} 个标注没有对应图，跳过："
+              f"{[str(x) for x in missing_img[:3]]}")
 
     # 标了非空的要拦下来：硬负样本必须是空标注，否则它会自己制造误报
     nonempty = []
     for st in paired:
-        if (lbl_dir / f"{st}.txt").read_text(encoding="utf-8").strip():
+        if rel_l[st].read_text(encoding="utf-8").strip():
             nonempty.append(st)
     if nonempty:
-        print(f"  ❌ {len(nonempty)} 个标注不是空的，这些不是负样本：{nonempty[:5]}")
+        print(f"  ❌ {len(nonempty)} 个标注不是空的，这些不是负样本："
+              f"{[str(x) for x in nonempty[:5]]}")
         print("     （如果那一帧真的还有火/烟，它本来就不该标成误报）")
         return 2
 

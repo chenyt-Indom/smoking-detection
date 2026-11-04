@@ -310,9 +310,13 @@ def main() -> int:
                          1: float(thr.get("color_conf_smoke", 0.55)),
                          2: float(thr.get("color_conf_cig", 0.55))}
 
+    _al = cfg.get("active_learning") or {}
     nf = Notifier(out_dir=ROOT / "alerts",
                   host=a.host or ui_cfg.get("host", "127.0.0.1"),
                   port=int(a.port or ui_cfg.get("port", 5050)),
+                  auto_neg=bool(_al.get("auto_collect", True)),
+                  auto_neg_max=int(_al.get("max_total", 800)),
+                  auto_neg_per_hour=int(_al.get("max_per_hour", 120)),
                   lives=views)
     nf.detector = detector                  # 供 /api/models 切换模型开关
     url = nf.start()

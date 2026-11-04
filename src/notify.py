@@ -31,6 +31,7 @@ from urllib.parse import parse_qs, unquote, urlparse
 
 import cv2
 
+from .hard_neg import HardNegCollector
 from .paths import resource_root
 
 # 告警级别 → 前端配色语义（前端只认这四种）
@@ -45,6 +46,8 @@ class Notifier:
                  webhook_url: str = "", max_history: int = 300,
                  dashboard: str | os.PathLike | None = None,
                  report_dir: str | os.PathLike | None = None,
+                 auto_neg: bool = True, auto_neg_max: int = 800,
+                 auto_neg_per_hour: int = 120,
                  live=None, lives=None):
         self.out_dir = Path(out_dir)
         self.out_dir.mkdir(parents=True, exist_ok=True)
@@ -56,6 +59,13 @@ class Notifier:
         # 人工标注的误报落在这里，等 scripts/merge_hard_negatives.py 回流进训练集
         self.report_dir = Path(report_dir) if report_dir else (
             self.out_dir.parent / "hard_negatives")
+
+        # 主动学习：把 LLM 判"非风险"的 ROI 自动存成硬负样本。
+        # 以前只有人工在待办里点"误报"才采集 —— 结果 fire 误报 1469 次、
+        # 负样本池只有 7 张。详见 src/hard_neg.py 开头。
+        self.hard_neg = HardNegCollector(
+            self.report_dir, max_total=auto_neg_max,
+            max_per_hour=auto_neg_per_hour, enabled=auto_neg)
 
         # 实时画面：支持多路。key 是 cam_id，前端用 ?cam=xxx 指定。
         # 传单个 live 时自动归到 "default"，保持旧调用方式可用。
@@ -132,6 +142,16 @@ class Notifier:
                 p_full = self.out_dir / f"{base}_full.jpg"
                 self._write_snapshot(p_full, ev.snapshot_full)
                 full_url = f"/snapshots/{base}_full.jpg" if p_full.is_file() else None
+
+            # 主动学习：`cleared` = 已判"非风险"，这一帧就是可信的负样本。
+            # submit 只入队，不做 IO —— push() 是跑在检测主循环里的。
+            # ⚠️ 只收 cleared。notice/warning 是"还没定论"，把真火当负样本
+            #    会把模型教坏，比漏采严重得多。
+            if has_roi and rec["level"] == "cleared":
+                self.hard_neg.submit(
+                    ev.snapshot, getattr(ev, "kind", ""), getattr(ev, "cam_id", ""),
+                    float(rec.get("score") or 0.0),
+                    " | ".join(str(x) for x in (rec.get("reasons") or [])))
         rec["snapshot"] = snap_url
         rec["snapshot_full"] = full_url
         if extra:
