@@ -1,0 +1,583 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>香烟标注复标工具</title>
+<style>
+  :root{
+    --bg:#14161a; --panel:#1b1e24; --line:#2b3038; --txt:#e6e9ef;
+    --dim:#8b93a1; --acc:#4ea1ff; --ok:#37c98b; --warn:#f0a13a; --bad:#ef5b5b;
+  }
+  *{box-sizing:border-box}
+  html,body{margin:0;height:100%;background:var(--bg);color:var(--txt);
+    font:13px/1.5 -apple-system,"Segoe UI","Microsoft YaHei",sans-serif;overflow:hidden}
+  #wrap{display:flex;height:100%}
+  #main{flex:1;position:relative;display:flex;align-items:center;justify-content:center;
+    background:#0d0f12;min-width:0}
+  #cv{display:block;cursor:crosshair}
+  #loupe{position:absolute;right:12px;bottom:12px;width:170px;height:170px;
+    border:1px solid var(--line);border-radius:8px;background:#000;display:none}
+  #side{width:330px;flex:0 0 330px;border-left:1px solid var(--line);
+    background:var(--panel);display:flex;flex-direction:column;overflow:hidden}
+  .pad{padding:11px 12px}
+  h1{font-size:14px;margin:0 0 4px;font-weight:600}
+  .sub{color:var(--dim);font-size:12px}
+  .row{display:flex;gap:8px;margin:7px 0}
+  button{flex:1;padding:7px 9px;border-radius:7px;border:1px solid var(--line);
+    background:#232830;color:var(--txt);cursor:pointer;font-size:12.5px}
+  button:hover{background:#2b313b}
+  button.primary{background:var(--acc);border-color:var(--acc);color:#06121f;font-weight:600}
+  button.good{background:#1e3a2e;border-color:#2c5a45;color:#8ce6b8}
+  button.bad{background:#3a2222;border-color:#5a2c2c;color:#f0a0a0}
+  button.arm{background:#3a3320;border-color:#6a5a2a;color:#f3d089}
+  select{width:100%;background:#232830;color:var(--txt);
+    border:1px solid var(--line);border-radius:6px;padding:6px}
+  .kv{display:flex;justify-content:space-between;padding:3px 0;
+    border-bottom:1px dashed #262b33;font-variant-numeric:tabular-nums}
+  .kv span:first-child{color:var(--dim)}
+  .tag{display:inline-block;padding:1px 7px;border-radius:99px;font-size:11px;
+    background:#26303c;color:#9fc4ea}
+  .tag.ok{background:#1e3a2e;color:#8ce6b8}
+  .tag.edit{background:#3a3320;color:#f3d089}
+  .hint{color:var(--dim);font-size:11.5px;line-height:1.75}
+  kbd{background:#262b33;border:1px solid #333a45;border-radius:4px;
+    padding:0 4px;font-size:11px}
+  #list{flex:1;overflow:auto;border-top:1px solid var(--line)}
+  .item{padding:6px 12px;border-bottom:1px solid #22262d;cursor:pointer;
+    display:flex;justify-content:space-between;gap:8px;font-size:12px}
+  .item:hover{background:#222831}
+  .item.cur{background:#1f3550;border-left:3px solid var(--acc);padding-left:9px}
+  .item .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  #toast{position:absolute;left:50%;top:14px;transform:translateX(-50%);
+    background:#1f2937;border:1px solid var(--line);padding:7px 14px;border-radius:8px;
+    opacity:0;transition:opacity .2s;pointer-events:none;font-size:12.5px}
+  #toast.show{opacity:1}
+  #fatal{position:fixed;inset:0;background:#0d0f12ee;display:none;
+    align-items:center;justify-content:center;z-index:99;padding:24px}
+  #fatal .box{max-width:640px;background:var(--panel);border:1px solid #5a2c2c;
+    border-radius:12px;padding:22px 24px;line-height:1.8}
+  #fatal h2{margin:0 0 10px;font-size:16px;color:#f0a0a0}
+  #fatal code{background:#0d0f12;padding:2px 6px;border-radius:4px;color:#8ce6b8}
+  .badge{padding:1px 7px;border-radius:99px;font-size:10.5px;margin-left:6px}
+  .badge.ex{background:#3a2222;color:#f0a0a0}
+  .badge.bw{background:#2a2a3a;color:#b0b0f0}
+  .badge.multi{background:#22343a;color:#8fd4e0}
+</style>
+</head>
+<body>
+<div id="wrap">
+  <div id="main">
+    <canvas id="cv"></canvas>
+    <canvas id="loupe"></canvas>
+    <div id="toast"></div>
+    <div id="fatal"><div class="box">
+      <h2>连不上后台接口</h2>
+      <div id="fatal-msg"></div>
+      <p>这个工具需要本地服务在跑：</p>
+      <p>1. 确认命令行里 <code>python scripts/annotate_cig.py</code> 还在运行<br>
+         2. 用<b>普通浏览器</b>打开 <code>http://127.0.0.1:5077/</code><br>
+         （IDE 预览面板里的是静态副本，没有后台接口，必然空白）</p>
+    </div></div>
+  </div>
+
+  <div id="side">
+    <div class="pad" style="border-bottom:1px solid var(--line)">
+      <h1>香烟标注复标</h1>
+      <div class="sub" id="pos">加载中…</div>
+      <div class="row" style="margin-top:9px">
+        <select id="split">
+          <option value="train">训练集 train</option>
+          <option value="val">验证集 val</option>
+        </select>
+        <select id="only">
+          <option value="all">全部</option>
+          <option value="unreviewed">未复核</option>
+          <option value="edited">已修改</option>
+          <option value="excluded">已排除</option>
+          <option value="bw">有黑白扫描结果</option>
+        </select>
+      </div>
+    </div>
+
+    <div class="pad" style="border-bottom:1px solid var(--line)">
+      <div class="kv"><span>本图框数</span><span id="v-n">–</span></div>
+      <div class="kv"><span>选中</span><span id="v-sel">–</span></div>
+      <div class="kv"><span>中心 (px)</span><span id="v-c">–</span></div>
+      <div class="kv"><span>宽 × 高 (px)</span><span id="v-wh">–</span></div>
+      <div class="kv"><span>角度</span><span id="v-a">–</span></div>
+      <div class="kv"><span>长宽比</span><span id="v-r">–</span></div>
+      <div class="kv"><span>状态</span><span id="v-st">–</span></div>
+
+      <div class="row">
+        <button id="btn-new" class="arm">+ 新增框 (N)</button>
+        <button id="btn-del" class="bad">删除选中框</button>
+      </div>
+      <div class="row">
+        <button id="btn-ok" class="good">原样正确</button>
+        <button id="btn-empty" class="bad">没有香烟</button>
+      </div>
+      <div class="row">
+        <button id="btn-reset">还原原始</button>
+        <button id="btn-save" class="primary">保存并下一张</button>
+      </div>
+      <div class="row">
+        <button id="btn-aspect">校正为细长(4:1)</button>
+      </div>
+      <div class="row">
+        <button id="btn-exclude" class="bad">排除（不加入训练）</button>
+      </div>
+      <div class="row">
+        <button id="btn-bwscan">扫描黑白图</button>
+        <button id="btn-bwapply">排除全部黑白</button>
+      </div>
+      <div class="row">
+        <button id="btn-export">导出训练清单</button>
+      </div>
+      <div class="sub" id="bw-note" style="margin-top:5px"></div>
+    </div>
+
+    <div class="pad" style="border-bottom:1px solid var(--line)">
+      <div class="hint">
+        <b>加框</b>　在图上<b>空白处按住拖一下</b>就生成新框（也可按 <kbd>N</kbd>）<br>
+        <b>选中</b>　点框内任意位置　<kbd>Tab</kbd> 切换　<kbd>Del</kbd> 删除<br>
+        <b>调整</b>　拖框内=移动　拖角点=缩放　拖顶部橙点=旋转（<kbd>Shift</kbd> 不吸附）<br>
+        <kbd>D</kbd> 正确　<kbd>X</kbd> 无香烟　<kbd>R</kbd> 还原　<kbd>Enter</kbd> 保存<br>
+        <kbd>W</kbd>/<kbd>S</kbd> 角度 ±1°　<kbd>←</kbd><kbd>→</kbd> 上/下一张
+      </div>
+    </div>
+
+    <div id="list"></div>
+  </div>
+</div>
+
+<script>
+const cv=document.getElementById('cv'), ctx=cv.getContext('2d');
+const loupe=document.getElementById('loupe'), lctx=loupe.getContext('2d');
+
+let S={
+  split:'train', only:'all', items:[], idx:0,
+  img:null, iw:0, ih:0,
+  boxes:[], sel:-1, orig:[],
+  scale:1, ox:0, oy:0, dirty:false, loaded:false,
+  drag:null, mouse:null, reviewed:0, total:0
+};
+
+/* ---------------- API（接口失败要明确报错，别白屏） ---------------- */
+function showFatal(msg){
+  document.getElementById('fatal-msg').textContent=msg;
+  document.getElementById('fatal').style.display='flex';
+}
+async function api(path,opts){
+  let r;
+  try{ r=await fetch(path,opts); }
+  catch(e){ showFatal('请求 '+path+' 失败：'+e.message); throw e; }
+  if(!r.ok){
+    showFatal(r.status===404
+      ? '后台没有这个接口（'+path+'）—— 你打开的可能是静态副本，请用浏览器打开 http://127.0.0.1:5077/'
+      : '后台返回 HTTP '+r.status+'（'+path+'）');
+    throw new Error('HTTP '+r.status);
+  }
+  return r.json();
+}
+
+/* ---------------- 几何 ---------------- */
+function corners(b){
+  const c=Math.cos(b.ang), s=Math.sin(b.ang), hw=b.w/2, hh=b.h/2;
+  return [[-hw,-hh],[hw,-hh],[hw,hh],[-hw,hh]]
+    .map(([x,y])=>[b.cx+x*c-y*s, b.cy+x*s+y*c]);
+}
+function toLocal(b,px,py){
+  const dx=px-b.cx, dy=py-b.cy, c=Math.cos(-b.ang), s=Math.sin(-b.ang);
+  return [dx*c-dy*s, dx*s+dy*c];
+}
+const X=x=>S.ox+x*S.scale, Y=y=>S.oy+y*S.scale;
+const IX=x=>(x-S.ox)/S.scale, IY=y=>(y-S.oy)/S.scale;
+
+/* ---------------- 绘制 ---------------- */
+function resize(){
+  const r=cv.parentElement.getBoundingClientRect();
+  cv.width=Math.floor(r.width); cv.height=Math.floor(r.height);
+  cv.style.width=r.width+'px'; cv.style.height=r.height+'px';
+  layout(); draw();
+}
+function layout(){
+  if(!S.img) return;
+  S.scale=Math.min(cv.width/S.iw, cv.height/S.ih);
+  S.ox=(cv.width-S.iw*S.scale)/2; S.oy=(cv.height-S.ih*S.scale)/2;
+}
+function draw(){
+  ctx.setTransform(1,0,0,1,0,0);
+  ctx.clearRect(0,0,cv.width,cv.height);
+  if(!S.img) return;
+  ctx.drawImage(S.img,S.ox,S.oy,S.iw*S.scale,S.ih*S.scale);
+  S.boxes.forEach((b,i)=>{
+    const cs=corners(b).map(([x,y])=>[X(x),Y(y)]);
+    const on=(i===S.sel);
+    ctx.beginPath();
+    ctx.moveTo(cs[0][0],cs[0][1]);
+    for(let k=1;k<4;k++) ctx.lineTo(cs[k][0],cs[k][1]);
+    ctx.closePath();
+    ctx.fillStyle=on?'rgba(78,161,255,.16)':'rgba(78,161,255,.05)';
+    ctx.fill();
+    ctx.lineWidth=on?2:1.2;
+    ctx.strokeStyle=on?(S.dirty?'#f0a13a':'#4ea1ff'):'rgba(78,161,255,.55)';
+    ctx.stroke();
+    if(!on){
+      const cen=[X(b.cx),Y(b.cy)];
+      ctx.font='11px sans-serif'; ctx.fillStyle='rgba(160,200,255,.9)';
+      ctx.fillText(String(i+1), cen[0]-3, cen[1]+4);
+      return;
+    }
+    const mid=[(cs[0][0]+cs[1][0])/2,(cs[0][1]+cs[1][1])/2];
+    const cen=[X(b.cx),Y(b.cy)];
+    let vx=mid[0]-cen[0], vy=mid[1]-cen[1]; const L=Math.hypot(vx,vy)||1;
+    const rot=[mid[0]+vx/L*34, mid[1]+vy/L*34];
+    ctx.beginPath(); ctx.moveTo(mid[0],mid[1]); ctx.lineTo(rot[0],rot[1]);
+    ctx.strokeStyle='#5a6472'; ctx.lineWidth=1; ctx.stroke();
+    ctx.beginPath(); ctx.arc(rot[0],rot[1],7,0,Math.PI*2);
+    ctx.fillStyle='#f0a13a'; ctx.fill();
+    for(const p of cs){
+      ctx.beginPath(); ctx.arc(p[0],p[1],6,0,Math.PI*2);
+      ctx.fillStyle='#4ea1ff'; ctx.fill();
+      ctx.strokeStyle='#0d0f12'; ctx.lineWidth=2; ctx.stroke();
+    }
+    ctx.beginPath(); ctx.arc(cen[0],cen[1],3,0,Math.PI*2);
+    ctx.fillStyle='#fff'; ctx.fill();
+  });
+  drawLoupe();
+}
+function drawLoupe(){
+  if(!S.mouse||!S.img){ loupe.style.display='none'; return; }
+  const [mx,my]=S.mouse, ix=IX(mx), iy=IY(my), R=26;
+  loupe.style.display='block';
+  lctx.clearRect(0,0,loupe.width,loupe.height);
+  lctx.drawImage(S.img, ix-R, iy-R, R*2, R*2, 0,0, loupe.width, loupe.height);
+  if(S.sel>=0 && S.boxes[S.sel]){
+    lctx.save();
+    lctx.scale(loupe.width/(R*2), loupe.height/(R*2));
+    lctx.translate(-(ix-R), -(iy-R));
+    const cs=corners(S.boxes[S.sel]);
+    lctx.beginPath(); lctx.moveTo(cs[0][0],cs[0][1]);
+    for(let k=1;k<4;k++) lctx.lineTo(cs[k][0],cs[k][1]);
+    lctx.closePath(); lctx.lineWidth=1.4; lctx.strokeStyle='#4ea1ff'; lctx.stroke();
+    lctx.restore();
+  }
+  lctx.strokeStyle='rgba(255,255,255,.5)'; lctx.lineWidth=1;
+  lctx.beginPath();
+  lctx.moveTo(loupe.width/2-8,loupe.height/2); lctx.lineTo(loupe.width/2+8,loupe.height/2);
+  lctx.moveTo(loupe.width/2,loupe.height/2-8); lctx.lineTo(loupe.width/2,loupe.height/2+8);
+  lctx.stroke();
+}
+
+/* ---------------- 面板 ---------------- */
+function refreshInfo(){
+  const b = S.sel>=0 ? S.boxes[S.sel] : null;
+  document.getElementById('v-n').textContent = S.loaded ? S.boxes.length : '–';
+  document.getElementById('v-sel').textContent = b ? `第 ${S.sel+1} / ${S.boxes.length} 个` : '未选中';
+  document.getElementById('v-c').textContent = b ? `${b.cx.toFixed(0)}, ${b.cy.toFixed(0)}` : '–';
+  document.getElementById('v-wh').textContent = b ? `${b.w.toFixed(0)} × ${b.h.toFixed(0)}` : '–';
+  document.getElementById('v-a').textContent = b ? `${(b.ang*180/Math.PI).toFixed(1)}°` : '–';
+  document.getElementById('v-r').textContent = b ? (Math.max(b.w,b.h)/Math.max(1,Math.min(b.w,b.h))).toFixed(2) : '–';
+  const st=document.getElementById('v-st');
+  if(!S.loaded){ st.innerHTML='–'; }
+  else if(!S.boxes.length){ st.innerHTML='<span class="tag bad">无框（空白处拖拽可新增）</span>'; }
+  else if(S.dirty){ st.innerHTML='<span class="tag edit">已修改·未保存</span>'; }
+  else if(S.items[S.idx]&&S.items[S.idx].edited){ st.innerHTML='<span class="tag ok">已复标</span>'; }
+  else { st.innerHTML='<span class="tag">原始标注</span>'; }
+}
+
+/* ---------------- 交互 ---------------- */
+function selectAt(mx,my){
+  for(let i=S.boxes.length-1;i>=0;i--){
+    const b=S.boxes[i], [lx,ly]=toLocal(b, IX(mx), IY(my));
+    if(Math.abs(lx)<=b.w/2 && Math.abs(ly)<=b.h/2) return i;
+  }
+  return -1;
+}
+function hitHandles(mx,my){
+  if(S.sel<0) return null;
+  const b=S.boxes[S.sel];
+  const cs=corners(b).map(([x,y])=>[X(x),Y(y)]);
+  const cen=[X(b.cx),Y(b.cy)];
+  const mid=[(cs[0][0]+cs[1][0])/2,(cs[0][1]+cs[1][1])/2];
+  let vx=mid[0]-cen[0], vy=mid[1]-cen[1]; const L=Math.hypot(vx,vy)||1;
+  const rot=[mid[0]+vx/L*34, mid[1]+vy/L*34];
+  if(Math.hypot(mx-rot[0],my-rot[1])<12) return {mode:'rotate'};
+  for(let i=0;i<4;i++) if(Math.hypot(mx-cs[i][0],my-cs[i][1])<12)
+    return {mode:'resize', corner:i};
+  return null;
+}
+cv.addEventListener('mousedown', e=>{
+  const rect=cv.getBoundingClientRect();
+  const mx=e.clientX-rect.left, my=e.clientY-rect.top;
+  const h=hitHandles(mx,my);
+  if(h){
+    const b=S.boxes[S.sel];
+    S.drag={...h, mx, my, box:{...b}, ang0:b.ang,
+            a0:Math.atan2(IY(my)-b.cy, IX(mx)-b.cx)};
+    if(h.mode==='resize') S.drag.opp=corners(b)[(h.corner+2)%4];
+    e.preventDefault(); return;
+  }
+  const i=selectAt(mx,my);
+  if(i>=0){
+    S.sel=i;
+    S.drag={mode:'move', mx, my, box:{...S.boxes[i]}};
+    draw(); refreshInfo(); e.preventDefault(); return;
+  }
+  // 空白处：直接拖出新框
+  S.boxes.push({cx:IX(mx), cy:IY(my), w:8, h:8, ang:0});
+  S.sel=S.boxes.length-1;
+  S.drag={mode:'create', mx, my};
+  S.dirty=true; draw(); refreshInfo(); e.preventDefault();
+});
+window.addEventListener('mousemove', e=>{
+  const rect=cv.getBoundingClientRect();
+  const mx=e.clientX-rect.left, my=e.clientY-rect.top;
+  S.mouse=[mx,my];
+  if(!S.drag){
+    cv.style.cursor = hitHandles(mx,my) ? 'pointer'
+                   : (selectAt(mx,my)>=0 ? 'move' : 'crosshair');
+    draw(); return;
+  }
+  const d=S.drag, b=S.boxes[S.sel]; if(!b) return;
+  if(d.mode==='create'){
+    const x0=IX(d.mx), y0=IY(d.my), x1=IX(mx), y1=IY(my);
+    b.cx=(x0+x1)/2; b.cy=(y0+y1)/2;
+    b.w=Math.max(6,Math.abs(x1-x0)); b.h=Math.max(6,Math.abs(y1-y0)); b.ang=0;
+  } else if(d.mode==='move'){
+    b.cx=d.box.cx+(mx-d.mx)/S.scale;
+    b.cy=d.box.cy+(my-d.my)/S.scale;
+  } else if(d.mode==='rotate'){
+    const a=Math.atan2(IY(my)-d.box.cy, IX(mx)-d.box.cx);
+    let na=d.ang0+(a-d.a0);
+    if(!e.shiftKey){ const step=Math.PI/12; na=Math.round(na/step)*step; }
+    b.ang=na;
+  } else if(d.mode==='resize'){
+    const opp=d.opp, c=Math.cos(-d.box.ang), s=Math.sin(-d.box.ang);
+    const dx=IX(mx)-opp[0], dy=IY(my)-opp[1];
+    const lx=dx*c-dy*s, ly=dx*s+dy*c;
+    b.w=Math.max(6,Math.abs(lx)); b.h=Math.max(6,Math.abs(ly));
+    const cc=Math.cos(d.box.ang), ss=Math.sin(d.box.ang);
+    b.cx=opp[0]+(lx/2)*cc-(ly/2)*ss;
+    b.cy=opp[1]+(lx/2)*ss+(ly/2)*cc;
+  }
+  S.dirty=true; draw(); refreshInfo();
+});
+window.addEventListener('mouseup', ()=>{
+  if(S.drag && S.drag.mode==='create'){
+    const b=S.boxes[S.sel];
+    if(b && (b.w<8||b.h<8)){ S.boxes.splice(S.sel,1); S.sel=-1; }
+  }
+  S.drag=null;
+});
+cv.addEventListener('mouseleave', ()=>{ S.mouse=null; draw(); });
+window.addEventListener('resize', resize);
+
+/* ---------------- 数据 ---------------- */
+function toast(msg,good){
+  const t=document.getElementById('toast');
+  t.textContent=msg; t.style.color=good===false?'#f0a0a0':'#e6e9ef';
+  t.classList.add('show');
+  clearTimeout(t._h); t._h=setTimeout(()=>t.classList.remove('show'),1500);
+}
+function normBoxes(){
+  return S.boxes.map(b=>[b.cx/S.iw, b.cy/S.ih, b.w/S.iw, b.h/S.ih]);
+}
+function obbBoxes(){
+  return S.boxes.map(b=>corners(b).map(([x,y])=>[x/S.iw, y/S.ih]).flat());
+}
+async function save(action){
+  if(!S.items.length) return false;
+  const it=S.items[S.idx];
+  const body={split:S.split,name:it.name,action};
+  if(action!=='empty' && S.boxes.length){
+    body.boxes=normBoxes(); body.obbs=obbBoxes();
+  }
+  try{
+    const j=await api('/api/save',{method:'POST',
+      headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
+    if(!j.ok) throw new Error(j.err||'保存失败');
+    it.edited=true;
+    it.boxes = action==='empty'?[]:normBoxes();
+    it.angs  = action==='empty'?[]:S.boxes.map(b=>b.ang);
+    S.dirty=false;
+    if(j.stats) updateStats(j.stats);
+    toast(action==='empty'?'已标记：这张没有香烟'
+          :`已保存（${it.boxes.length} 个框）`);
+    return true;
+  }catch(err){ toast('保存失败：'+err.message,false); return false; }
+}
+function updateStats(st){
+  const s=st[S.split]; S.reviewed=s.reviewed; S.total=s.total;
+  document.getElementById('pos').textContent=
+    `第 ${S.idx+1} / ${S.items.length} 张　·　已复标 ${s.reviewed}/${s.total}　·　排除 ${s.excluded}`;
+  document.querySelectorAll('.item').forEach((el,i)=>el.classList.toggle('cur',i===S.idx));
+  const cur=document.querySelectorAll('.item')[S.idx];
+  if(cur) cur.scrollIntoView({block:'nearest'});
+}
+async function loadList(){
+  S.split=document.getElementById('split').value;
+  S.only=document.getElementById('only').value;
+  S.items=await api(`/api/list?split=${S.split}&only=${S.only}`);
+  buildSideList(); S.idx=0; await go(0);
+}
+function itemHTML(it){
+  const flags=(it.excluded?'<span class="badge ex">排除</span>':'')
+    +(it.bw!=null&&it.bw<6?'<span class="badge bw">黑白</span>':'')
+    +(it.boxes&&it.boxes.length>1?`<span class="badge multi">${it.boxes.length}框</span>`:'');
+  return `<span class="nm">${it.name}${flags}</span><span class="st">${it.edited?'✓':''}</span>`;
+}
+function buildSideList(){
+  const box=document.getElementById('list'); box.innerHTML='';
+  const frag=document.createDocumentFragment();
+  S.items.forEach((it,i)=>{
+    const d=document.createElement('div');
+    d.className='item'; d.innerHTML=itemHTML(it);
+    d.onclick=()=>go(i);
+    frag.appendChild(d);
+  });
+  box.appendChild(frag);
+}
+function applyOriginal(){
+  const it=S.items[S.idx];
+  const src=(it&&it.boxes)||[];
+  const angs=(it&&it.angs)||[];
+  S.orig=src.map((v,i)=>({cx:v[0]*S.iw, cy:v[1]*S.ih, w:v[2]*S.iw, h:v[3]*S.ih,
+                          ang:angs[i]||0}));
+  S.boxes=S.orig.map(b=>({...b}));
+  S.sel=S.boxes.length?0:-1;
+}
+async function go(i){
+  if(i<0||i>=S.items.length) return;
+  S.idx=i; S.dirty=false; S.loaded=false;
+  const it=S.items[i];
+  const img=new Image();
+  img.onload=()=>{
+    S.img=img; S.iw=img.naturalWidth; S.ih=img.naturalHeight;
+    layout(); applyOriginal(); S.loaded=true; draw(); refreshInfo();
+    api('/api/stats').then(updateStats).catch(()=>{});
+  };
+  img.onerror=()=>toast('图片加载失败：'+it.name,false);
+  img.src=`/img?split=${S.split}&name=${encodeURIComponent(it.name)}`;
+}
+async function next(){ if(S.idx<S.items.length-1) await go(S.idx+1); }
+
+/* ---------------- 按钮 ---------------- */
+document.getElementById('btn-new').onclick=()=>{
+  toast('在图上空白处按住拖一下，就能画新框');
+};
+document.getElementById('btn-del').onclick=()=>{
+  if(S.sel<0){ toast('先点一下要删的框',false); return; }
+  S.boxes.splice(S.sel,1);
+  S.sel=S.boxes.length?Math.min(S.sel,S.boxes.length-1):-1;
+  S.dirty=true; draw(); refreshInfo();
+};
+document.getElementById('btn-ok').onclick=async()=>{ await save('ok'); await next(); };
+document.getElementById('btn-empty').onclick=async()=>{
+  if(!confirm('把这张标记为「没有香烟」？会写入空标注。')) return;
+  await save('empty'); await next();
+};
+document.getElementById('btn-reset').onclick=()=>{
+  S.boxes=S.orig.map(b=>({...b}));
+  S.sel=S.boxes.length?0:-1; S.dirty=false; draw(); refreshInfo();
+};
+document.getElementById('btn-save').onclick=async()=>{
+  if(!S.boxes.length){ toast('还没有框：空白处拖一下，或点「没有香烟」',false); return; }
+  if(await save('ok')) await next();
+};
+document.getElementById('btn-aspect').onclick=()=>{
+  const b = S.sel>=0 ? S.boxes[S.sel] : null;
+  if(!b){ toast('先选中一个框',false); return; }
+  const long=Math.max(b.w,b.h), short=Math.max(6,long/4);
+  if(b.w>=b.h){ b.w=long; b.h=short; } else { b.w=short; b.h=long; }
+  S.dirty=true; draw(); refreshInfo(); toast('已校正为 4:1（长边不变）');
+};
+document.getElementById('btn-exclude').onclick=async()=>{
+  const it=S.items[S.idx]; if(!it) return;
+  const want=!it.excluded;
+  try{
+    const j=await api('/api/exclude',{method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({split:S.split,name:it.name,excluded:want})});
+    it.excluded=want;
+    if(j.stats) updateStats(j.stats);
+    const el=document.querySelectorAll('.item')[S.idx];
+    if(el) el.innerHTML=itemHTML(it);
+    toast(want?'已排除，不加入训练清单':'已恢复，会加入训练清单');
+    if(want) await next();
+  }catch(err){ toast('操作失败：'+err.message,false); }
+};
+document.getElementById('btn-bwscan').onclick=async()=>{
+  const note=document.getElementById('bw-note');
+  try{
+    await api('/api/bw_scan',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({split:S.split})});
+    note.textContent='扫描中…';
+    const tick=setInterval(async()=>{
+      try{
+        const st=await api('/api/bw_status');
+        if(st.running) note.textContent=`扫描中 ${st.done}/${st.total}`;
+        else{
+          clearInterval(tick); await loadList();
+          const bw=S.items.filter(i=>i.bw!=null&&i.bw<6).length;
+          note.textContent=`扫描完成：${S.split} 共 ${S.items.length} 张，判定黑白 ${bw} 张`;
+        }
+      }catch(e){ clearInterval(tick); }
+    },700);
+  }catch(err){ note.textContent='扫描失败：'+err.message; }
+};
+document.getElementById('btn-bwapply').onclick=async()=>{
+  const note=document.getElementById('bw-note');
+  const names=S.items.filter(i=>i.bw!=null&&i.bw<6&&!i.excluded).map(i=>i.name);
+  if(!names.length){ note.textContent='没有待排除的黑白图（先扫描）'; return; }
+  if(!confirm(`把 ${names.length} 张黑白图排除出训练清单？（不删原图）`)) return;
+  try{
+    const j=await api('/api/exclude',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({split:S.split,names,excluded:true})});
+    if(j.stats) updateStats(j.stats);
+    await loadList();
+    note.textContent=`已排除 ${names.length} 张黑白图`;
+  }catch(err){ note.textContent='排除失败：'+err.message; }
+};
+document.getElementById('btn-export').onclick=async()=>{
+  const note=document.getElementById('bw-note');
+  try{
+    const j=await api('/api/export',{method:'POST',headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({split:S.split})});
+    note.textContent=`已导出 ${j.count} 张 → ${j.file}（剔除 ${j.excluded} 张）`;
+  }catch(err){ note.textContent='导出失败：'+err.message; }
+};
+document.getElementById('split').onchange=loadList;
+document.getElementById('only').onchange=loadList;
+
+/* ---------------- 键盘 ---------------- */
+window.addEventListener('keydown',async e=>{
+  if(e.target.tagName==='INPUT'||e.target.tagName==='SELECT') return;
+  const k=e.key.toLowerCase();
+  if(k==='arrowright'){ e.preventDefault(); if(S.dirty) await save('ok'); await next(); }
+  else if(k==='arrowleft'){ e.preventDefault(); if(S.idx>0) await go(S.idx-1); }
+  else if(k==='enter'){ e.preventDefault(); document.getElementById('btn-save').click(); }
+  else if(k==='d'){ e.preventDefault(); document.getElementById('btn-ok').click(); }
+  else if(k==='x'){ e.preventDefault(); document.getElementById('btn-empty').click(); }
+  else if(k==='r'){ e.preventDefault(); document.getElementById('btn-reset').click(); }
+  else if(k==='n'){ e.preventDefault(); document.getElementById('btn-new').click(); }
+  else if(k==='tab'){
+    e.preventDefault();
+    if(S.boxes.length){ S.sel=(S.sel+1)%S.boxes.length; draw(); refreshInfo(); }
+  }
+  else if(k==='delete'||k==='backspace'){
+    e.preventDefault(); document.getElementById('btn-del').click();
+  }
+  else if((k==='w'||k==='s') && S.sel>=0){
+    e.preventDefault();
+    S.boxes[S.sel].ang += (k==='w'?1:-1)*Math.PI/180;
+    S.dirty=true; draw(); refreshInfo();
+  }
+});
+
+/* ---------------- 启动 ---------------- */
+resize();
+api('/api/stats').then(()=>loadList()).catch(()=>{});
+</script>
+</body>
+</html>
