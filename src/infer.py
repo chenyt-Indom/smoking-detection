@@ -132,7 +132,31 @@ class Detector:
     ) -> None:
         from ultralytics import YOLO  # 延迟导入：只做标注审计时不必装 ultralytics
 
-        self.model = YOLO(weights)
+        def _prefer_engine(path, sz):
+            """同目录有同名 .engine（TensorRT）就用它 —— 实测快 3 倍左右。
+
+            engine 是导出时的**固定 imgsz + 固定 batch=1**（本项目按 960 导），
+            所以只有 imgsz==960 时才用；配置改成别的尺寸会自动回退到 .pt。
+            ⚠️ TensorRT 11 + ultralytics 的动态 batch 会 CUDA illegal access
+            崩溃（实测两次），所以引擎只能固定 batch=1 —— 多图/切片这些
+            原本靠 batch 提速的地方必须在调用侧逐张循环（见 _bp）。
+            另外 engine 绑定当前 GPU + TensorRT 版本，换机器要重新导出。
+            返回 (路径, 是否engine)。
+            """
+            if not path:
+                return path, False
+            try:
+                from pathlib import Path
+                eng = Path(str(path)).with_suffix(".engine")
+                if eng.is_file() and int(sz) == 960:
+                    print(f"  [TRT] 使用 TensorRT engine：{eng.name}", flush=True)
+                    return str(eng), True
+            except Exception:                # noqa: BLE001
+                pass
+            return str(path), False
+
+        _mw, self.is_engine = _prefer_engine(weights, imgsz)
+        self.model = YOLO(_mw)
         self.names = self.model.names
         self.conf = conf
         self.iou = iou
@@ -142,7 +166,12 @@ class Detector:
         # 第二个模型（香烟）：与主模型分开推理，结果在 detect 里合并。
         # 香烟本体和明火是两套完全不同的训练数据，硬合成一个模型
         # 会互相干扰、两边精度都掉。
-        self.extra = YOLO(extra_weights) if extra_weights else None
+        if extra_weights:
+            _ew, self.extra_is_engine = _prefer_engine(extra_weights, imgsz)
+            self.extra = YOLO(_ew)
+        else:
+            self.extra = None
+            self.extra_is_engine = False
         self.extra_names = self.extra.names if self.extra else {}
         self.extra_conf = float(extra_conf if extra_conf is not None else conf)
         # 香烟模型降频：它要跑 5 次前向（整图 + 2x2 切片），逐帧跑会把
@@ -285,12 +314,14 @@ class Detector:
                 need_idx.append(i)
         if need_idx:
             imgs = [images[i] for i in need_idx]
-            rs = self.extra.predict(imgs, imgsz=self.imgsz, conf=self.extra_conf,
-                                    iou=self.iou, device=self.device, verbose=False)
+            rs = self._bp(self.extra, self.extra_is_engine, imgs,
+                          imgsz=self.imgsz, conf=self.extra_conf,
+                          iou=self.iou, device=self.device, verbose=False)
             # 旋转 90° 再检一次（补横向香烟）：模型对横向香烟召回低，旋转后横向变纵向。
             rot_imgs = [cv2.rotate(im, cv2.ROTATE_90_CLOCKWISE) for im in imgs]
-            rs_rot = self.extra.predict(rot_imgs, imgsz=self.imgsz, conf=self.extra_conf,
-                                        iou=self.iou, device=self.device, verbose=False)
+            rs_rot = self._bp(self.extra, self.extra_is_engine, rot_imgs,
+                              imgsz=self.imgsz, conf=self.extra_conf,
+                              iou=self.iou, device=self.device, verbose=False)
             for j, i in enumerate(need_idx):
                 out = []
                 for b in rs[j].boxes:
@@ -311,6 +342,29 @@ class Detector:
                 results[i] = out
         return results
 
+    def _bp(self, model, is_engine: bool, imgs: list, **kw):
+        """批量前向的统一入口：引擎只能 batch=1，其它情况照常合批。
+
+        为什么必须集中到一处：原本代码里有 4 个地方直接调 model.predict(list)，
+        分别喂 2 张（两路整图）、9 张（一路的切片）、2 张（两路香烟）。
+        TensorRT 引擎是固定 batch=1 的，用 batch=2 喂它会直接
+        `AssertionError: input size [2,3,960,960] not equal to max model size`
+        —— 而那个异常被上层 try/except 吞掉，表现为"检测全空、框不动"，
+        比崩溃更难查。所以凡是批量的地方一律走这里，不再手写 predict。
+        """
+        if not imgs:
+            return []
+        # 调试开关：强制逐张推理。用来把"帧率差异"和"合批/逐张差异"分开 ——
+        # 合批时 ultralytics 会把多路图 letterbox 到**同一个**尺寸，
+        # 逐张时各自按自己的长宽比缩放，等效分辨率不同，检出集合也不同。
+        import os
+        _per = bool(os.environ.get("DET_FORCE_PER_IMAGE"))
+        if (_per or is_engine) and len(imgs) == 1:
+            return [model.predict(imgs[0], **kw)[0]]
+        if _per or is_engine:
+            return [model.predict(im, **kw)[0] for im in imgs]
+        return model.predict(list(imgs), **kw)
+
     def _predict_batch(self, imgs: list[np.ndarray],
                        offsets: list[tuple[int, int]]) -> list[Detection]:
         """一次前向跑多张图。分级检测要补切好几块，逐块跑很亏 ——
@@ -321,8 +375,9 @@ class Detector:
             return self._predict(imgs[0], offsets[0])
         # 切片块本身小，用更高的 imgsz 才能把里面的小目标放大到"能认"的尺寸。
         # 整图仍用 self.imgsz（960）保速度，切片单独用 tile_imgsz（1280）。
-        rs = self.model.predict(
-            list(imgs), imgsz=getattr(self, "tile_imgsz", self.imgsz),
+        rs = self._bp(
+            self.model, self.is_engine, list(imgs),
+            imgsz=getattr(self, "tile_imgsz", self.imgsz),
             conf=self.conf, iou=self.iou,
             device=self.device, classes=self.classes, verbose=False,
         )
@@ -508,8 +563,9 @@ class Detector:
         # ── 1. 整图 batch（主模型粗筛）──
         coarses: list[list] = [[] for _ in range(n)]
         if self.enable_main:
-            rs = self.model.predict(
-                images, imgsz=self.imgsz, conf=trigger_conf, iou=self.iou,
+            rs = self._bp(
+                self.model, self.is_engine, images,
+                imgsz=self.imgsz, conf=trigger_conf, iou=self.iou,
                 device=self.device, classes=self.classes, verbose=False)
             for i, r in enumerate(rs):
                 coarses[i] = [

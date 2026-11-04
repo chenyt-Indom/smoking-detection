@@ -348,10 +348,18 @@ def test_llm_label_wins() -> None:
     因为 kind 一直用检测类别（主模型把香烟误检成 fire）。
     """
     arb = (ROOT / "src" / "arbiter.py").read_text(encoding="utf-8")
-    if "fire|smoke|cigarette|steam" in arb:
-        check(OK, "LLM 支持 cigarette", "label 可选值里已包含香烟")
+    # 原来这里是硬匹配 `"fire|smoke|cigarette|steam"` 这一整串。
+    # prompt 后来把候选值重排成 fire|smoke|cigarette|light|other|uncertain
+    # （没写 steam，因为烟/汽本来就该归 other），锚点就失效了 ——
+    # 检查报"没有 cigarette"，实际 prompt 里明明有。改成解析枚举本身。
+    import re as _re
+    _m = _re.search(r'"label"\s*:\s*"([^"]+)"', arb)
+    _labels = [x.strip() for x in (_m.group(1).split("|") if _m else [])]
+    if "cigarette" in _labels:
+        check(OK, "LLM 支持 cigarette", f"label 可选值：{'|'.join(_labels)}")
     else:
-        check(FAIL, "LLM 支持 cigarette", "label 白名单里没有 cigarette")
+        check(FAIL, "LLM 支持 cigarette",
+              f"label 白名单里没有 cigarette（当前：{'|'.join(_labels) or '解析不到'}）")
 
     if '"cigarette"' in arb or "cigarette" in arb.split("def parse")[0]:
         check(OK, "香烟判据", "prompt 已说明「香烟判 cigarette 不是 smoke」")
@@ -417,13 +425,40 @@ def test_cigarette_confirm_frames() -> None:
     # 门限低是**故意的**。只要它 <= det_conf 就说得通 ——
     # 真正的把关在 LLM 那一层，不在检测层。
     det_c = float((c.get("thresholds") or {}).get("det_conf", 1))
-    # 正确关系：类别门槛 >= 总门槛（总门槛是"什么都要过"的那道粗筛，
-    # 类别门槛是"这一类至少要多可信"）。写反过一次，自检自己报的错。
+    # 正确关系：类别门槛 >= 总门槛（总门槛是"什么都要过"的那道粗筛）。
+    # ⚠️ 唯一的例外是 cigarette：它不走主模型，走 **副模型自己的 conf**，
+    #    所以 det_conf 管不到它。这个例外不能凭"我记得是这样"放行，
+    #    必须先在 infer.py 里确认副模型确实用的是 self.extra_conf。
+    extra_own_conf = _extra_model_has_own_conf()
     if tc >= det_c:
         check(OK, "香烟检测门限", f"{tc} >= det_conf {det_c}，不会被总门槛先滤掉")
+    elif extra_own_conf:
+        check(OK, "香烟检测门限",
+              f"{tc} < det_conf {det_c}，但香烟走副模型自己的 extra_conf，"
+              f"主门槛管不到它（已在 infer.py 核实）")
     else:
         check(FAIL, "香烟检测门限", f"{tc} < det_conf {det_c}，目标会被总门槛滤掉")
 
+
+
+def _extra_model_has_own_conf() -> bool:
+    """副模型（香烟）是否有独立的 conf 参数，而不是复用主模型的。
+
+    为什么需要：det_conf 只是**主模型**的推理门槛。香烟是第二个模型、
+    第二份权重，走的是 extra_conf。如果哪天有人把副模型的 predict 改成
+    复用 self.conf，那 cigarette_conf 就失去意义了 —— 这个函数会在
+    自检里把那种改动暴露出来，而不是继续默认"应该没问题"。
+    """
+    try:
+        src = (ROOT / "src" / "infer.py").read_text(encoding="utf-8")
+    except OSError:
+        return False
+    has_attr = "self.extra_conf" in src
+    # 副模型 predict 的 conf 实参必须是 extra_conf
+    used = ("conf=self.extra_conf" in src
+            or "conf=self.extra_conf" in src.replace(" ", "")
+            or '"conf": self.extra_conf' in src)
+    return has_attr and (used or "extra_conf," in src.replace(" ", ""))
 
 
 def test_confirm_frames_all() -> None:
@@ -539,6 +574,9 @@ def test_floor_order() -> None:
     det = float(c.get("det_conf", 1))
     lows = {k: float(c.get(k, 1)) for k in
             ("fire_conf", "smoke_conf", "cigarette_conf")}
+    # cigarette 例外同上：门槛由副模型的 extra_conf 把关，见 _extra_model_has_own_conf。
+    if _extra_model_has_own_conf():
+        lows.pop("cigarette_conf", None)
     bad = [f"{k}={v} < det_conf={det}" for k, v in lows.items() if v < det]
     if bad:
         check(FAIL, "检测层门槛次序", "总门槛高于类别门槛 -> " + "；".join(bad))

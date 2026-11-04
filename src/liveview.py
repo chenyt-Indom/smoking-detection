@@ -94,6 +94,11 @@ class LiveView:
         # （目标短暂丢失后重新捕获）时新轨迹的框会跳到新位置 —— 这一层
         # 兜住那种跨轨迹的跳变，让眼睛看到的是连续的。
         self._prev_boxes: list = []
+        # 上一帧**实际画出来的**框，用来做两件事（治"一直闪"，见 _draw）：
+        #   _cand_prev  灰框名额的粘性选择：上一帧画过的优先保住名额
+        #   _color_prev 彩色框阈值的滞回：已上色的框不会因为置信度微降就变灰
+        self._cand_prev: list = []
+        self._color_prev: list = []
 
         self._last_pub = 0.0
         self._n_pub = 0
@@ -303,13 +308,82 @@ class LiveView:
         #        用户举着烟却"检测 0 个目标"就是这么来的。
         _cand_min_area = h * w * 0.006      # 火/烟
         _cand_min_area_cig = h * w * 0.00015  # 香烟：约 78 像素起
+        # 香烟面积**上限**：真烟再近也占不到画面 2.5%。
+        # 实测 cigarette_conf=0.03 时模型会在床架/衣服上吐出 240x52 的框
+        # （占画面 4%、conf 0.05），画出来就是用户说的"框乱画"。
+        # 只有下限没有上限，这种明显不合理的框就拦不住。
+        _cand_max_area_cig = h * w * 0.025
+
+        # ── 治「一闪一闪」的两个显示层修正 ──────────────────────────────
+        # 用户反馈"一直闪、框乱跳"。除了环境因素，这一层有两个机械原因：
+        #
+        #   A. 灰框名额是"每帧按置信度取前 2 个"。灰框的置信度本来就贴着
+        #      门槛抖，排序每帧都在变 —— 这一帧画 A/B、下一帧画 C/D，
+        #      屏幕上就是一直在闪。
+        #   B. 彩色框门槛（0.55/0.58）是硬阈值。置信度在门槛附近浮动时，
+        #      框会在"红框 ⇄ 灰框"之间来回变色、变粗细，同样像在闪。
+        #
+        # 解法：A 改成"上一帧画过的优先"（按 IoU 认框，名额有剩才换新框）；
+        #       B 给门槛加 15% 滞回（已上色的框掉到门槛 85% 仍保持上色，
+        #       跌破才降级）。
+        # 两处都只影响"画不画/画什么颜色"，不改变任何检测与追踪结果。
+        _prev_cand = getattr(self, "_cand_prev", [])
+        _prev_color = getattr(self, "_color_prev", [])
+        _is_cig_n = lambda n: "cig" in n                       # noqa: E731
+
+        def _was(box, nm, hist) -> bool:
+            """这个框上一帧是不是已经以同样身份画过？"""
+            return any(p[1] == nm and self._iou(p[0], box) > 0.3 for p in hist)
+
+        def _hot(box, nm, cf, thr) -> bool:
+            """够不够画彩色框（含 15% 滞回）。"""
+            return cf >= thr or (cf >= thr * 0.85 and _was(box, nm, _prev_color))
+
+        def _grey_ok(i: int):
+            """够不够格当灰框候选；够格返回置信度，不够返回 None。"""
+            _d = dets[i]
+            _b = getattr(_d, "xyxy", None)
+            if _b is None:
+                return None
+            _x1, _y1, _x2, _y2 = (int(round(v)) for v in _b)
+            _x1, _y1 = max(0, _x1), max(0, _y1)
+            _x2, _y2 = min(w - 1, _x2), min(h - 1, _y2)
+            if _x2 <= _x1 or _y2 <= _y1:
+                return None
+            _nm = str(getattr(_d, "cls_name", "")).lower()
+            _cf = float(getattr(_d, "conf", 0.0))
+            _thr = (self.color_confs.get(2, 0.55) if _is_cig_n(_nm)
+                    else self.color_confs.get(int(getattr(_d, "cls_id", -1)), 0.50))
+            if _hot(_b, _nm, _cf, _thr):
+                return None                   # 会画成彩色框，不占灰框名额
+            _bw, _bh = _x2 - _x1, _y2 - _y1
+            if _is_cig_n(_nm):
+                if _bw * _bh > _cand_max_area_cig or _bw * _bh < _cand_min_area_cig:
+                    return None
+            elif _bw * _bh < _cand_min_area:
+                return None
+            return _cf
+
+        _sticky, _fresh = [], []
+        for _i in range(len(dets)):
+            _cf = _grey_ok(_i)
+            if _cf is None:
+                continue
+            _b = dets[_i].xyxy
+            _nm2 = str(getattr(dets[_i], "cls_name", "")).lower()
+            (_sticky if _was(_b, _nm2, _prev_cand) else _fresh).append((_i, _cf))
+        _sticky.sort(key=lambda t: -t[1])
+        _fresh.sort(key=lambda t: -t[1])
+        _cand_sel = {i for i, _ in (_sticky + _fresh)[:_cand_limit]}
+        _cand_now: list = []
+        _color_now: list = []
 
         def collides(box) -> bool:
             x1, y1, x2, y2 = box
             return any(not (x2 <= a or x1 >= c or y2 <= b or y1 >= d)
                        for a, b, c, d in placed)
 
-        for d in dets:
+        for _di, d in enumerate(dets):
             x1, y1, x2, y2 = (int(round(v)) for v in getattr(d, "xyxy", (0, 0, 0, 0)))
             x1, y1 = max(0, x1), max(0, y1)
             x2, y2 = min(w - 1, x2), min(h - 1, y2)
@@ -326,26 +400,27 @@ class LiveView:
                 alarm_thr = self.color_confs.get(2, 0.55)
             else:
                 alarm_thr = self.color_confs.get(cid, 0.50)
-            # 颜色只由「类别 + 是否达阈值」决定，不再分置信度档位
-            # 灰框限量：未达阈值的框最多画 N 个（按置信度从高到低）。
-            # 阈值降到 0.08 后画面里能冒出几十个灰框，满屏标签反而什么都看不清 ——
-            # 它们的信息量本来就只有"这里有东西"这一点，留前几个足够提示了。
-            if conf < alarm_thr:
-                _bw = max(1.0, x2 - x1)
-                _bh = max(1.0, y2 - y1)
-                _is_cig = "cig" in str(getattr(d, "cls_name", "")).lower()
-                _need = _cand_min_area_cig if _is_cig else _cand_min_area
-                if _cand_drawn >= _cand_limit or _bw * _bh < _need:
+            # 香烟尺寸合理性闸门：过于离谱的大框直接不画（见 _cand_max_area_cig）。
+            if _is_cig_n(_nm) and (x2 - x1) * (y2 - y1) > _cand_max_area_cig:
+                continue
+            # 颜色只由「类别 + 是否达阈值」决定；门槛带 20% 滞回（见 _hot）。
+            # 灰框名额由上面的粘性选择统一决定（_cand_sel），
+            # 这里只判断"在不在名单里"，不再边画边数 —— 那样会因排序抖动换框。
+            _is_hot = _hot((x1, y1, x2, y2), _nm, conf, alarm_thr)
+            if not _is_hot:
+                if _di not in _cand_sel:
                     continue
-            if conf >= alarm_thr:
-                if "cig" in str(getattr(d, "cls_name", "")).lower():
+                _cand_drawn += 1
+            if _is_hot:
+                if _is_cig_n(_nm):
                     color = CIG_COLOR
                 else:
                     color = COLORS.get(cid, DEFAULT_COLOR)
                 thick, suffix = 2, ""
+                _color_now.append(((float(x1), float(y1), float(x2), float(y2)), _nm))
             else:
                 color, thick, suffix = CAND_COLOR, 1, " ?"
-                _cand_drawn += 1
+                _cand_now.append(((float(x1), float(y1), float(x2), float(y2)), _nm))
             cv2.rectangle(img, (x1, y1), (x2, y2), color, thick)
 
             name = str(getattr(d, "cls_name", "obj")).upper()
@@ -374,9 +449,13 @@ class LiveView:
             cv2.rectangle(img, (x1, ly), (x1 + tw + 6, ly + bh), color, -1)
             # 告警框用白字压在彩色底上；候选框用深字压在灰底上，进一步弱化
             # 暗色候选底上用浅灰字，彩色告警底上用白字
-            txt = (215, 215, 215) if conf < alarm_thr else (255, 255, 255)
+            txt = (255, 255, 255) if _is_hot else (215, 215, 215)
             cv2.putText(img, label, (x1 + 3, ly + th + 1), FONT, 0.5,
                         txt, 1, cv2.LINE_AA)
+
+        # 记住本帧"实际画出来的"框，下一帧用来做粘性选择与颜色滞回
+        self._cand_prev = _cand_now
+        self._color_prev = _color_now
 
         # 左上角信息条：帧号 / 检测数 / 时间
         bar = f"f{frame_idx if frame_idx is not None else '-'}  det {len(dets)}  " \

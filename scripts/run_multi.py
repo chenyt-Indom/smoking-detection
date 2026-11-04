@@ -50,6 +50,20 @@ def load_cfg() -> dict:
     return yaml.safe_load(p.read_text(encoding="utf-8")) or {}
 
 
+def port_busy(host: str, port: int) -> bool:
+    """看板端口是否被占用 —— 第二道防重复启动（跨会话也有效）。"""
+    import socket
+    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.bind((host, port))
+        return False
+    except OSError:
+        return True
+    finally:
+        s.close()
+
+
 def acquire_lock():
     """单实例锁（内核互斥量）。多路也只有一个进程，锁的语义不变。"""
     if sys.platform == "win32":
@@ -60,7 +74,10 @@ def acquire_lock():
             k32.CreateMutexW.restype = wintypes.HANDLE
             k32.CreateMutexW.argtypes = [wintypes.LPCVOID, wintypes.BOOL,
                                          wintypes.LPCWSTR]
-            h = k32.CreateMutexW(None, True, "Local\\FireSmokeMonitor_Single")
+            # ⚠️ 用 Global\ 而不是 Local\：Local 只在同一个登录会话内互斥。
+            # 实测出现过两个实例（不同解释器启动、落在不同 session）都拿到锁，
+            # 同时抢同一批摄像头 —— 画面疯狂闪烁、帧率减半，用户以为算法坏了。
+            h = k32.CreateMutexW(None, True, "Global\\FireSmokeMonitor_Single")
             if ctypes.get_last_error() == 183:
                 return None
             return h
@@ -202,6 +219,14 @@ def main() -> int:
     if lock is None:
         print("[x] 已经有一个监控进程在运行，先关掉旧的。")
         return 4
+    # 第二道保险：端口被占说明还有别的副本（安装版/别的解释器）在跑。
+    # 两个实例同时抓摄像头 = 画面一直闪、帧率减半，必须拦住。
+    _ui = (yaml.safe_load(Path(a.config).read_text(encoding="utf-8")) or {}).get("ui") or {}
+    _p = int(_ui.get("port", 5050))
+    if port_busy(str(_ui.get("host", "127.0.0.1")), _p):
+        print(f"[x] 端口 {_p} 已被占用 —— 还有另一个监控实例在跑（或安装版开着）。")
+        print("    两个实例同时抓摄像头会让画面一直闪、帧率减半，请先关掉那个。")
+        return 5
 
     cfg = yaml.safe_load(Path(a.config).read_text(encoding="utf-8")) or {}
     cams = [c for c in (cfg.get("cameras") or []) if c.get("enabled", True)]
