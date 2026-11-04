@@ -57,7 +57,7 @@ _LOCK = threading.Lock()
 _BW = {"running": False, "done": 0, "total": 0, "split": ""}
 _ANG = {"mtime": None, "data": {}}
 _WH: dict[str, tuple[int, int] | None] = {}
-_LIST_CACHE: dict = {"key": None, "data": None}
+_LIST_CACHE: dict = {"sig": None, "data": {}}
 
 
 # ---------------------------------------------------------------- 小工具
@@ -223,12 +223,16 @@ def _dir_sig() -> str:
 
 def list_items(split: str, only: str = "all") -> list[dict]:
     """带缓存。直算要读 7813 个 label 文件，实测 3.8 秒，页面一刷新就卡。"""
-    ck = f"{split}|{only}|{_dir_sig()}"
-    if _LIST_CACHE.get("key") == ck:
-        return _LIST_CACHE["data"]
+    sig = _dir_sig()
+    c = _LIST_CACHE
+    if c["sig"] != sig:          # 任一目录/文件变了，整份缓存作废
+        c["sig"] = sig
+        c["data"] = {}
+    key = f"{split}|{only}"
+    if key in c["data"]:
+        return c["data"][key]
     out = _build_list(split, only)
-    _LIST_CACHE["key"] = ck
-    _LIST_CACHE["data"] = out
+    c["data"][key] = out
     return out
 
 
@@ -508,6 +512,19 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", b"not found")
 
 
+def _warm_list_cache() -> None:
+    """后台预热列表缓存：不预热的话，页面第一次打开要空等 3.9 秒（读 7813 个 label）。
+
+    只预热 train/all —— 标数据集基本都在 train，val 等真用到再算。
+    """
+    try:
+        t0 = time.time()
+        list_items("train", "all")
+        print(f"[✓] 列表缓存已预热（{time.time() - t0:.1f}s）")
+    except Exception as e:                # noqa: BLE001
+        print(f"[!] 预热失败：{e}")
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
@@ -537,6 +554,7 @@ def main() -> int:
     print("  Ctrl+C 停止")
     print("=" * 72)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    threading.Thread(target=_warm_list_cache, daemon=True).start()
     if a.open:
         threading.Timer(0.8, lambda: webbrowser.open(
             f"http://{a.host}:{a.port}/")).start()
