@@ -114,6 +114,7 @@
       <div class="kv"><span>角度</span><span id="v-a">–</span></div>
       <div class="kv"><span>长宽比</span><span id="v-r">–</span></div>
       <div class="kv"><span>状态</span><span id="v-st">–</span></div>
+      <div class="kv"><span>落盘</span><span id="v-save">–</span></div>
 
       <div id="chips" class="chips"></div>
 
@@ -432,7 +433,7 @@ function normBoxes(){
 function obbBoxes(){
   return S.boxes.map(b=>corners(b).map(([x,y])=>[x/S.iw, y/S.ih]).flat());
 }
-async function save(action){
+async function save(action, silent){
   if(!S.items.length) return false;
   const it=S.items[S.idx];
   const body={split:S.split,name:it.name,action};
@@ -447,11 +448,21 @@ async function save(action){
     it.boxes = action==='empty'?[]:normBoxes();
     it.angs  = action==='empty'?[]:S.boxes.map(b=>b.ang);
     S.dirty=false;
+    markSaved(!!silent);
     if(j.stats) updateStats(j.stats);
-    toast(action==='empty'?'已标记：这张没有香烟'
+    if(!silent) toast(action==='empty'?'已标记：这张没有香烟'
           :`已保存（${it.boxes.length} 个框）`);
     return true;
-  }catch(err){ toast('保存失败：'+err.message,false); return false; }
+  }catch(err){
+    toast('保存失败：'+err.message,false);
+    return false;
+  }
+}
+function markSaved(auto){
+  const el=document.getElementById('v-save');
+  if(!el) return;
+  const t=new Date(), p=n=>String(n).padStart(2,'0');
+  el.textContent=`${p(t.getHours())}:${p(t.getMinutes())} ${auto?'自动写入':'已写入'}`;
 }
 function updateStats(st){
   const s=st[S.split]; S.reviewed=s.reviewed; S.total=s.total;
@@ -465,7 +476,23 @@ async function loadList(){
   S.split=document.getElementById('split').value;
   S.only=document.getElementById('only').value;
   S.items=await api(`/api/list?split=${S.split}&only=${S.only}`);
-  buildSideList(); S.idx=0; await go(0);
+  buildSideList();
+  // 断点恢复：回到上次标到的那张（关机/重启/刷新都不丢位置）
+  let start=0, back=null, skipped=0;
+  try{
+    const p=await api('/api/progress');
+    if(p && p.split===S.split && p.name){
+      const k=S.items.findIndex(it=>it.name===p.name);
+      if(k>=0){ start=k; back=p.name; }
+    }else if(S.only==='all'||S.only==='unreviewed'){
+      // 没有进度记录时：直接停在第一张还没复标的图上
+      const k=S.items.findIndex(it=>!it.edited);
+      if(k>0){ start=k; skipped=k; }
+    }
+  }catch(e){}
+  await go(start, true);
+  if(back) toast(`已回到上次那张：${back}（第 ${start+1} 张）`);
+  else if(skipped) toast(`前面 ${skipped} 张已复标，从第 ${start+1} 张接着标`);
 }
 function itemHTML(it){
   const flags=(it.excluded?'<span class="badge ex">排除</span>':'')
@@ -493,8 +520,10 @@ function applyOriginal(){
   S.boxes=S.orig.map(b=>({...b}));
   S.sel=S.boxes.length?0:-1;
 }
-async function go(i){
+async function go(i, keep){
   if(i<0||i>=S.items.length) return;
+  // 切图前先把当前改动落盘，点列表/翻页都不会把修改弄丢
+  if(!keep && S.dirty && S.loaded && !S.drag){ await save('ok', true); }
   S.idx=i; S.dirty=false; S.loaded=false;
   const it=S.items[i];
   const img=new Image();
@@ -643,6 +672,16 @@ window.addEventListener('keydown',async e=>{
 /* ---------------- 启动 ---------------- */
 resize(); syncSnap();
 api('/api/stats').then(()=>loadList()).catch(()=>{});
+
+/* 30 秒自动落盘：有未保存改动、且没在拖拽时才写。关机/断电最多丢 30 秒内的动作 */
+setInterval(()=>{
+  if(S.dirty && S.loaded && S.boxes.length && !S.drag) save('ok', true);
+}, 30000);
+
+/* 关页面/刷新时如果还有没落盘的改动，浏览器会拦一下 */
+window.addEventListener('beforeunload', e=>{
+  if(S.dirty){ e.preventDefault(); e.returnValue=''; }
+});
 </script>
 </body>
 </html>

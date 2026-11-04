@@ -30,8 +30,10 @@ import argparse
 import json
 import math
 import mimetypes
+import os
 import threading
 import time
+import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, urlparse
@@ -45,6 +47,7 @@ OBB = DATA / "labels_obb"
 REVIEWS = DATA / "reviews.jsonl"
 EXCLUDED = DATA / "excluded.json"
 BWFLAGS = DATA / "bw_flags.json"
+PROGRESS = DATA / "progress.json"      # 上次标到哪张：关机重启后自动回到原地
 
 _LOCK = threading.Lock()
 _BW = {"running": False, "done": 0, "total": 0, "split": ""}
@@ -70,6 +73,17 @@ def _save_json(p: Path, obj) -> None:
     tmp = p.with_suffix(p.suffix + ".tmp")
     tmp.write_text(json.dumps(obj, ensure_ascii=False, indent=1), encoding="utf-8")
     tmp.replace(p)
+
+
+def _write_text_atomic(p: Path, text: str) -> None:
+    """先写 .tmp 再 os.replace：关机/断电写到一半也不会留下半截标注文件。"""
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_suffix(p.suffix + ".tmp")
+    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
+        f.write(text)
+        f.flush()
+        os.fsync(f.fileno())
+    os.replace(tmp, p)
 
 
 def load_excluded() -> dict:
@@ -193,28 +207,43 @@ def save(payload: dict) -> dict:
         fx.parent.mkdir(parents=True, exist_ok=True)
         ob.parent.mkdir(parents=True, exist_ok=True)
         if action == "empty" or not boxes:
-            fx.write_text("", encoding="utf-8")
-            ob.write_text("", encoding="utf-8")
+            _write_text_atomic(fx, "")
+            _write_text_atomic(ob, "")
         else:
-            fx.write_text("".join(
-                "0 " + " ".join(f"{float(v):.6f}" for v in b) + "\n" for b in boxes),
-                encoding="utf-8")
-            ob_lines = []
-            for i, b in enumerate(boxes):
-                if i < len(obbs) and obbs[i] and len(obbs[i]) == 8:
-                    vals = [float(v) for v in obbs[i]]
-                else:
-                    cx, cy, w, h = (float(v) for v in b)
-                    vals = [cx - w / 2, cy - h / 2, cx + w / 2, cy - h / 2,
-                            cx + w / 2, cy + h / 2, cx - w / 2, cy + h / 2]
-                ob_lines.append("0 " + " ".join(f"{v:.6f}" for v in vals) + "\n")
-            ob.write_text("".join(ob_lines), encoding="utf-8")
+            _write_text_atomic(fx, "".join(
+                "0 " + " ".join(f"{float(v):.6f}" for v in b) + "\n" for b in boxes))
+            # 客户端没给旋转四点（脚本/旧版调用）时，别拿轴对齐四点去覆盖已存的旋转标注
+            has_obb = any(o and len(o) == 8 for o in obbs)
+            keep_old = False
+            if not has_obb and ob.is_file():
+                try:
+                    old = [ln for ln in ob.read_text(encoding="utf-8").splitlines() if ln.strip()]
+                except OSError:
+                    old = []
+                keep_old = len(old) == len(boxes)
+            if not keep_old:
+                ob_lines = []
+                for i, b in enumerate(boxes):
+                    if i < len(obbs) and obbs[i] and len(obbs[i]) == 8:
+                        vals = [float(v) for v in obbs[i]]
+                    else:
+                        cx, cy, w, h = (float(v) for v in b)
+                        vals = [cx - w / 2, cy - h / 2, cx + w / 2, cy - h / 2,
+                                cx + w / 2, cy + h / 2, cx - w / 2, cy + h / 2]
+                    ob_lines.append("0 " + " ".join(f"{v:.6f}" for v in vals) + "\n")
+                _write_text_atomic(ob, "".join(ob_lines))
         try:
             with open(REVIEWS, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"ts": round(time.time(), 3), "split": split,
                                     "name": f"{stem}.jpg", "action": action,
                                     "n_boxes": len(boxes), "boxes": boxes},
                                    ensure_ascii=False) + "\n")
+        except OSError:
+            pass
+        # 记住进度：下次打开自动回到这张（列表可能被筛选/排除改变，所以只存名字）
+        try:
+            _save_json(PROGRESS, {"split": split, "name": f"{stem}.jpg",
+                                  "action": action, "ts": round(time.time(), 1)})
         except OSError:
             pass
     return {"ok": True, "stats": stats()}
@@ -311,6 +340,9 @@ class Handler(BaseHTTPRequestHandler):
         if u.path == "/api/stats":
             self._json(stats())
             return
+        if u.path == "/api/progress":
+            self._json(_load_json(PROGRESS, {}))
+            return
         if u.path == "/api/list":
             self._json(list_items((q.get("split") or ["train"])[0],
                                   (q.get("only") or ["all"])[0]))
@@ -365,6 +397,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--host", default="127.0.0.1")
     ap.add_argument("--port", type=int, default=5077)
+    ap.add_argument("--open", action="store_true",
+                    help="启动后自动用默认浏览器打开页面（双击 bat 时用）")
     a = ap.parse_args()
     if not DATA.is_dir():
         print(f"[x] 数据集不存在：{DATA}")
@@ -382,6 +416,9 @@ def main() -> int:
     print("  Ctrl+C 停止")
     print("=" * 72)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    if a.open:
+        threading.Timer(0.8, lambda: webbrowser.open(
+            f"http://{a.host}:{a.port}/")).start()
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
