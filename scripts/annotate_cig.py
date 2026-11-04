@@ -57,6 +57,7 @@ _LOCK = threading.Lock()
 _BW = {"running": False, "done": 0, "total": 0, "split": ""}
 _ANG = {"mtime": None, "data": {}}
 _WH: dict[str, tuple[int, int] | None] = {}
+_LIST_CACHE: dict = {"key": None, "data": None}
 
 
 # ---------------------------------------------------------------- 小工具
@@ -203,7 +204,35 @@ def read_boxes(split: str, stem: str) -> tuple[list[list[float]], bool]:
     return _parse_boxes(f.read_text(encoding="utf-8", errors="ignore")), False
 
 
+def _dir_sig() -> str:
+    """用来判断列表缓存能不能复用：任一相关目录/文件变了就重算。"""
+    parts: list[str] = []
+    for p in (img_dir("train"), img_dir("val"), lbl_dir("train"), lbl_dir("val"),
+              FIXED / "train", FIXED / "val", OBB / "train", OBB / "val"):
+        try:
+            parts.append(f"{p.stat().st_mtime:.3f}")
+        except OSError:
+            parts.append("-")
+    for p in (EXCLUDED, ANGLES, BWFLAGS):
+        try:
+            parts.append(f"{p.stat().st_mtime:.3f}")
+        except OSError:
+            parts.append("-")
+    return "|".join(parts)
+
+
 def list_items(split: str, only: str = "all") -> list[dict]:
+    """带缓存。直算要读 7813 个 label 文件，实测 3.8 秒，页面一刷新就卡。"""
+    ck = f"{split}|{only}|{_dir_sig()}"
+    if _LIST_CACHE.get("key") == ck:
+        return _LIST_CACHE["data"]
+    out = _build_list(split, only)
+    _LIST_CACHE["key"] = ck
+    _LIST_CACHE["data"] = out
+    return out
+
+
+def _build_list(split: str, only: str = "all") -> list[dict]:
     ex = load_excluded()[split]
     bw = load_bw().get(split) or {}
     out = []
