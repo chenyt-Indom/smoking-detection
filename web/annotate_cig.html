@@ -233,11 +233,31 @@ function layout(){
   S.scale=Math.min(cv.width/S.iw, cv.height/S.ih);
   S.ox=(cv.width-S.iw*S.scale)/2; S.oy=(cv.height-S.ih*S.scale)/2;
 }
+/* 缩放后的底图缓存：原来每帧都要把 1920x1080 原图重新缩放采样一次，
+   鼠标一动就重绘一次，实际浏览器里每帧十几毫秒 —— 这是比解码更隐形的根源 */
+let _bg=null, _bgKey='', _bgImg=null;
+function ensureBg(){
+  const key=`${S.iw}x${S.ih}@${S.scale.toFixed(4)}`;
+  if(_bg && _bgKey===key && _bgImg===S.img) return _bg;
+  const W=Math.max(1,Math.ceil(S.iw*S.scale)), H=Math.max(1,Math.ceil(S.ih*S.scale));
+  _bg=document.createElement('canvas');
+  _bg.width=W; _bg.height=H;
+  _bg.getContext('2d').drawImage(S.img,0,0,W,H);
+  _bgKey=key; _bgImg=S.img;
+  return _bg;
+}
+/* 拖拽时用 rAF 合并：一帧最多画一次 */
+let _pendingDraw=false;
+function drawSoon(){
+  if(_pendingDraw) return;
+  _pendingDraw=true;
+  requestAnimationFrame(()=>{ _pendingDraw=false; draw(); });
+}
 function draw(){
   ctx.setTransform(1,0,0,1,0,0);
   ctx.clearRect(0,0,cv.width,cv.height);
   if(!S.img) return;
-  ctx.drawImage(S.img,S.ox,S.oy,S.iw*S.scale,S.ih*S.scale);
+  ctx.drawImage(ensureBg(),S.ox,S.oy,S.iw*S.scale,S.ih*S.scale);
   S.boxes.forEach((b,i)=>{
     const cs=corners(b).map(([x,y])=>[X(x),Y(y)]);
     const on=(i===S.sel);
@@ -388,7 +408,9 @@ window.addEventListener('mousemove', e=>{
   if(!S.drag){
     cv.style.cursor = hitHandles(mx,my) ? 'pointer'
                    : (selectAt(mx,my)>=0 ? 'move' : 'crosshair');
-    draw(); return;
+    // 没拖拽时只重绘右下角放大镜（170x170），不动主画布
+    if(S.img) drawLoupe();
+    return;
   }
   const d=S.drag, b=S.boxes[S.sel]; if(!b) return;
   if(d.mode==='create'){
@@ -412,7 +434,7 @@ window.addEventListener('mousemove', e=>{
     b.cx=opp[0]+(lx/2)*cc-(ly/2)*ss;
     b.cy=opp[1]+(lx/2)*ss+(ly/2)*cc;
   }
-  S.dirty=true; draw(); refreshInfo();
+  S.dirty=true; drawSoon(); refreshInfo();
 });
 window.addEventListener('mouseup', ()=>{
   if(S.drag && S.drag.mode==='create'){
@@ -569,7 +591,12 @@ function prefetch(i){
   if(_pref.has(key)) return;
   if(_pref.size>400) _pref.clear();
   _pref.add(key);
-  const go2=()=>{ new Image().src=`/img?split=${S.split}&name=${encodeURIComponent(it.name)}`; };
+  const go2=()=>{
+    const im=new Image();
+    im.src=`/img?split=${S.split}&name=${encodeURIComponent(it.name)}`;
+    // 关键：提前把 JPEG 解码完。只下载不解码的话，切过去那一刻仍要现场解码 1920x1080
+    if(im.decode) im.decode().catch(()=>{});
+  };
   if(window.requestIdleCallback) requestIdleCallback(go2,{timeout:1500}); else setTimeout(go2,120);
 }
 async function go(i, keep){
@@ -581,7 +608,9 @@ async function go(i, keep){
   const it=S.items[i];
   const t0=performance.now();
   const img=new Image();
-  img.onload=()=>{
+  img.onload=async()=>{
+    // 等解码真正完成再画，避免在 onload 那一刻同步解码卡主线程
+    if(img.decode) { try{ await img.decode(); }catch(e){} }
     S.img=img; S.iw=img.naturalWidth; S.ih=img.naturalHeight;
     layout(); applyOriginal(); S.loaded=true; draw(); refreshInfo();
     const el=document.getElementById('v-load');
