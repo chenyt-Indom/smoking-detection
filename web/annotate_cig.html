@@ -48,6 +48,13 @@
   .item:hover{background:#222831}
   .item.cur{background:#1f3550;border-left:3px solid var(--acc);padding-left:9px}
   .item .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .chips{display:flex;flex-wrap:wrap;gap:5px;margin:9px 0 3px;min-height:22px}
+  .chips b{font-weight:500;font-size:11.5px;padding:2px 9px;border-radius:6px;
+    background:#232830;border:1px solid var(--line);color:#9fc4ea;cursor:pointer;
+    font-variant-numeric:tabular-nums;user-select:none}
+  .chips b:hover{border-color:#3d4756}
+  .chips b.on{background:var(--acc);border-color:var(--acc);color:#06121f;font-weight:700}
+  .chips .none{color:var(--dim);font-size:11.5px;line-height:22px}
   #toast{position:absolute;left:50%;top:14px;transform:translateX(-50%);
     background:#1f2937;border:1px solid var(--line);padding:7px 14px;border-radius:8px;
     opacity:0;transition:opacity .2s;pointer-events:none;font-size:12.5px}
@@ -108,6 +115,8 @@
       <div class="kv"><span>长宽比</span><span id="v-r">–</span></div>
       <div class="kv"><span>状态</span><span id="v-st">–</span></div>
 
+      <div id="chips" class="chips"></div>
+
       <div class="row">
         <button id="btn-new" class="arm">+ 新增框 (N)</button>
         <button id="btn-del" class="bad">删除选中框</button>
@@ -122,6 +131,10 @@
       </div>
       <div class="row">
         <button id="btn-aspect">校正为细长(4:1)</button>
+        <button id="btn-zero">角度归零</button>
+      </div>
+      <div class="row">
+        <button id="btn-snap">旋转吸附 15°：关</button>
       </div>
       <div class="row">
         <button id="btn-exclude" class="bad">排除（不加入训练）</button>
@@ -139,8 +152,8 @@
     <div class="pad" style="border-bottom:1px solid var(--line)">
       <div class="hint">
         <b>加框</b>　在图上<b>空白处按住拖一下</b>就生成新框（也可按 <kbd>N</kbd>）<br>
-        <b>选中</b>　点框内任意位置　<kbd>Tab</kbd> 切换　<kbd>Del</kbd> 删除<br>
-        <b>调整</b>　拖框内=移动　拖角点=缩放　拖顶部橙点=旋转（<kbd>Shift</kbd> 不吸附）<br>
+        <b>改框</b>　点一下框（点偏一点也认）就选中它，再拖＝移动；<br>　　　　<b>点上面那排框号</b>可直接跳到第 N 个框<br>
+        <b>调整</b>　拖角点=缩放　拖顶部橙点=旋转（<b>默认无级</b>，<kbd>G</kbd> 开关 15° 吸附）<br>
         <kbd>D</kbd> 正确　<kbd>X</kbd> 无香烟　<kbd>R</kbd> 还原　<kbd>Enter</kbd> 保存<br>
         <kbd>W</kbd>/<kbd>S</kbd> 角度 ±1°　<kbd>←</kbd><kbd>→</kbd> 上/下一张
       </div>
@@ -159,7 +172,7 @@ let S={
   img:null, iw:0, ih:0,
   boxes:[], sel:-1, orig:[],
   scale:1, ox:0, oy:0, dirty:false, loaded:false,
-  drag:null, mouse:null, reviewed:0, total:0
+  drag:null, mouse:null, reviewed:0, total:0, snap:false
 };
 
 /* ---------------- API（接口失败要明确报错，别白屏） ---------------- */
@@ -190,6 +203,16 @@ function toLocal(b,px,py){
   const dx=px-b.cx, dy=py-b.cy, c=Math.cos(-b.ang), s=Math.sin(-b.ang);
   return [dx*c-dy*s, dx*s+dy*c];
 }
+/* 旋转橙柄的位置：按框的屏幕短边自适应，否则细长小框的橙点会飘得很远点不到 */
+function rotPos(b,cs){
+  const cen=[X(b.cx),Y(b.cy)];
+  const mid=[(cs[0][0]+cs[1][0])/2,(cs[0][1]+cs[1][1])/2];
+  let vx=mid[0]-cen[0], vy=mid[1]-cen[1]; const L=Math.hypot(vx,vy)||1;
+  const sw=Math.min(Math.hypot(cs[1][0]-cs[0][0],cs[1][1]-cs[0][1]),
+                    Math.hypot(cs[3][0]-cs[0][0],cs[3][1]-cs[0][1]));
+  const dist=Math.max(17,Math.min(34,sw*0.7+15));
+  return [mid[0]+vx/L*dist, mid[1]+vy/L*dist];
+}
 const X=x=>S.ox+x*S.scale, Y=y=>S.oy+y*S.scale;
 const IX=x=>(x-S.ox)/S.scale, IY=y=>(y-S.oy)/S.scale;
 
@@ -217,29 +240,32 @@ function draw(){
     ctx.moveTo(cs[0][0],cs[0][1]);
     for(let k=1;k<4;k++) ctx.lineTo(cs[k][0],cs[k][1]);
     ctx.closePath();
-    ctx.fillStyle=on?'rgba(78,161,255,.16)':'rgba(78,161,255,.05)';
+    ctx.fillStyle=on?'rgba(78,161,255,.16)':'rgba(78,161,255,.07)';
     ctx.fill();
-    ctx.lineWidth=on?2:1.2;
-    ctx.strokeStyle=on?(S.dirty?'#f0a13a':'#4ea1ff'):'rgba(78,161,255,.55)';
+    ctx.lineWidth=on?2.2:1.7;
+    ctx.strokeStyle=on?(S.dirty?'#f0a13a':'#4ea1ff'):'rgba(126,190,255,.82)';
     ctx.stroke();
     if(!on){
       const cen=[X(b.cx),Y(b.cy)];
-      ctx.font='11px sans-serif'; ctx.fillStyle='rgba(160,200,255,.9)';
-      ctx.fillText(String(i+1), cen[0]-3, cen[1]+4);
+      ctx.font='bold 12px sans-serif'; ctx.fillStyle='rgba(170,215,255,.95)';
+      ctx.fillText(String(i+1), cen[0]-4, cen[1]+4);
       return;
     }
     const mid=[(cs[0][0]+cs[1][0])/2,(cs[0][1]+cs[1][1])/2];
     const cen=[X(b.cx),Y(b.cy)];
-    let vx=mid[0]-cen[0], vy=mid[1]-cen[1]; const L=Math.hypot(vx,vy)||1;
-    const rot=[mid[0]+vx/L*34, mid[1]+vy/L*34];
+    const sw=Math.min(Math.hypot(cs[1][0]-cs[0][0],cs[1][1]-cs[0][1]),
+                      Math.hypot(cs[3][0]-cs[0][0],cs[3][1]-cs[0][1]));
+    const rr=Math.max(3,Math.min(6,sw*0.18));      // 小框的手柄跟着缩小，别糊成一团
+    const rrot=Math.max(4,Math.min(7,sw*0.2));
+    const rot=rotPos(b,cs);
     ctx.beginPath(); ctx.moveTo(mid[0],mid[1]); ctx.lineTo(rot[0],rot[1]);
     ctx.strokeStyle='#5a6472'; ctx.lineWidth=1; ctx.stroke();
-    ctx.beginPath(); ctx.arc(rot[0],rot[1],7,0,Math.PI*2);
+    ctx.beginPath(); ctx.arc(rot[0],rot[1],rrot,0,Math.PI*2);
     ctx.fillStyle='#f0a13a'; ctx.fill();
     for(const p of cs){
-      ctx.beginPath(); ctx.arc(p[0],p[1],6,0,Math.PI*2);
+      ctx.beginPath(); ctx.arc(p[0],p[1],rr,0,Math.PI*2);
       ctx.fillStyle='#4ea1ff'; ctx.fill();
-      ctx.strokeStyle='#0d0f12'; ctx.lineWidth=2; ctx.stroke();
+      ctx.strokeStyle='#0d0f12'; ctx.lineWidth=1.6; ctx.stroke();
     }
     ctx.beginPath(); ctx.arc(cen[0],cen[1],3,0,Math.PI*2);
     ctx.fillStyle='#fff'; ctx.fill();
@@ -284,13 +310,29 @@ function refreshInfo(){
   else if(S.dirty){ st.innerHTML='<span class="tag edit">已修改·未保存</span>'; }
   else if(S.items[S.idx]&&S.items[S.idx].edited){ st.innerHTML='<span class="tag ok">已复标</span>'; }
   else { st.innerHTML='<span class="tag">原始标注</span>'; }
+  renderChips();
+}
+
+/* 框号胶囊：多框时点一下就跳到那个框，比在图上找框快 */
+function renderChips(){
+  const box=document.getElementById('chips');
+  if(!box) return;
+  if(!S.loaded){ box.innerHTML=''; return; }
+  if(!S.boxes.length){ box.innerHTML='<span class="none">无框 —— 空白处拖一下新建</span>'; return; }
+  box.innerHTML=S.boxes.map((b,i)=>{
+    const w=Math.round(b.w), h=Math.round(b.h);
+    return `<b class="${i===S.sel?'on':''}" data-i="${i}">${i+1}`
+      + `<span style="opacity:.55"> ·${w}×${h}</span></b>`;
+  }).join('');
 }
 
 /* ---------------- 交互 ---------------- */
+const HIT_PAD=9;   /* 屏幕像素：点击容差（烟框又细又长，严格点框内几乎点不中） */
 function selectAt(mx,my){
+  const tol=HIT_PAD/Math.max(0.05,S.scale);
   for(let i=S.boxes.length-1;i>=0;i--){
     const b=S.boxes[i], [lx,ly]=toLocal(b, IX(mx), IY(my));
-    if(Math.abs(lx)<=b.w/2 && Math.abs(ly)<=b.h/2) return i;
+    if(Math.abs(lx)<=b.w/2+tol && Math.abs(ly)<=b.h/2+tol) return i;
   }
   return -1;
 }
@@ -299,11 +341,15 @@ function hitHandles(mx,my){
   const b=S.boxes[S.sel];
   const cs=corners(b).map(([x,y])=>[X(x),Y(y)]);
   const cen=[X(b.cx),Y(b.cy)];
-  const mid=[(cs[0][0]+cs[1][0])/2,(cs[0][1]+cs[1][1])/2];
-  let vx=mid[0]-cen[0], vy=mid[1]-cen[1]; const L=Math.hypot(vx,vy)||1;
-  const rot=[mid[0]+vx/L*34, mid[1]+vy/L*34];
-  if(Math.hypot(mx-rot[0],my-rot[1])<12) return {mode:'rotate'};
-  for(let i=0;i<4;i++) if(Math.hypot(mx-cs[i][0],my-cs[i][1])<12)
+  // 框在屏幕上的短边：细长小框不能让角点手柄把整个框吃掉，否则只能缩放不能移动
+  const sw=Math.min(Math.hypot(cs[1][0]-cs[0][0],cs[1][1]-cs[0][1]),
+                    Math.hypot(cs[3][0]-cs[0][0],cs[3][1]-cs[0][1]));
+  const R=Math.max(4,Math.min(12,sw*0.3));
+  const rot=rotPos(b,cs);
+  if(Math.hypot(mx-rot[0],my-rot[1])<Math.max(9,R)) return {mode:'rotate'};
+  // 中心区一律当移动（小框尤其需要）
+  if(Math.hypot(mx-cen[0],my-cen[1])<Math.max(7,sw*0.34)) return null;
+  for(let i=0;i<4;i++) if(Math.hypot(mx-cs[i][0],my-cs[i][1])<R)
     return {mode:'resize', corner:i};
   return null;
 }
@@ -350,7 +396,7 @@ window.addEventListener('mousemove', e=>{
   } else if(d.mode==='rotate'){
     const a=Math.atan2(IY(my)-d.box.cy, IX(mx)-d.box.cx);
     let na=d.ang0+(a-d.a0);
-    if(!e.shiftKey){ const step=Math.PI/12; na=Math.round(na/step)*step; }
+    if(S.snap && !e.shiftKey){ const step=Math.PI/12; na=Math.round(na/step)*step; }
     b.ang=na;
   } else if(d.mode==='resize'){
     const opp=d.opp, c=Math.cos(-d.box.ang), s=Math.sin(-d.box.ang);
@@ -485,6 +531,24 @@ document.getElementById('btn-save').onclick=async()=>{
   if(!S.boxes.length){ toast('还没有框：空白处拖一下，或点「没有香烟」',false); return; }
   if(await save('ok')) await next();
 };
+document.getElementById('btn-zero').onclick=()=>{
+  const b = S.sel>=0 ? S.boxes[S.sel] : null;
+  if(!b){ toast('先选中一个框',false); return; }
+  b.ang=0; S.dirty=true; draw(); refreshInfo();
+};
+document.getElementById('btn-snap').onclick=()=>{
+  S.snap=!S.snap; syncSnap();
+  toast(S.snap?'旋转改成 15° 一档吸附（按住 Shift 仍可自由）':'旋转已改为无级（任意角度）');
+};
+function syncSnap(){
+  const b=document.getElementById('btn-snap');
+  b.textContent='旋转吸附 15°：'+(S.snap?'开':'关');
+  b.classList.toggle('arm',S.snap);
+}
+document.getElementById('chips').onclick=e=>{
+  const t=e.target.closest('b[data-i]'); if(!t) return;
+  S.sel=+t.dataset.i; draw(); refreshInfo();
+};
 document.getElementById('btn-aspect').onclick=()=>{
   const b = S.sel>=0 ? S.boxes[S.sel] : null;
   if(!b){ toast('先选中一个框',false); return; }
@@ -568,6 +632,7 @@ window.addEventListener('keydown',async e=>{
   else if(k==='delete'||k==='backspace'){
     e.preventDefault(); document.getElementById('btn-del').click();
   }
+  else if(k==='g'){ e.preventDefault(); document.getElementById('btn-snap').click(); }
   else if((k==='w'||k==='s') && S.sel>=0){
     e.preventDefault();
     S.boxes[S.sel].ang += (k==='w'?1:-1)*Math.PI/180;
@@ -576,7 +641,7 @@ window.addEventListener('keydown',async e=>{
 });
 
 /* ---------------- 启动 ---------------- */
-resize();
+resize(); syncSnap();
 api('/api/stats').then(()=>loadList()).catch(()=>{});
 </script>
 </body>
