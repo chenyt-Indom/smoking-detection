@@ -83,13 +83,15 @@ def _save_json(p: Path, obj) -> None:
 
 
 def _write_text_atomic(p: Path, text: str) -> None:
-    """先写 .tmp 再 os.replace：关机/断电写到一半也不会留下半截标注文件。"""
+    """先写 .tmp 再 os.replace：关机/断电也不会留下半截标注文件。
+
+    ⚠️ 不要加 os.fsync()。fsync 会强制等磁盘真正落盘，训练在疯狂读盘时
+    每次能阻塞几百毫秒~秒级，而保存一张要写 4 个文件 ⇒ 切图直接被拖死。
+    os.replace 本身已是原子操作，断电最坏丢最后一张的保存，可接受。
+    """
     p.parent.mkdir(parents=True, exist_ok=True)
     tmp = p.with_suffix(p.suffix + ".tmp")
-    with open(tmp, "w", encoding="utf-8", newline="\n") as f:
-        f.write(text)
-        f.flush()
-        os.fsync(f.fileno())
+    tmp.write_text(text, encoding="utf-8", newline="\n")
     os.replace(tmp, p)
 
 

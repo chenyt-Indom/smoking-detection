@@ -439,25 +439,25 @@ function obbBoxes(){
 }
 async function save(action, silent){
   if(!S.items.length) return false;
-  const it=S.items[S.idx];
+  // 先把要存的东西快照下来：不阻塞切图时，await 期间用户可能已经翻到另一张
+  const idx=S.idx, it=S.items[idx];
+  const empty=(action==='empty');
+  const snapB=empty?[]:normBoxes();
+  const snapA=empty?[]:S.boxes.map(b=>b.ang);
+  const snapO=empty?[]:obbBoxes();
   const body={split:S.split,name:it.name,action};
-  if(action!=='empty' && S.boxes.length){
-    body.boxes=normBoxes(); body.obbs=obbBoxes();
-    /* 角度直传像素空间的真实值：四点存的是归一化坐标，服务端反推会被宽高比压歪 */
-    body.angs=S.boxes.map(b=>b.ang);
-  }
+  if(snapB.length){ body.boxes=snapB; body.obbs=snapO; body.angs=snapA; }
   try{
     const j=await api('/api/save',{method:'POST',
       headers:{'Content-Type':'application/json'},body:JSON.stringify(body)});
     if(!j.ok) throw new Error(j.err||'保存失败');
     it.edited=true;
-    it.boxes = action==='empty'?[]:normBoxes();
-    it.angs  = action==='empty'?[]:S.boxes.map(b=>b.ang);
-    S.dirty=false;
+    it.boxes=snapB; it.angs=snapA;
+    if(S.idx===idx) S.dirty=false;      // 人还在原图才清脏标记
     markSaved(!!silent);
-    paintItem(S.idx);
-    if(j.stats) updateStats(j.stats);
-    if(!silent) toast(action==='empty'?'已标记：这张没有香烟'
+    paintItem(idx);
+    if(j.stats && S.idx===idx) updateStats(j.stats);
+    if(!silent) toast(empty?'已标记：这张没有香烟'
           :`已保存（${it.boxes.length} 个框）`);
     return true;
   }catch(err){
@@ -574,8 +574,9 @@ function prefetch(i){
 }
 async function go(i, keep){
   if(i<0||i>=S.items.length) return;
-  // 切图前先把当前改动落盘，点列表/翻页都不会把修改弄丢
-  if(!keep && S.dirty && S.loaded && !S.drag){ await save('ok', true); }
+  // 切图前把当前改动先落盘，但**不 await**：
+  // 一 await 就把切图卡在写盘上（训练在抢磁盘时能卡 1~2 秒），这是卡顿的真凶
+  if(!keep && S.dirty && S.loaded && !S.drag){ save('ok', true); }
   S.idx=i; S.dirty=false; S.loaded=false;
   const it=S.items[i];
   const t0=performance.now();
@@ -729,10 +730,11 @@ window.addEventListener('keydown',async e=>{
 resize(); syncSnap();
 api('/api/stats').then(()=>loadList()).catch(()=>{});
 
-/* 30 秒自动落盘：有未保存改动、且没在拖拽时才写。关机/断电最多丢 30 秒内的动作 */
+/* 120 秒自动落盘：有未保存改动、且没在拖拽时才写。
+   原来 30 秒太频繁，每 30 秒就要写 4 个文件，白白加重磁盘压力 */
 setInterval(()=>{
   if(S.dirty && S.loaded && S.boxes.length && !S.drag) save('ok', true);
-}, 30000);
+}, 120000);
 
 /* 关页面/刷新时如果还有没落盘的改动，浏览器会拦一下 */
 window.addEventListener('beforeunload', e=>{
