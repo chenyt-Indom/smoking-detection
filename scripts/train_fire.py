@@ -39,6 +39,14 @@ def parse() -> argparse.Namespace:
                     help="输出根目录。建议用纯英文路径（中文路径下 ultralytics 偶发把结果写到盘根）")
     ap.add_argument("--device", default="0")
     ap.add_argument("--patience", type=int, default=25)
+    # 续训/精修时学习率必须能压下来。原来 lr0 写死走 ultralytics 默认 0.01，
+    # 从已有 best.pt 接着练会被一个大学习率把权重打散，等于白练。
+    ap.add_argument("--lr0", type=float, default=0.01, help="初始学习率")
+    ap.add_argument("--optimizer", default="auto",
+                    help="auto / SGD / AdamW / MuSGD")
+    ap.add_argument("--cos-lr", action="store_true", help="余弦退火（末段更稳）")
+    ap.add_argument("--close-mosaic", type=int, default=15,
+                    help="最后 N 轮关掉 mosaic（小目标定位更准）")
     ap.add_argument("--resume", action="store_true")
     ap.add_argument("--dry-run", action="store_true")
     return ap.parse_args()
@@ -74,6 +82,17 @@ def main() -> int:
         print("  权重加载成功")
         return 0
 
+    # ⚠️ ultralytics 的坑：optimizer='auto' 会**完全忽略** lr0/momentum 自己定，
+    # 日志里那句 "found, ignoring 'lr0=...'" 很容易被刷屏盖过去。
+    # 项目历史上因此废过一整轮训练（目录名还留着
+    # `fire_smoke_v7_26s960_ABORT_auto吞lr0`）。
+    # 从已有 best.pt 继续精修时这尤其致命：auto 会挑 lr=0.01，把学好的权重打散。
+    # 所以只要 lr0 不是默认的 0.01，就不许用 auto。
+    if a.optimizer == "auto" and abs(a.lr0 - 0.01) > 1e-9:
+        print(f"[!] optimizer=auto 会忽略 lr0={a.lr0}，自动改成 MuSGD 以保留学习率设置。")
+        print("    想用 auto 就显式传 --lr0 0.01。")
+        a.optimizer = "MuSGD"
+
     t0 = time.time()
     model = YOLO(a.model)
 
@@ -91,7 +110,10 @@ def main() -> int:
             resume=a.resume,
             # 小目标（fire 有 29% 的框小于 0.25% 画面）—— 保留 mosaic，末期关掉
             mosaic=1.0,
-            close_mosaic=15,
+            close_mosaic=a.close_mosaic,
+            lr0=a.lr0,
+            optimizer=a.optimizer,
+            cos_lr=a.cos_lr,
             # 数据增强：火/烟对亮度与模糊很敏感，这几项给足
             hsv_h=0.015, hsv_s=0.7, hsv_v=0.5,
             degrees=5.0, translate=0.1, scale=0.5, shear=0.0,
@@ -109,9 +131,10 @@ def main() -> int:
             print(f"[!] 显存不足（{exc}），自动降到 batch={max(4, a.batch // 2)} 重试…")
             results = model.train(
                 data=str(data), epochs=a.epochs, imgsz=a.imgsz,
-                batch=max(4, a.batch // 2), device=a.device, workers=a.workers,
+                batch=max(2, a.batch // 2), device=a.device, workers=a.workers,
                 project=a.project, name=a.name, exist_ok=True,
-                mosaic=1.0, close_mosaic=15, patience=a.patience,
+                mosaic=1.0, close_mosaic=a.close_mosaic, patience=a.patience,
+                lr0=a.lr0, optimizer=a.optimizer, cos_lr=a.cos_lr,
                 verbose=True, seed=0, amp=True, plots=True,
             )
         else:
