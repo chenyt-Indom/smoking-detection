@@ -48,6 +48,9 @@
   .item:hover{background:#222831}
   .item.cur{background:#1f3550;border-left:3px solid var(--acc);padding-left:9px}
   .item .nm{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+  .item .st{flex:0 0 auto;color:var(--ok);font-weight:700;font-size:13px}
+  .item.done .nm{color:#98a2b0}
+  .item.cur .nm{color:var(--txt)}
   .chips{display:flex;flex-wrap:wrap;gap:5px;margin:9px 0 3px;min-height:22px}
   .chips b{font-weight:500;font-size:11.5px;padding:2px 9px;border-radius:6px;
     background:#232830;border:1px solid var(--line);color:#9fc4ea;cursor:pointer;
@@ -449,6 +452,7 @@ async function save(action, silent){
     it.angs  = action==='empty'?[]:S.boxes.map(b=>b.ang);
     S.dirty=false;
     markSaved(!!silent);
+    paintItem(S.idx);
     if(j.stats) updateStats(j.stats);
     if(!silent) toast(action==='empty'?'已标记：这张没有香烟'
           :`已保存（${it.boxes.length} 个框）`);
@@ -505,11 +509,20 @@ function buildSideList(){
   const frag=document.createDocumentFragment();
   S.items.forEach((it,i)=>{
     const d=document.createElement('div');
-    d.className='item'; d.innerHTML=itemHTML(it);
+    d.className='item'+(it.edited?' done':'');
+    d.innerHTML=itemHTML(it);
     d.onclick=()=>go(i);
     frag.appendChild(d);
   });
   box.appendChild(frag);
+}
+/* 保存/排除后只重画这一项，不用整张列表重建（也就能立刻出✓） */
+function paintItem(i){
+  const el=document.querySelectorAll('.item')[i];
+  const it=S.items[i];
+  if(!el||!it) return;
+  el.className='item'+(it.edited?' done':'')+(i===S.idx?' cur':'');
+  el.innerHTML=itemHTML(it);
 }
 function applyOriginal(){
   const it=S.items[S.idx];
@@ -594,8 +607,7 @@ document.getElementById('btn-exclude').onclick=async()=>{
       body:JSON.stringify({split:S.split,name:it.name,excluded:want})});
     it.excluded=want;
     if(j.stats) updateStats(j.stats);
-    const el=document.querySelectorAll('.item')[S.idx];
-    if(el) el.innerHTML=itemHTML(it);
+    paintItem(S.idx);
     toast(want?'已排除，不加入训练清单':'已恢复，会加入训练清单');
     if(want) await next();
   }catch(err){ toast('操作失败：'+err.message,false); }
