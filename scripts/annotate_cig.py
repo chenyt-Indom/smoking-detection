@@ -431,11 +431,12 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
-    def _send(self, code: int, ctype: str, body: bytes):
+    def _send(self, code: int, ctype: str, body: bytes,
+              cache: str = "no-store"):
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
+        self.send_header("Cache-Control", cache)
         self.end_headers()
         try:
             self.wfile.write(body)
@@ -479,8 +480,9 @@ class Handler(BaseHTTPRequestHandler):
             if not p.is_file():
                 self._send(404, "text/plain", b"not found")
                 return
+            # 图片名不变则内容不变 ⇒ 让浏览器缓存住，前后翻页就不用重新下载+解码
             self._send(200, mimetypes.guess_type(p.name)[0] or "image/jpeg",
-                       p.read_bytes())
+                       p.read_bytes(), cache="private, max-age=86400")
             return
         self._send(404, "text/plain", b"not found")
 

@@ -118,6 +118,7 @@
       <div class="kv"><span>长宽比</span><span id="v-r">–</span></div>
       <div class="kv"><span>状态</span><span id="v-st">–</span></div>
       <div class="kv"><span>落盘</span><span id="v-save">–</span></div>
+      <div class="kv"><span>切图耗时</span><span id="v-load">–</span></div>
 
       <div id="chips" class="chips"></div>
 
@@ -492,7 +493,7 @@ async function loadList(){
   S.split=document.getElementById('split').value;
   S.only=document.getElementById('only').value;
   S.items=await api(`/api/list?split=${S.split}&only=${S.only}`);
-  buildSideList(); S.lastCur=null;
+  buildSideList(); S.lastCur=null; _pref.clear();
   // 断点恢复：回到上次标到的那张（关机/重启/刷新都不丢位置）
   let start=0, back=null, skipped=0;
   try{
@@ -551,17 +552,32 @@ function applyOriginal(){
   S.boxes=S.orig.map(b=>({...b}));
   S.sel=S.boxes.length?0:-1;
 }
+/* 预取相邻两张：图片现在带 max-age 缓存，翻页/前后对比时直接命中 */
+let _pref = new Set();
+function prefetch(i){
+  if(i<0||i>=S.items.length) return;
+  const it=S.items[i]; if(!it) return;
+  const key=S.split+'/'+it.name;
+  if(_pref.has(key)) return;
+  if(_pref.size>400) _pref.clear();
+  _pref.add(key);
+  new Image().src=`/img?split=${S.split}&name=${encodeURIComponent(it.name)}`;
+}
 async function go(i, keep){
   if(i<0||i>=S.items.length) return;
   // 切图前先把当前改动落盘，点列表/翻页都不会把修改弄丢
   if(!keep && S.dirty && S.loaded && !S.drag){ await save('ok', true); }
   S.idx=i; S.dirty=false; S.loaded=false;
   const it=S.items[i];
+  const t0=performance.now();
   const img=new Image();
   img.onload=()=>{
     S.img=img; S.iw=img.naturalWidth; S.ih=img.naturalHeight;
     layout(); applyOriginal(); S.loaded=true; draw(); refreshInfo();
+    const el=document.getElementById('v-load');
+    if(el) el.textContent=`${Math.round(performance.now()-t0)} ms`;
     api('/api/stats').then(updateStats).catch(()=>{});
+    prefetch(i+1); prefetch(i-1);
   };
   img.onerror=()=>toast('图片加载失败：'+it.name,false);
   img.src=`/img?split=${S.split}&name=${encodeURIComponent(it.name)}`;
