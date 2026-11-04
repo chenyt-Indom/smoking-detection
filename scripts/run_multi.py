@@ -90,13 +90,19 @@ class Worker:
     """一路摄像头：采集线程 + 独立流水线状态 + 独立画面发布线程。"""
 
     def __init__(self, cam: dict, detector, view: LiveView, pipe_cfg: dict,
-                 arbiter, pub_interval: float):
+                 arbiter, pub_interval: float, cig_conf: float = 0.03):
         self.id = str(cam["id"])
         self.name = str(cam.get("name") or self.id)
         self.index = int(cam["index"])
         self.view = view
         self.pipe_cfg = pipe_cfg
         self.pub_interval = pub_interval
+        # 本路香烟检出的最低置信度。**按路设**，不是全局一个值 ——
+        # 实测依据：cam_0 是 640x480，一支烟只有十几像素，香烟模型在那里
+        # 给出的中位置信度只有 0.06、67 次检出里 0 次 >=0.20，全是噪声；
+        # 这些噪声框会建轨迹、被送 LLM 复核（白烧额度）、还把界面数量刷得乱跳。
+        # 而 cam_1 是 1280x720，香烟像素翻倍，才真正检得出。
+        self.cig_conf = float(cig_conf)
         self.last_idx = -1
         self._dbg = 0
         self._stop = threading.Event()
@@ -170,6 +176,13 @@ class Worker:
 
     def step_with(self, pkt, dets):
         """用外部 batch 检测的结果处理一帧，返回事件列表。"""
+        # 香烟按**本路**门槛再筛一次（见 self.cig_conf）。
+        # 在进追踪器之前筛，所以低分噪声不会建轨迹、不会进告警、不会送 LLM。
+        # 只影响 cigarette —— 火/烟的判定链路一个字都没动。
+        if self.cig_conf > 0:
+            dets = [d for d in dets
+                    if not ("cig" in str(getattr(d, "cls_name", "")).lower()
+                            and float(getattr(d, "conf", 0.0)) < self.cig_conf)]
         res = self.pipe.process(pkt, dets)
         self.pipe._last_dets = res.dets
         self.pipe._det_ts.append(time.time())
@@ -333,8 +346,10 @@ def main() -> int:
     for c in cams:
         pc = dict(pipe_cfg)
         try:
+            _cig = float(c.get("cigarette_conf",
+                                thr.get("cigarette_conf", 0.03)))
             workers.append(Worker(c, detector, views[str(c["id"])], pc,
-                                  arb, pub_interval))
+                                  arb, pub_interval, cig_conf=_cig))
         except RuntimeError as e:
             print(f"  [跳过] {e}", flush=True)
     if not workers:
