@@ -177,7 +177,7 @@ let S={
   img:null, iw:0, ih:0,
   boxes:[], sel:-1, orig:[],
   scale:1, ox:0, oy:0, dirty:false, loaded:false,
-  drag:null, mouse:null, reviewed:0, total:0, snap:false, lastCur:null
+  drag:null, mouse:null, reviewed:0, total:0, snap:false, lastCur:null, stats:null
 };
 
 /* ---------------- API（接口失败要明确报错，别白屏） ---------------- */
@@ -472,11 +472,16 @@ function markSaved(auto){
   el.textContent=`${p(t.getHours())}:${p(t.getMinutes())} ${auto?'自动写入':'已写入'}`;
 }
 function updateStats(st){
-  const s=st[S.split]; S.reviewed=s.reviewed; S.total=s.total;
-  document.getElementById('pos').textContent=
-    `第 ${S.idx+1} / ${S.items.length} 张　·　已复标 ${s.reviewed}/${s.total}　·　排除 ${s.excluded}`;
-  // 只改变化的那两项。原来每次切图都 querySelectorAll 遍历 7813 个节点再 toggle，
-  // 再叠上 86% 的内存占用，切一张图能卡半秒
+  if(st){
+    S.stats=st;
+    const s=st[S.split]; S.reviewed=s.reviewed; S.total=s.total;
+    document.getElementById('pos').textContent=
+      `第 ${S.idx+1} / ${S.items.length} 张　·　已复标 ${s.reviewed}/${s.total}　·　排除 ${s.excluded}`;
+  }
+  markCurrent();
+}
+/* 只换高亮：列表可能 7800+ 项，走 children[i] 索引，不遍历 */
+function markCurrent(){
   const l=listEl();
   if(!l) return;
   const prev=(S.lastCur!=null)?l.children[S.lastCur]:null;
@@ -494,6 +499,7 @@ async function loadList(){
   S.only=document.getElementById('only').value;
   S.items=await api(`/api/list?split=${S.split}&only=${S.only}`);
   buildSideList(); S.lastCur=null; _pref.clear();
+  try{ S.stats=await api('/api/stats'); }catch(e){}
   // 断点恢复：回到上次标到的那张（关机/重启/刷新都不丢位置）
   let start=0, back=null, skipped=0;
   try{
@@ -508,6 +514,7 @@ async function loadList(){
     }
   }catch(e){}
   await go(start, true);
+  updateStats(S.stats);
   if(back) toast(`已回到上次那张：${back}（第 ${start+1} 张）`);
   else if(skipped) toast(`前面 ${skipped} 张已复标，从第 ${start+1} 张接着标`);
 }
@@ -552,7 +559,8 @@ function applyOriginal(){
   S.boxes=S.orig.map(b=>({...b}));
   S.sel=S.boxes.length?0:-1;
 }
-/* 预取相邻两张：图片现在带 max-age 缓存，翻页/前后对比时直接命中 */
+/* 预取相邻两张：图片带 max-age 缓存，翻页/前后对比直接命中。
+   用 requestIdleCallback 放到浏览器空闲时再做，不跟当前这张抢主线程 */
 let _pref = new Set();
 function prefetch(i){
   if(i<0||i>=S.items.length) return;
@@ -561,7 +569,8 @@ function prefetch(i){
   if(_pref.has(key)) return;
   if(_pref.size>400) _pref.clear();
   _pref.add(key);
-  new Image().src=`/img?split=${S.split}&name=${encodeURIComponent(it.name)}`;
+  const go2=()=>{ new Image().src=`/img?split=${S.split}&name=${encodeURIComponent(it.name)}`; };
+  if(window.requestIdleCallback) requestIdleCallback(go2,{timeout:1500}); else setTimeout(go2,120);
 }
 async function go(i, keep){
   if(i<0||i>=S.items.length) return;
@@ -576,7 +585,8 @@ async function go(i, keep){
     layout(); applyOriginal(); S.loaded=true; draw(); refreshInfo();
     const el=document.getElementById('v-load');
     if(el) el.textContent=`${Math.round(performance.now()-t0)} ms`;
-    api('/api/stats').then(updateStats).catch(()=>{});
+    // 切图不再请求 /api/stats（那是 4 次全目录扫描，IO 忙时能把页面拖死）
+    markCurrent();
     prefetch(i+1); prefetch(i-1);
   };
   img.onerror=()=>toast('图片加载失败：'+it.name,false);

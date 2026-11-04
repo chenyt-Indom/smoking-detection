@@ -263,13 +263,21 @@ def _build_list(split: str, only: str = "all") -> list[dict]:
     return out
 
 
+_STATS_CACHE: dict = {"sig": None, "data": None}
+
+
 def stats() -> dict:
+    sig = _dir_sig()
+    if _STATS_CACHE["sig"] == sig:
+        return _STATS_CACHE["data"]
     ex = load_excluded()
     res = {}
     for split in ("train", "val"):
         total = len(list(img_dir(split).glob("*.jpg")))
         done = len(list((FIXED / split).glob("*.txt"))) if (FIXED / split).is_dir() else 0
         res[split] = {"total": total, "reviewed": done, "excluded": len(ex[split])}
+    _STATS_CACHE["sig"] = sig
+    _STATS_CACHE["data"] = res
     return res
 
 
@@ -514,6 +522,29 @@ class Handler(BaseHTTPRequestHandler):
             self._send(404, "text/plain", b"not found")
 
 
+def _raise_self_priority() -> None:
+    """把自己的 CPU 优先级提到 AboveNormal。
+
+    训练在后台跑时会和标注抢 CPU，而标注是前台交互（人盯着看），
+    优先级高一点，卡顿会明显少。对训练无影响（降的是训练那边）。
+    """
+    try:
+        import psutil
+        psutil.Process().nice(psutil.ABOVE_NORMAL_PRIORITY_CLASS)
+        print("[✓] 进程优先级已提升到 AboveNormal")
+    except Exception as e:                # noqa: BLE001
+        # 退路：直接调 Win32（注意 HANDLE 必须声明成 c_void_p，否则 64 位下句柄无效）
+        try:
+            import ctypes
+            k = ctypes.windll.kernel32
+            k.GetCurrentProcess.restype = ctypes.c_void_p
+            k.SetPriorityClass.argtypes = [ctypes.c_void_p, ctypes.c_ulong]
+            ok = k.SetPriorityClass(k.GetCurrentProcess(), 0x00008000)
+            print(f"[{'✓' if ok else '!'}] 优先级（Win32 退路）：{'成功' if ok else '失败'}")
+        except Exception:                 # noqa: BLE001
+            print(f"[!] 优先级设置失败（不影响使用）：{e}")
+
+
 def _warm_list_cache() -> None:
     """后台预热列表缓存：不预热的话，页面第一次打开要空等 3.9 秒（读 7813 个 label）。
 
@@ -556,6 +587,7 @@ def main() -> int:
     print("  Ctrl+C 停止")
     print("=" * 72)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
+    _raise_self_priority()
     threading.Thread(target=_warm_list_cache, daemon=True).start()
     if a.open:
         threading.Timer(0.8, lambda: webbrowser.open(
