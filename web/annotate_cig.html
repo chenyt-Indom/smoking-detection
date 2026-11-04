@@ -442,6 +442,8 @@ async function save(action, silent){
   const body={split:S.split,name:it.name,action};
   if(action!=='empty' && S.boxes.length){
     body.boxes=normBoxes(); body.obbs=obbBoxes();
+    /* 角度直传像素空间的真实值：四点存的是归一化坐标，服务端反推会被宽高比压歪 */
+    body.angs=S.boxes.map(b=>b.ang);
   }
   try{
     const j=await api('/api/save',{method:'POST',

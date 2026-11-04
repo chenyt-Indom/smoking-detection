@@ -48,9 +48,15 @@ REVIEWS = DATA / "reviews.jsonl"
 EXCLUDED = DATA / "excluded.json"
 BWFLAGS = DATA / "bw_flags.json"
 PROGRESS = DATA / "progress.json"      # 上次标到哪张：关机重启后自动回到原地
+ANGLES = DATA / "angles.json"          # 每张图每框的旋转角（弧度）
+# ⚠️ 角度必须单独存，不能从归一化四点反推：
+#    四点存的是 x/iw、y/ih，非正方形图上 atan2(dy,dx) 会被宽高比压歪
+#    （实测 1280x720 的图，真值 15° 会读成 25.47°）
 
 _LOCK = threading.Lock()
 _BW = {"running": False, "done": 0, "total": 0, "split": ""}
+_ANG = {"mtime": None, "data": {}}
+_WH: dict[str, tuple[int, int] | None] = {}
 
 
 # ---------------------------------------------------------------- 小工具
@@ -100,15 +106,19 @@ def load_bw() -> dict:
 
 
 # ---------------------------------------------------------------- 标注读写
-def read_angles(split: str, stem: str) -> list[float]:
-    """从四点 OBB 反推每个框的旋转角（弧度）。没有就返回空表。
+def _angles_from_obb(split: str, stem: str) -> list[float]:
+    """从四点 OBB 反推角度 —— 仅用于兼容没有 angles.json 的旧数据。
 
-    ⚠️ 必须**逐行**读：数据集里存在多框图（train 273 张、最多一张 14 个框），
+    ⚠️ 必须**逐行**读：数据集里存在多框图（train 42 张 ≥3 框、最多一张 14 个框），
     只取第一行会让界面看起来"只有一个框"，一保存就把其余框覆盖掉。
+    ⚠️ 四点坐标是归一化的（x/iw、y/ih），直接 atan2 会被宽高比压歪 ——
+       必须乘回真实宽高再算，否则 1280x720 上真值 15° 会算成 25.47°。
     """
     f = OBB / split / f"{stem}.txt"
     if not f.is_file():
         return []
+    wh = _img_wh(split, f"{stem}.jpg")
+    sx, sy = wh if wh else (1.0, 1.0)
     out = []
     for line in f.read_text(encoding="utf-8").strip().splitlines():
         p = line.split()
@@ -118,8 +128,55 @@ def read_angles(split: str, stem: str) -> list[float]:
             v = [float(x) for x in p[1:9]]
         except ValueError:
             continue
-        out.append(math.atan2(v[3] - v[1], v[2] - v[0]))
+        out.append(math.atan2((v[3] - v[1]) * sy, (v[2] - v[0]) * sx))
     return out
+
+
+def read_angles(split: str, stem: str) -> list[float]:
+    """优先读 angles.json（精确）；没有记录才从四点反推（旧数据兼容）。"""
+    d = load_angles().get(split) or {}
+    key = f"{stem}.jpg"
+    if key in d:
+        try:
+            return [float(x) for x in (d[key] or [])]
+        except (TypeError, ValueError):
+            pass
+    return _angles_from_obb(split, stem)
+
+
+def load_angles() -> dict:
+    """{"train": {"000-0.jpg": [-0.2618]}, ...}，带 mtime 缓存。"""
+    try:
+        m = ANGLES.stat().st_mtime if ANGLES.is_file() else None
+    except OSError:
+        m = None
+    if _ANG["mtime"] != m:
+        _ANG["data"] = _load_json(ANGLES, {}) or {}
+        _ANG["mtime"] = m
+    return _ANG["data"]
+
+
+def put_angles(split: str, name: str, angs) -> None:
+    d = _load_json(ANGLES, {}) or {}
+    d.setdefault(split, {})[Path(name).name] = [round(float(a), 6) for a in (angs or [])]
+    _save_json(ANGLES, d)
+    _ANG["mtime"] = None
+
+
+def _img_wh(split: str, name: str):
+    """图像真实宽高（只读文件头，很快）。用于把归一化四点还原到像素空间。"""
+    key = f"{split}/{name}"
+    if key in _WH:
+        return _WH[key]
+    wh = None
+    try:
+        from PIL import Image
+        with Image.open(img_dir(split) / name) as im:
+            wh = im.size
+    except Exception:                     # noqa: BLE001
+        wh = None
+    _WH[key] = wh
+    return wh
 
 
 def _parse_boxes(text: str) -> list[list[float]]:
@@ -201,6 +258,7 @@ def save(payload: dict) -> dict:
         obbs = [payload.get("obb")] if payload.get("obb") else []
     boxes = [b for b in (boxes or []) if b and len(b) == 4]
     obbs = list(obbs or [])
+    angs_in = payload.get("angs")      # 前端直传的像素空间真实角度（最准）
     fx = FIXED / split / f"{stem}.txt"
     ob = OBB / split / f"{stem}.txt"
     with _LOCK:
@@ -232,6 +290,14 @@ def save(payload: dict) -> dict:
                                 cx + w / 2, cy + h / 2, cx - w / 2, cy + h / 2]
                     ob_lines.append("0 " + " ".join(f"{v:.6f}" for v in vals) + "\n")
                 _write_text_atomic(ob, "".join(ob_lines))
+        # 角度单独落盘：不靠四点反推（归一化四点反推会被宽高比压歪）
+        if boxes:
+            if isinstance(angs_in, list) and len(angs_in) == len(boxes):
+                put_angles(split, f"{stem}.jpg", angs_in)
+            else:
+                put_angles(split, f"{stem}.jpg", _angles_from_obb(split, stem))
+        else:
+            put_angles(split, f"{stem}.jpg", [])
         try:
             with open(REVIEWS, "a", encoding="utf-8") as f:
                 f.write(json.dumps({"ts": round(time.time(), 3), "split": split,
@@ -247,6 +313,26 @@ def save(payload: dict) -> dict:
         except OSError:
             pass
     return {"ok": True, "stats": stats()}
+
+
+def migrate_angles() -> int:
+    """给已标图补 angles.json —— 用真实宽高把归一化四点还原到像素空间再反推。
+
+    没被二次保存过的图，这样算出来的角度就是当初标的角度（误差 <0.01°）。
+    """
+    d = _load_json(ANGLES, {}) or {}
+    n = 0
+    for split in ("train", "val"):
+        od = OBB / split
+        if not od.is_dir():
+            continue
+        for f in sorted(od.glob("*.txt")):
+            d.setdefault(split, {})[f"{f.stem}.jpg"] = [
+                round(a, 6) for a in _angles_from_obb(split, f.stem)]
+            n += 1
+    _save_json(ANGLES, d)
+    _ANG["mtime"] = None
+    return n
 
 
 def set_excluded(split: str, names: list[str], excluded: bool) -> dict:
@@ -399,10 +485,16 @@ def main() -> int:
     ap.add_argument("--port", type=int, default=5077)
     ap.add_argument("--open", action="store_true",
                     help="启动后自动用默认浏览器打开页面（双击 bat 时用）")
+    ap.add_argument("--migrate-angles", action="store_true",
+                    help="给已标图补 angles.json（修宽高比导致的读角度偏差）")
     a = ap.parse_args()
     if not DATA.is_dir():
         print(f"[x] 数据集不存在：{DATA}")
         return 2
+    if a.migrate_angles:
+        n = migrate_angles()
+        print(f"[✓] 已迁移 {n} 张图的角度 → {ANGLES}")
+        return 0
     st = stats()
     print("=" * 72)
     print("香烟数据集复标工具（旋转框 / 排除样本 / 黑白筛查）")
