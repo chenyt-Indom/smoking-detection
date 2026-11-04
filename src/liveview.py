@@ -50,6 +50,37 @@ DEFAULT_COLOR = (190, 190, 190)
 
 FONT = cv2.FONT_HERSHEY_SIMPLEX
 
+# ── 画框的时序记忆（治「一闪一闪」的根本手段）──────────────────────────
+# 实测背景：把同一张验证图做 6 个"几乎看不出区别"的扰动（JPEG 重压缩 /
+# 轻微噪声 / 轻微模糊），模型给出的检出数量会有 29%~32% 的版本不一致 ——
+# 也就是说**单帧检测本身就不稳定**。这是模型在门槛附近做硬判定的固有性质，
+# 换后端也改不了（实测 .pt / FP16 引擎 / FP32 引擎 = 29% / 30% / 32%）。
+#
+# 而画框用的是 `pipe._last_dets`，那是**当帧原始检测**，没有任何时序记忆 ——
+# 追踪器那边的宽限只作用在告警判定上，管不到画面。检测抖一下，框就闪一下。
+#
+# 解法：画框层保留每个框 BOX_PERSIST_SEC 秒。当帧没检到、但刚才还在，
+# 就按上回的位置继续画（位置不动，不预测、不漂移）。超过这个时间才真消失。
+# 0.30s ≈ 3 个检测周期（9fps），正好跨过"偶尔漏一帧"。
+# ⚠️ 别调太大：0.6s 以上会让"目标已经走了"的框还挂在屏幕上，反而更糟。
+BOX_PERSIST_SEC = 0.30
+# 最多记多少个框（防止异常情况下无限增长）
+BOX_PERSIST_MAX = 24
+
+
+class _Ghost:
+    """补画用的"幽灵框"：结构对齐 Detection，只供 _smooth/_draw 读取。"""
+
+    __slots__ = ("xyxy", "cls_name", "conf", "cls_id", "tid", "area")
+
+    def __init__(self, box, name, conf, cid):
+        self.xyxy = box
+        self.cls_name = name
+        self.conf = conf
+        self.cls_id = cid
+        self.tid = -1
+        self.area = max(0.0, box[2] - box[0]) * max(0.0, box[3] - box[1])
+
 
 class LiveView:
     """最新帧的单一存放点：pipeline 写，HTTP 线程读。"""
@@ -99,6 +130,8 @@ class LiveView:
         #   _color_prev 彩色框阈值的滞回：已上色的框不会因为置信度微降就变灰
         self._cand_prev: list = []
         self._color_prev: list = []
+        # 画框时序记忆：[(xyxy, cls_name, cls_id, conf, 最后一次见到的时间)]
+        self._box_mem: list = []
 
         self._last_pub = 0.0
         self._n_pub = 0
@@ -261,6 +294,54 @@ class LiveView:
         self._prev_boxes = out
         return out
 
+    def _with_persistence(self, dets: list) -> list:
+        """把"刚还在、这一帧没检到"的框补回来 —— 治画面闪烁。
+
+        判据只有一条：同类别的框在上次位置 IoU>0.3 就算"还是它"。
+        续命时沿用记忆里的最高置信度（不衰减），这样颜色/粗细不会跟着抖。
+        """
+        now = time.time()
+        mem = getattr(self, "_box_mem", [])
+
+        def iou(a, b) -> float:
+            return self._iou(a, b)
+
+        new_mem: list = []
+        used: set[int] = set()
+        for d in dets:
+            b = getattr(d, "xyxy", None)
+            if b is None:
+                new_mem.append(None)
+                continue
+            nm = str(getattr(d, "cls_name", ""))
+            cf = float(getattr(d, "conf", 0.0))
+            cid = int(getattr(d, "cls_id", -1))
+            best, bi = -1, 0.3
+            for i, m in enumerate(mem):
+                if i in used or m[1] != nm:
+                    continue
+                v = iou(m[0], b)
+                if v > bi:
+                    bi, best = v, i
+            if best >= 0:
+                used.add(best)
+                cf = max(cf, mem[best][3])      # 沿用见过的最高分，颜色不抖
+            new_mem.append([tuple(float(v) for v in b), nm, cid, cf, now])
+
+        # 没被匹配上的旧框：还在宽限内就继续画
+        ghosts: list = []
+        for i, m in enumerate(mem):
+            if i in used:
+                continue
+            age = now - m[4]
+            if age > BOX_PERSIST_SEC:
+                continue
+            ghosts.append(_Ghost(m[0], m[1], m[3], m[2]))
+            new_mem.append([m[0], m[1], m[2], m[3], m[4]])   # 保留原始时间，不续命
+
+        self._box_mem = [m for m in new_mem if m is not None][-BOX_PERSIST_MAX:]
+        return dets + ghosts
+
     def _draw(self, image: np.ndarray, dets, frame_idx, cam_id) -> np.ndarray:
         # 先做跨帧平滑，再画。把平滑后的框包成和 Detection 同构的对象，
         # 这样下面所有绘制/统计代码不用改结构。
@@ -286,6 +367,7 @@ class LiveView:
         #   静止   -> 0.25~0.45，重在历史，压抖动
         #   快速移动 -> 最高 0.9，重在观测，不拖影
         # 所以它不会像固定 EMA 那样引入滞后。
+        dets = self._with_persistence(list(dets or []))
         _raw = list(dets or [])
         _sm = self._smooth(_raw)
         dets = [_S(b, n, c, getattr(_raw[i], "cls_id", -1) if i < len(_raw) else -1)
